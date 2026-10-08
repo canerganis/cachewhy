@@ -1,0 +1,87 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+      - run: npm run lint:privacy
+      - name: Built CLI through a symlink (how npm links bin entries)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          ln -s "$PWD/dist/cli.js" "$RUNNER_TEMP/cw"
+          out=$(node "$RUNNER_TEMP/cw" --version)
+          echo "version: $out"
+          test -n "$out"
+      - name: Package listing check
+        shell: bash
+        run: |
+          npm pack --dry-run --json > pack.json
+          node -e "
+            const pack = JSON.parse(require('fs').readFileSync('pack.json', 'utf8'))[0];
+            const files = pack.files.map((f) => f.path.replace(/\\\\/g, '/'));
+            console.log(files.join('\n'));
+            const banned = /^(test|src|docs|\.github|fixtures)\/|(^|\/)\.env|\.zst\$|\.jsonl\$|\.tsbuildinfo\$/;
+            const bad = files.filter((f) => banned.test(f));
+            const missing = ['package.json', 'README.md', 'LICENSE'].filter((f) => !files.includes(f));
+            if (!files.some((f) => f.startsWith('dist/'))) missing.push('dist/');
+            if (bad.length || missing.length) {
+              console.error('unexpected files:', bad, 'missing files:', missing);
+              process.exit(1);
+            }
+          "
+
+  no-network:
+    name: no network (unshare)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Confirm the sandbox has no network
+        run: |
+          unshare -rn node -e "
+            require('dns').lookup('example.com', (err) => {
+              if (!err) { console.error('network is reachable'); process.exit(1); }
+              console.log('no network, as expected');
+            });
+          "
+      - name: Test suite without network
+        run: unshare -rn npm test
+      - name: Built CLI without network
+        run: |
+          bin=$(node -p "const b = require('./package.json').bin; typeof b === 'string' ? b : Object.values(b)[0]")
+          unshare -rn node "$bin" --help

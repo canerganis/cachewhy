@@ -1,0 +1,49 @@
+name: Wrong cause
+description: cachewhy blamed the wrong thing for a cache miss
+labels: [wrong-cause]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste transcripts, prompts, file paths, usernames or session ids. Describe the shape of the data, or attach a synthetic reproduction.
+  - type: input
+    id: version
+    attributes:
+      label: cachewhy version
+    validations:
+      required: true
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Agent
+      options: [Claude Code, Codex, Other]
+    validations:
+      required: true
+  - type: input
+    id: agent-version
+    attributes:
+      label: Agent version
+  - type: textarea
+    id: reported
+    attributes:
+      label: Cause cachewhy reported
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Cause you believe is correct, and why
+    validations:
+      required: true
+  - type: textarea
+    id: shape
+    attributes:
+      label: Shape of the sequence (redacted)
+      description: For example turn order, which block changed, rough token counts. No real content.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: This report contains no real transcript content, paths, usernames or session ids.
+          required: true

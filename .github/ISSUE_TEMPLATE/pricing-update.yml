@@ -1,0 +1,34 @@
+name: Pricing update
+description: A model price or cache rate is missing or out of date
+labels: [pricing]
+body:
+  - type: input
+    id: model
+    attributes:
+      label: Model id
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Provider
+      description: For example Anthropic or OpenAI.
+    validations:
+      required: true
+  - type: textarea
+    id: rates
+    attributes:
+      label: Rates (USD per million tokens)
+      description: Input, output, cache read, and cache write per TTL if applicable.
+    validations:
+      required: true
+  - type: input
+    id: source
+    attributes:
+      label: Official pricing page URL
+    validations:
+      required: true
+  - type: input
+    id: effective
+    attributes:
+      label: Effective date

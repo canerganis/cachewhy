@@ -1,0 +1,43 @@
+name: New agent source
+description: Request support for another coding agent's logs
+labels: [new-agent]
+body:
+  - type: input
+    id: agent
+    attributes:
+      label: Agent name and version
+    validations:
+      required: true
+  - type: input
+    id: location
+    attributes:
+      label: Default log location (generic, no username)
+      placeholder: "~/.agent/sessions"
+    validations:
+      required: true
+  - type: dropdown
+    id: format
+    attributes:
+      label: Log format
+      options: [JSONL, JSONL compressed, SQLite, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: usage
+    attributes:
+      label: Does the log record per-request token usage and cache fields?
+      description: Name the fields. Use invented values, never real content.
+    validations:
+      required: true
+  - type: textarea
+    id: sample
+    attributes:
+      label: Synthetic sample of the record shape
+      render: json
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: The sample is synthetic and contains no real paths, usernames, session ids or content.
+          required: true

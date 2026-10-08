@@ -1,0 +1,38 @@
+name: release
+
+# Runs only when a version tag is pushed. Never triggered by pull requests.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing and provenance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - name: Tag matches package version
+        run: |
+          v=$(node -p "require('./package.json').version")
+          if [ "refs/tags/v$v" != "$GITHUB_REF" ]; then
+            echo "tag $GITHUB_REF does not match package.json version $v"
+            exit 1
+          fi
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+      - run: npm run lint:privacy
+      # Trusted publishing needs npm 11.5.1 or newer (bundled with Node 24).
+      # No NPM_TOKEN is used: authentication is the OIDC token.
+      - run: npm publish --provenance --access public

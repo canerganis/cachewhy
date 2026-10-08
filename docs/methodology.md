@@ -11,6 +11,7 @@ Conventions:
 * Constants are named `C1` to `C34` in section 0.3. A constant changes only through the procedure in section 0.4.
 * "Request" means one billed model response. "Chain" is defined in section 5.
 * "Token" always means an integer count taken from the log. Fractions of tokens never exist.
+* Artifact status (informational, not a rule). This document names two artifacts that do not exist in the repository yet: `pricing/table.json` (added at D1, see section 15) and `scripts/recompute` (planned, to be written from this document, R13.1). Rules that cite them describe what must exist before the matching gate can pass. Everything else named here as a path (`src/`, `test/`, `scripts/check-repo-privacy.mjs`, `scripts/gen-fixtures.ts`, `scripts/experiments/`) exists.
 * Arithmetic (R2.16). All token arithmetic, every comparison of a token quantity with a constant, and all money use BigInt. A constant that is a ratio or a percentage is an exact rational `num/den`, and a ratio test is a cross-multiplication of BigInt values. Floating point is used only for display, for the Wilson intervals of section 12 (they take run counts, not tokens) and for numbers that no decision reads.
 
 ## 0. Scope

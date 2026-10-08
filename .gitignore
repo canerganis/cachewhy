@@ -4,3 +4,4 @@ dist/
 local/
 *.log
 .DS_Store
+pack.json
