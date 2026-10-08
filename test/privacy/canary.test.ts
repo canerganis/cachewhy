@@ -491,8 +491,15 @@ test("canary trees: every command output and every error path stays clean", asyn
         assert.equal(await run(["doctor", ...extra, ...dirs], t.h), 0);
         outputs.push(...t.out, ...t.err);
       }
+      // The summary reads every canary field through the parsers and prints text and JSON (R14.7: default, --json).
+      for (const extra of [[], ["--json"], ["--since", "2026-01-01", "--no-color"], ["--agent", "claude", "--json"]]) {
+        const t = harness();
+        assert.equal(await run(["summary", ...extra, ...dirs], t.h), 0);
+        assert.ok(t.out.join("").length > 0);
+        outputs.push(...t.out, ...t.err);
+      }
     }
-    for (const argv of [["pricing"], ["summary", "--demo"], ["session", "synthetic-x"], ["evidence", "synthetic-x"], ["nope"], ["--since", "bad"], ["doctor", "--agent", "bad"]]) {
+    for (const argv of [["pricing"], ["summary", "--demo"], ["session", "synthetic-x"], ["evidence", "synthetic-x"], ["nope"], ["--since", "bad"], ["--since", "2030-01-01", "--until", "2020-01-01"], ["doctor", "--agent", "bad"]]) {
       const t = harness();
       await run(argv, t.h);
       outputs.push(...t.out, ...t.err);

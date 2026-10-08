@@ -110,3 +110,32 @@ export function formatTable(columns: Column[], rows: string[][], opts: { indent?
   for (const r of rows) out.push(line(r));
   return out.join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// BigInt formatting (R2.16: token and money quantities are never converted to Number)
+// ---------------------------------------------------------------------------
+
+/** 1234567n -> "1,234,567". */
+export function formatBig(n: bigint): string {
+  const neg = n < 0n;
+  const digits = (neg ? -n : n).toString();
+  const out = digits.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return neg ? "-" + out : out;
+}
+
+/** num/den as a percent with one decimal, rounded half up (R2.2). "n/a" when den is 0. Display only. */
+export function formatPercentBig(num: bigint, den: bigint): string {
+  if (den <= 0n) return "n/a";
+  const tenths = (num * 2000n + den) / (2n * den); // round half up of num * 1000 / den
+  return `${tenths / 10n}.${tenths % 10n}%`;
+}
+
+/** Picodollars to "$1,234.5678" (four decimals, rounded half up at 1e-4 USD). Display only (R3.8). */
+export function formatUsdPico(pico: bigint, decimals = 4): string {
+  const scale = 10n ** BigInt(12 - decimals);
+  const units = (pico * 2n + scale) / (2n * scale);
+  const unitsPerUsd = 10n ** BigInt(decimals);
+  const whole = units / unitsPerUsd;
+  const frac = (units % unitsPerUsd).toString().padStart(decimals, "0");
+  return `$${formatBig(whole)}.${frac}`;
+}

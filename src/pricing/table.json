@@ -1,0 +1,1940 @@
+{
+  "schema_version": 1,
+  "table_version": "pt-2026-10-09.1",
+  "verified_at": "2026-10-09",
+  "mode": "current list price repricing",
+  "currency": "USD",
+  "unit": "per 1M tokens",
+  "price_format": "Decimal strings. Absolute prices are authoritative at runtime (R3.2). Multipliers are stored for the ratio test only.",
+  "sources": {
+    "A1": "https://platform.claude.com/docs/en/about-claude/pricing",
+    "A2": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
+    "C1": "https://code.claude.com/docs/en/prompt-caching",
+    "C2": "https://code.claude.com/docs/en/costs",
+    "O1": "https://developers.openai.com/api/docs/pricing",
+    "O2": "https://developers.openai.com/api/docs/guides/prompt-caching",
+    "CX1": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+    "OM-gpt-6-astra": "https://developers.openai.com/api/docs/models/gpt-6-astra",
+    "OM-gpt-6.1-sol": "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+    "OM-gpt-6-sol": "https://developers.openai.com/api/docs/models/gpt-6-sol",
+    "OM-gpt-6-luna": "https://developers.openai.com/api/docs/models/gpt-6-luna",
+    "OM-gpt-5.6-sol": "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+    "OM-gpt-5.6-terra": "https://developers.openai.com/api/docs/models/gpt-5.6-terra",
+    "OM-gpt-5.6-luna": "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
+    "OM-gpt-5.5": "https://developers.openai.com/api/docs/models/gpt-5.5",
+    "OM-gpt-5.4": "https://developers.openai.com/api/docs/models/gpt-5.4"
+  },
+  "unverified_policy": "An entry or field that is not stated on an official page above has verified false. A verified false entry, and a verified false modifier, MUST NOT produce dollars. Tokens are still reported and counted as unpriced (R3.3, R3.4, R3.9).",
+  "modifiers": {
+    "batch": {
+      "applies_to": "anthropic",
+      "input_multiplier": "0.5",
+      "output_multiplier": "0.5",
+      "cache_multipliers_stack": true,
+      "verified": true,
+      "source_ids": [
+        "A1"
+      ],
+      "priced_at_runtime": false,
+      "note": "Documented, but no per-model absolute batch price rows are stored. A batch response is unpriced_modifier under R3.4 until such rows exist."
+    },
+    "geo_us": {
+      "applies_to": "anthropic",
+      "multiplier": "1.1",
+      "constant": "C32",
+      "verified": true,
+      "source_ids": [
+        "A1"
+      ],
+      "note": "Per model flag in each entry. A1 states the 1.1x multiplier for Claude 4.6 and later models, on all token categories including cache writes and reads, and says it stacks with fast mode and caching."
+    },
+    "fast_with_geo_us": {
+      "applies_to": "anthropic",
+      "multiplier_source": "geo_us",
+      "verified": true,
+      "source_ids": [
+        "A1"
+      ],
+      "note": "A1 states that the data residency multiplier applies on top of fast mode pricing and that it covers input, output, cache writes and cache reads. A fast response with inference_geo us is priced at the fast row of the model times the geo multiplier (C32) where the model's geo_us applies."
+    },
+    "openai_regional_endpoint": {
+      "applies_to": "openai",
+      "multiplier": "1.1",
+      "verified": true,
+      "source_ids": [
+        "O1"
+      ],
+      "priced_at_runtime": false,
+      "note": "Regional and FedRAMP endpoints add 10 percent. Not observable in logs, so not applied (R3.4 assumption no_regional_surcharge_assumed)."
+    },
+    "openai_service_tier": {
+      "applies_to": "openai",
+      "tiers": [
+        "standard",
+        "fast",
+        "ultrafast"
+      ],
+      "verified": true,
+      "source_ids": [
+        "O1",
+        "CX1"
+      ],
+      "priced_at_runtime": false,
+      "observable_in_logs": false,
+      "note": "O1 lists Fast and Ultrafast prices above the Standard prices for the same model (for example gpt-6.1-sol Fast is twice the Standard price, Ultrafast six times), and CX1 describes Standard, Fast and Ultrafast speed options. The tier of a response is not retained in or derivable from the logs (Q9), so a Codex response gets no dollars with reason modifier_unverified (R3.4). No Standard tier is assumed and no tier rows are stored except the existing gpt-5.3-codex fast row."
+    },
+    "openai_long_context": {
+      "applies_to": "openai",
+      "threshold_input_tokens": 272000,
+      "constant": "C25",
+      "source_ids": [
+        "O1"
+      ],
+      "note": "Priced only where the entry's long_context object has verified true for its prices and scope request with scope_verified true (R3.10, R3.11). A session or unknown scope gives no dollars at any input size."
+    }
+  },
+  "models": [
+    {
+      "id": "claude-fable-5-1",
+      "name": "Fable 5.1",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-fable-5-1"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "10",
+        "output": "50",
+        "cache_read": "0.25",
+        "cache_write_5m": "12.5",
+        "cache_write_1h": "20"
+      },
+      "multipliers": {
+        "cache_read": "0.025",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 512,
+      "tiers": null,
+      "long_context": {
+        "surcharge": "none",
+        "note": "Full 1M context is billed at standard rates (A1).",
+        "verified": true
+      },
+      "fast": null,
+      "geo_us": {
+        "applies": true,
+        "multiplier": "1.1",
+        "verified": true,
+        "source_ids": [
+          "A1"
+        ]
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "claude-mythos-5-1",
+      "name": "Mythos 5.1",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-mythos-5-1"
+      ],
+      "aliases": [],
+      "status": "limited",
+      "prices_usd_per_mtok": {
+        "input": "10",
+        "output": "50",
+        "cache_read": "0.25",
+        "cache_write_5m": "12.5",
+        "cache_write_1h": "20"
+      },
+      "multipliers": {
+        "cache_read": "0.025",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 512,
+      "tiers": null,
+      "long_context": {
+        "surcharge": "none",
+        "note": "Full 1M context is billed at standard rates (A1).",
+        "verified": true
+      },
+      "fast": null,
+      "geo_us": {
+        "applies": true,
+        "multiplier": "1.1",
+        "verified": true,
+        "source_ids": [
+          "A1"
+        ]
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "Listed as limited availability on A1."
+      ]
+    },
+    {
+      "id": "claude-fable-5",
+      "name": "Fable 5",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-fable-5"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "10",
+        "output": "50",
+        "cache_read": "1",
+        "cache_write_5m": "12.5",
+        "cache_write_1h": "20"
+      },
+      "multipliers": {
+        "cache_read": "0.1",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 512,
+      "tiers": null,
+      "long_context": {
+        "surcharge": "none",
+        "note": "Full 1M context is billed at standard rates (A1).",
+        "verified": true
+      },
+      "fast": null,
+      "geo_us": {
+        "applies": true,
+        "multiplier": "1.1",
+        "verified": true,
+        "source_ids": [
+          "A1"
+        ]
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "claude-opus-5-5",
+      "name": "Opus 5.5",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-opus-5-5"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "4",
+        "output": "20",
+        "cache_read": "0.2",
+        "cache_write_5m": "5",
+        "cache_write_1h": "8"
+      },
+      "multipliers": {
+        "cache_read": "0.05",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 512,
+      "tiers": null,
+      "long_context": {
+        "surcharge": "none",
+        "note": "Full 1M context is billed at standard rates (A1).",
+        "verified": true
+      },
+      "fast": {
+        "prices_usd_per_mtok": {
+          "input": "8",
+          "output": "40",
+          "cache_read": "0.4",
+          "cache_write_5m": "10",
+          "cache_write_1h": "16"
+        },
+        "cache_prices_derived": true,
+        "multipliers": {
+          "cache_read": "0.05",
+          "cache_write_5m": "1.25",
+          "cache_write_1h": "2"
+        },
+        "verified": true,
+        "source_ids": [
+          "A1"
+        ],
+        "note": "A1 states the fast input and output prices and that cache multipliers apply on top. Cache prices here are derived by that multiplication.",
+        "geo_us_applies": true,
+        "geo_us_source_ids": [
+          "A1"
+        ]
+      },
+      "geo_us": {
+        "applies": true,
+        "multiplier": "1.1",
+        "verified": true,
+        "source_ids": [
+          "A1"
+        ]
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "claude-opus-5",
+      "name": "Opus 5",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-opus-5"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "5",
+        "output": "25",
+        "cache_read": "0.5",
+        "cache_write_5m": "6.25",
+        "cache_write_1h": "10"
+      },
+      "multipliers": {
+        "cache_read": "0.1",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 512,
+      "tiers": null,
+      "long_context": {
+        "surcharge": "none",
+        "note": "Full 1M context is billed at standard rates (A1).",
+        "verified": true
+      },
+      "fast": {
+        "prices_usd_per_mtok": {
+          "input": "10",
+          "output": "50",
+          "cache_read": "1",
+          "cache_write_5m": "12.5",
+          "cache_write_1h": "20"
+        },
+        "cache_prices_derived": true,
+        "multipliers": {
+          "cache_read": "0.1",
+          "cache_write_5m": "1.25",
+          "cache_write_1h": "2"
+        },
+        "verified": true,
+        "source_ids": [
+          "A1"
+        ],
+        "note": "A1 states the fast input and output prices and that cache multipliers apply on top. Cache prices here are derived by that multiplication.",
+        "geo_us_applies": true,
+        "geo_us_source_ids": [
+          "A1"
+        ]
+      },
+      "geo_us": {
+        "applies": true,
+        "multiplier": "1.1",
+        "verified": true,
+        "source_ids": [
+          "A1"
+        ]
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "claude-opus-4-8",
+      "name": "Opus 4.8",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-opus-4-8"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "5",
+        "output": "25",
+        "cache_read": "0.5",
+        "cache_write_5m": "6.25",
+        "cache_write_1h": "10"
+      },
+      "multipliers": {
+        "cache_read": "0.1",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 1024,
+      "tiers": null,
+      "long_context": {
+        "surcharge": "none",
+        "note": "Full 1M context is billed at standard rates (A1).",
+        "verified": true
+      },
+      "fast": {
+        "prices_usd_per_mtok": {
+          "input": "10",
+          "output": "50",
+          "cache_read": "1",
+          "cache_write_5m": "12.5",
+          "cache_write_1h": "20"
+        },
+        "cache_prices_derived": true,
+        "multipliers": {
+          "cache_read": "0.1",
+          "cache_write_5m": "1.25",
+          "cache_write_1h": "2"
+        },
+        "verified": true,
+        "source_ids": [
+          "A1"
+        ],
+        "note": "A1 states the fast input and output prices and that cache multipliers apply on top. Cache prices here are derived by that multiplication.",
+        "geo_us_applies": true,
+        "geo_us_source_ids": [
+          "A1"
+        ]
+      },
+      "geo_us": {
+        "applies": true,
+        "multiplier": "1.1",
+        "verified": true,
+        "source_ids": [
+          "A1"
+        ]
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "claude-opus-4-7",
+      "name": "Opus 4.7",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-opus-4-7"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "5",
+        "output": "25",
+        "cache_read": "0.5",
+        "cache_write_5m": "6.25",
+        "cache_write_1h": "10"
+      },
+      "multipliers": {
+        "cache_read": "0.1",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 2048,
+      "tiers": null,
+      "long_context": {
+        "surcharge": "none",
+        "note": "Full 1M context is billed at standard rates (A1).",
+        "verified": true
+      },
+      "fast": null,
+      "geo_us": {
+        "applies": true,
+        "multiplier": "1.1",
+        "verified": true,
+        "source_ids": [
+          "A1"
+        ]
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "claude-opus-4-6",
+      "name": "Opus 4.6",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-opus-4-6"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "5",
+        "output": "25",
+        "cache_read": "0.5",
+        "cache_write_5m": "6.25",
+        "cache_write_1h": "10"
+      },
+      "multipliers": {
+        "cache_read": "0.1",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 4096,
+      "tiers": null,
+      "long_context": {
+        "surcharge": "none",
+        "note": "Full 1M context is billed at standard rates (A1).",
+        "verified": true
+      },
+      "fast": null,
+      "geo_us": {
+        "applies": true,
+        "multiplier": "1.1",
+        "verified": true,
+        "source_ids": [
+          "A1"
+        ]
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "claude-opus-4-5",
+      "name": "Opus 4.5",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-opus-4-5"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "5",
+        "output": "25",
+        "cache_read": "0.5",
+        "cache_write_5m": "6.25",
+        "cache_write_1h": "10"
+      },
+      "multipliers": {
+        "cache_read": "0.1",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 4096,
+      "tiers": null,
+      "long_context": null,
+      "fast": null,
+      "geo_us": {
+        "applies": null,
+        "multiplier": null,
+        "verified": false,
+        "source_ids": [],
+        "note": "A1 states the multiplier for 4.6 and later models only. Not stated for this model, so inference_geo us gives no dollars."
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "claude-opus-4-1",
+      "name": "Opus 4.1",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-opus-4-1"
+      ],
+      "aliases": [],
+      "status": "retired",
+      "prices_usd_per_mtok": {
+        "input": "15",
+        "output": "75",
+        "cache_read": "1.5",
+        "cache_write_5m": "18.75",
+        "cache_write_1h": "30"
+      },
+      "multipliers": {
+        "cache_read": "0.1",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 1024,
+      "tiers": null,
+      "long_context": null,
+      "fast": null,
+      "geo_us": {
+        "applies": null,
+        "multiplier": null,
+        "verified": false,
+        "source_ids": [],
+        "note": "A1 states the multiplier for 4.6 and later models only. Not stated for this model, so inference_geo us gives no dollars."
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "Listed as retired on A1."
+      ]
+    },
+    {
+      "id": "claude-opus-4",
+      "name": "Opus 4",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-opus-4"
+      ],
+      "aliases": [],
+      "status": "retired",
+      "prices_usd_per_mtok": {
+        "input": "15",
+        "output": "75",
+        "cache_read": "1.5",
+        "cache_write_5m": "18.75",
+        "cache_write_1h": "30"
+      },
+      "multipliers": {
+        "cache_read": "0.1",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 1024,
+      "tiers": null,
+      "long_context": null,
+      "fast": null,
+      "geo_us": {
+        "applies": null,
+        "multiplier": null,
+        "verified": false,
+        "source_ids": [],
+        "note": "A1 states the multiplier for 4.6 and later models only. Not stated for this model, so inference_geo us gives no dollars."
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "Listed as retired on A1."
+      ]
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "name": "Sonnet 5.5",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-sonnet-5-5"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "2",
+        "output": "10",
+        "cache_read": "0.1",
+        "cache_write_5m": "2.5",
+        "cache_write_1h": "4"
+      },
+      "multipliers": {
+        "cache_read": "0.05",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 512,
+      "tiers": null,
+      "long_context": {
+        "surcharge": "none",
+        "note": "Full 1M context is billed at standard rates (A1).",
+        "verified": true
+      },
+      "fast": null,
+      "geo_us": {
+        "applies": true,
+        "multiplier": "1.1",
+        "verified": true,
+        "source_ids": [
+          "A1"
+        ]
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "claude-sonnet-5",
+      "name": "Sonnet 5",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-sonnet-5"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "2",
+        "output": "10",
+        "cache_read": "0.2",
+        "cache_write_5m": "2.5",
+        "cache_write_1h": "4"
+      },
+      "multipliers": {
+        "cache_read": "0.1",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 1024,
+      "tiers": null,
+      "long_context": {
+        "surcharge": "none",
+        "note": "Full 1M context is billed at standard rates (A1).",
+        "verified": true
+      },
+      "fast": null,
+      "geo_us": {
+        "applies": true,
+        "multiplier": "1.1",
+        "verified": true,
+        "source_ids": [
+          "A1"
+        ]
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "name": "Sonnet 4.6",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-sonnet-4-6"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "3",
+        "output": "15",
+        "cache_read": "0.3",
+        "cache_write_5m": "3.75",
+        "cache_write_1h": "6"
+      },
+      "multipliers": {
+        "cache_read": "0.1",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 1024,
+      "tiers": null,
+      "long_context": {
+        "surcharge": "none",
+        "note": "Full 1M context is billed at standard rates (A1).",
+        "verified": true
+      },
+      "fast": null,
+      "geo_us": {
+        "applies": true,
+        "multiplier": "1.1",
+        "verified": true,
+        "source_ids": [
+          "A1"
+        ]
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "claude-sonnet-4-5",
+      "name": "Sonnet 4.5",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-sonnet-4-5"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "3",
+        "output": "15",
+        "cache_read": "0.3",
+        "cache_write_5m": "3.75",
+        "cache_write_1h": "6"
+      },
+      "multipliers": {
+        "cache_read": "0.1",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 1024,
+      "tiers": null,
+      "long_context": null,
+      "fast": null,
+      "geo_us": {
+        "applies": null,
+        "multiplier": null,
+        "verified": false,
+        "source_ids": [],
+        "note": "A1 states the multiplier for 4.6 and later models only. Not stated for this model, so inference_geo us gives no dollars."
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "claude-sonnet-4",
+      "name": "Sonnet 4",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-sonnet-4"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "3",
+        "output": "15",
+        "cache_read": "0.3",
+        "cache_write_5m": "3.75",
+        "cache_write_1h": "6"
+      },
+      "multipliers": {
+        "cache_read": "0.1",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 1024,
+      "tiers": null,
+      "long_context": null,
+      "fast": null,
+      "geo_us": {
+        "applies": null,
+        "multiplier": null,
+        "verified": false,
+        "source_ids": [],
+        "note": "A1 states the multiplier for 4.6 and later models only. Not stated for this model, so inference_geo us gives no dollars."
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "name": "Haiku 4.5",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-haiku-4-5"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "1",
+        "output": "5",
+        "cache_read": "0.1",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "multipliers": {
+        "cache_read": "0.1",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 4096,
+      "tiers": null,
+      "long_context": null,
+      "fast": null,
+      "geo_us": {
+        "applies": null,
+        "multiplier": null,
+        "verified": false,
+        "source_ids": [],
+        "note": "A1 states the multiplier for 4.6 and later models only. Not stated for this model, so inference_geo us gives no dollars."
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "claude-haiku-3-5",
+      "name": "Haiku 3.5",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-haiku-3-5"
+      ],
+      "aliases": [],
+      "status": "retired",
+      "prices_usd_per_mtok": {
+        "input": "0.8",
+        "output": "4",
+        "cache_read": "0.08",
+        "cache_write_5m": "1",
+        "cache_write_1h": "1.6"
+      },
+      "multipliers": {
+        "cache_read": "0.1",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 2048,
+      "tiers": null,
+      "long_context": null,
+      "fast": null,
+      "geo_us": {
+        "applies": null,
+        "multiplier": null,
+        "verified": false,
+        "source_ids": [],
+        "note": "A1 states the multiplier for 4.6 and later models only. Not stated for this model, so inference_geo us gives no dollars."
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "Listed as retired on A1."
+      ]
+    },
+    {
+      "id": "claude-haiku-5-5",
+      "name": "Haiku 5.5",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-haiku-5-5"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "0.1",
+        "output": "0.5",
+        "cache_read": "0.01",
+        "cache_write_5m": "0.125",
+        "cache_write_1h": "0.2"
+      },
+      "multipliers": {
+        "cache_read": "0.1",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 512,
+      "tiers": {
+        "split_on": "total_input",
+        "split_tokens": 100000,
+        "rule": "total_input at most split_tokens uses prices_usd_per_mtok, above uses high",
+        "high": {
+          "input": "0.5",
+          "output": "2.5",
+          "cache_read": "0.05",
+          "cache_write_5m": "0.625",
+          "cache_write_1h": "1"
+        },
+        "high_multipliers": {
+          "cache_read": "0.1",
+          "cache_write_5m": "1.25",
+          "cache_write_1h": "2"
+        },
+        "verified": true,
+        "source_ids": [
+          "A1"
+        ]
+      },
+      "long_context": null,
+      "fast": null,
+      "geo_us": {
+        "applies": true,
+        "multiplier": "1.1",
+        "verified": true,
+        "source_ids": [
+          "A1"
+        ]
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "A1 lists two price rows, prompts up to 100K and prompts over 100K. The full-context standard-rate statement excludes this model."
+      ]
+    },
+    {
+      "id": "claude-mythos-5",
+      "name": "Mythos 5",
+      "provider": "anthropic",
+      "model_ids": [
+        "claude-mythos-5"
+      ],
+      "aliases": [],
+      "status": "limited",
+      "prices_usd_per_mtok": {
+        "input": "10",
+        "output": "50",
+        "cache_read": "1",
+        "cache_write_5m": "12.5",
+        "cache_write_1h": "20"
+      },
+      "multipliers": {
+        "cache_read": "0.1",
+        "cache_write_5m": "1.25",
+        "cache_write_1h": "2"
+      },
+      "min_cacheable_tokens": 512,
+      "tiers": null,
+      "long_context": {
+        "surcharge": "none",
+        "note": "Full 1M context is billed at standard rates (A1).",
+        "verified": true
+      },
+      "fast": null,
+      "geo_us": {
+        "applies": true,
+        "multiplier": "1.1",
+        "verified": true,
+        "source_ids": [
+          "A1"
+        ]
+      },
+      "source_ids": [
+        "A1",
+        "A2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "Listed as limited availability on A1."
+      ]
+    },
+    {
+      "id": "mythos-preview",
+      "name": "Mythos Preview",
+      "provider": "anthropic",
+      "model_ids": [],
+      "aliases": [],
+      "status": "unpriced",
+      "prices_usd_per_mtok": null,
+      "multipliers": null,
+      "min_cacheable_tokens": 2048,
+      "tiers": null,
+      "long_context": null,
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "A2"
+      ],
+      "verified": false,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "The minimum cacheable length is on A2. No price for this model is on the pages used, so it produces no dollars.",
+        "No model id is stated on the pages used, so no id is matched."
+      ]
+    },
+    {
+      "id": "gpt-6-astra",
+      "name": "GPT-6 Astra",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-6-astra"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "10",
+        "cached_input": "1",
+        "cache_write": "12.5",
+        "output": "50"
+      },
+      "multipliers": {
+        "cached_input": "0.1",
+        "cache_write": "1.25"
+      },
+      "min_cacheable_tokens": 1024,
+      "tiers": null,
+      "long_context": {
+        "threshold_input_tokens": 272000,
+        "input_multiplier": "2",
+        "output_multiplier": "1.5",
+        "prices_usd_per_mtok": {
+          "input": "20",
+          "cached_input": "2",
+          "cache_write": "25",
+          "output": "75"
+        },
+        "multipliers": {
+          "cached_input": "0.1",
+          "cache_write": "1.25"
+        },
+        "verified": true,
+        "source_ids": [
+          "O1"
+        ],
+        "scope": "request",
+        "scope_verified": true,
+        "scope_source_id": "OM-gpt-6-astra",
+        "note": "O1 prints these prices for input over 272K. The model page (OM-gpt-6-astra) states that the long-context rate applies to the full request, so the scope is request."
+      },
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "O1",
+        "O2",
+        "OM-gpt-6-astra"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "gpt-6.1-sol",
+      "name": "GPT-6.1 Sol",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-6.1-sol"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "2",
+        "cached_input": "0.1",
+        "cache_write": "2.5",
+        "output": "10"
+      },
+      "multipliers": {
+        "cached_input": "0.05",
+        "cache_write": "1.25"
+      },
+      "min_cacheable_tokens": 1024,
+      "tiers": null,
+      "long_context": {
+        "threshold_input_tokens": 272000,
+        "input_multiplier": "2",
+        "output_multiplier": "1.5",
+        "prices_usd_per_mtok": {
+          "input": "4",
+          "cached_input": "0.2",
+          "cache_write": "5",
+          "output": "15"
+        },
+        "multipliers": {
+          "cached_input": "0.05",
+          "cache_write": "1.25"
+        },
+        "verified": true,
+        "source_ids": [
+          "O1"
+        ],
+        "scope": "request",
+        "scope_verified": true,
+        "scope_source_id": "OM-gpt-6.1-sol",
+        "note": "O1 prints these prices for input over 272K. The model page (OM-gpt-6.1-sol) states that the long-context rate applies to the full request, so the scope is request."
+      },
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "O1",
+        "O2",
+        "OM-gpt-6.1-sol"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "gpt-6-sol",
+      "name": "GPT-6 Sol",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-6-sol"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "2",
+        "cached_input": "0.2",
+        "cache_write": "2.5",
+        "output": "10"
+      },
+      "multipliers": {
+        "cached_input": "0.1",
+        "cache_write": "1.25"
+      },
+      "min_cacheable_tokens": 1024,
+      "tiers": null,
+      "long_context": {
+        "threshold_input_tokens": 272000,
+        "input_multiplier": "2",
+        "output_multiplier": "1.5",
+        "prices_usd_per_mtok": {
+          "input": "4",
+          "cached_input": "0.4",
+          "cache_write": "5",
+          "output": "15"
+        },
+        "multipliers": {
+          "cached_input": "0.1",
+          "cache_write": "1.25"
+        },
+        "verified": true,
+        "source_ids": [
+          "O1"
+        ],
+        "scope": "request",
+        "scope_verified": true,
+        "scope_source_id": "OM-gpt-6-sol",
+        "note": "O1 prints these prices for input over 272K. The model page (OM-gpt-6-sol) states that the long-context rate applies to the full request, so the scope is request."
+      },
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "O1",
+        "O2",
+        "OM-gpt-6-sol"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "gpt-6-luna",
+      "name": "GPT-6 Luna",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-6-luna"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "0.1",
+        "cached_input": "0.01",
+        "cache_write": "0.125",
+        "output": "0.5"
+      },
+      "multipliers": {
+        "cached_input": "0.1",
+        "cache_write": "1.25"
+      },
+      "min_cacheable_tokens": 1024,
+      "tiers": null,
+      "long_context": {
+        "threshold_input_tokens": 272000,
+        "input_multiplier": "2",
+        "output_multiplier": "1.5",
+        "prices_usd_per_mtok": {
+          "input": "0.2",
+          "cached_input": "0.02",
+          "cache_write": "0.25",
+          "output": "0.75"
+        },
+        "multipliers": {
+          "cached_input": "0.1",
+          "cache_write": "1.25"
+        },
+        "verified": true,
+        "source_ids": [
+          "O1"
+        ],
+        "scope": "request",
+        "scope_verified": true,
+        "scope_source_id": "OM-gpt-6-luna",
+        "note": "O1 prints these prices for input over 272K. The model page (OM-gpt-6-luna) states that the long-context rate applies to the full request, so the scope is request."
+      },
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "O1",
+        "O2",
+        "OM-gpt-6-luna"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "name": "GPT-5.6 Sol",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-5.6-sol"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "4",
+        "cached_input": "0.4",
+        "cache_write": "5",
+        "output": "20"
+      },
+      "multipliers": {
+        "cached_input": "0.1",
+        "cache_write": "1.25"
+      },
+      "min_cacheable_tokens": 1024,
+      "tiers": null,
+      "long_context": {
+        "threshold_input_tokens": 272000,
+        "input_multiplier": "2",
+        "output_multiplier": "1.5",
+        "prices_usd_per_mtok": {
+          "input": "8",
+          "cached_input": "0.8",
+          "cache_write": "10",
+          "output": "30"
+        },
+        "multipliers": {
+          "cached_input": "0.1",
+          "cache_write": "1.25"
+        },
+        "verified": true,
+        "source_ids": [
+          "O1"
+        ],
+        "scope": "request",
+        "scope_verified": true,
+        "scope_source_id": "OM-gpt-5.6-sol",
+        "note": "O1 prints these prices for input over 272K. The model page (OM-gpt-5.6-sol) states that the long-context rate applies to the full request, so the scope is request."
+      },
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "O1",
+        "O2",
+        "OM-gpt-5.6-sol"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "O1 lists this price as a promotion through at least 2026-11-21. Dollars after that date may differ from this table."
+      ],
+      "price_valid_through_at_least": "2026-11-21"
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "name": "GPT-5.6 Terra",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-5.6-terra"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "2",
+        "cached_input": "0.2",
+        "cache_write": "2.5",
+        "output": "12"
+      },
+      "multipliers": {
+        "cached_input": "0.1",
+        "cache_write": "1.25"
+      },
+      "min_cacheable_tokens": 1024,
+      "tiers": null,
+      "long_context": {
+        "threshold_input_tokens": 272000,
+        "input_multiplier": "2",
+        "output_multiplier": "1.5",
+        "prices_usd_per_mtok": {
+          "input": "4",
+          "cached_input": "0.4",
+          "cache_write": "5",
+          "output": "18"
+        },
+        "multipliers": {
+          "cached_input": "0.1",
+          "cache_write": "1.25"
+        },
+        "verified": true,
+        "source_ids": [
+          "O1"
+        ],
+        "scope": "request",
+        "scope_verified": true,
+        "scope_source_id": "OM-gpt-5.6-terra",
+        "note": "O1 prints these prices for input over 272K. The model page (OM-gpt-5.6-terra) states that the long-context rate applies to the full request, so the scope is request."
+      },
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "O1",
+        "O2",
+        "OM-gpt-5.6-terra"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "name": "GPT-5.6 Luna",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-5.6-luna"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "0.2",
+        "cached_input": "0.02",
+        "cache_write": "0.25",
+        "output": "1.2"
+      },
+      "multipliers": {
+        "cached_input": "0.1",
+        "cache_write": "1.25"
+      },
+      "min_cacheable_tokens": 1024,
+      "tiers": null,
+      "long_context": {
+        "threshold_input_tokens": 272000,
+        "input_multiplier": "2",
+        "output_multiplier": "1.5",
+        "prices_usd_per_mtok": {
+          "input": "0.4",
+          "cached_input": "0.04",
+          "cache_write": "0.5",
+          "output": "1.8"
+        },
+        "multipliers": {
+          "cached_input": "0.1",
+          "cache_write": "1.25"
+        },
+        "verified": true,
+        "source_ids": [
+          "O1"
+        ],
+        "scope": "request",
+        "scope_verified": true,
+        "scope_source_id": "OM-gpt-5.6-luna",
+        "note": "O1 prints these prices for input over 272K. The model page (OM-gpt-5.6-luna) states that the long-context rate applies to the full request, so the scope is request."
+      },
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "O1",
+        "O2",
+        "OM-gpt-5.6-luna"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": []
+    },
+    {
+      "id": "gpt-5.5",
+      "name": "GPT-5.5",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-5.5"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "5",
+        "cached_input": "0.5",
+        "cache_write": null,
+        "output": "30"
+      },
+      "multipliers": {
+        "cached_input": null,
+        "cache_write": null
+      },
+      "min_cacheable_tokens": null,
+      "tiers": null,
+      "long_context": {
+        "threshold_input_tokens": 272000,
+        "input_multiplier": "2",
+        "output_multiplier": "1.5",
+        "prices_usd_per_mtok": {
+          "input": "10",
+          "cached_input": "1",
+          "cache_write": null,
+          "output": "45"
+        },
+        "verified": true,
+        "source_ids": [
+          "O1"
+        ],
+        "scope": "session",
+        "scope_verified": true,
+        "scope_source_id": "OM-gpt-5.5",
+        "note": "O1 prints these prices for input over 272K. The model page (OM-gpt-5.5) states that the long-context rate applies to the full session, so the scope is session."
+      },
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "O1",
+        "O2",
+        "OM-gpt-5.5"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "O2 calls the cached input rate model-dependent for GPT-5.5 and earlier, so no multiplier is stored. The cached input price is the figure listed on O1.",
+        "No cache write price is listed on O1 and O2 states no write charge for GPT-5.5 and earlier. Per R3.6 a response with cache write tokens above 0 on this model gets no dollars.",
+        "Minimum cacheable length is not fixed for GPT-5.5 and earlier (O2), stored as null.",
+        "The O1 row is the under 272K input price."
+      ]
+    },
+    {
+      "id": "gpt-5.4",
+      "name": "GPT-5.4",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-5.4"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "2.5",
+        "cached_input": "0.25",
+        "cache_write": null,
+        "output": "15"
+      },
+      "multipliers": {
+        "cached_input": null,
+        "cache_write": null
+      },
+      "min_cacheable_tokens": null,
+      "tiers": null,
+      "long_context": {
+        "threshold_input_tokens": 272000,
+        "input_multiplier": "2",
+        "output_multiplier": "1.5",
+        "prices_usd_per_mtok": {
+          "input": "5",
+          "cached_input": "0.5",
+          "cache_write": null,
+          "output": "22.5"
+        },
+        "verified": true,
+        "source_ids": [
+          "O1"
+        ],
+        "scope": "session",
+        "scope_verified": true,
+        "scope_source_id": "OM-gpt-5.4",
+        "note": "O1 prints these prices for input over 272K. The model page (OM-gpt-5.4) states that the long-context rate applies to the full session, so the scope is session."
+      },
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "O1",
+        "O2",
+        "OM-gpt-5.4"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "O2 calls the cached input rate model-dependent for GPT-5.5 and earlier, so no multiplier is stored. The cached input price is the figure listed on O1.",
+        "No cache write price is listed on O1 and O2 states no write charge for GPT-5.5 and earlier. Per R3.6 a response with cache write tokens above 0 on this model gets no dollars.",
+        "Minimum cacheable length is not fixed for GPT-5.5 and earlier (O2), stored as null.",
+        "The O1 row is the under 272K input price."
+      ]
+    },
+    {
+      "id": "gpt-5.4-mini",
+      "name": "GPT-5.4 mini",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-5.4-mini"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "0.75",
+        "cached_input": "0.075",
+        "cache_write": null,
+        "output": "4.5"
+      },
+      "multipliers": {
+        "cached_input": null,
+        "cache_write": null
+      },
+      "min_cacheable_tokens": null,
+      "tiers": null,
+      "long_context": null,
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "O1",
+        "O2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "O2 calls the cached input rate model-dependent for GPT-5.5 and earlier, so no multiplier is stored. The cached input price is the figure listed on O1.",
+        "No cache write price is listed on O1 and O2 states no write charge for GPT-5.5 and earlier. Per R3.6 a response with cache write tokens above 0 on this model gets no dollars.",
+        "Minimum cacheable length is not fixed for GPT-5.5 and earlier (O2), stored as null."
+      ]
+    },
+    {
+      "id": "gpt-5.3-codex",
+      "name": "GPT-5.3 Codex",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-5.3-codex"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "1.75",
+        "cached_input": "0.175",
+        "cache_write": null,
+        "output": "14"
+      },
+      "multipliers": {
+        "cached_input": null,
+        "cache_write": null
+      },
+      "min_cacheable_tokens": null,
+      "tiers": null,
+      "long_context": null,
+      "fast": {
+        "prices_usd_per_mtok": {
+          "input": "3.5",
+          "cached_input": "0.35",
+          "cache_write": null,
+          "output": "28"
+        },
+        "verified": true,
+        "source_ids": [
+          "O1"
+        ],
+        "note": "Priority or fast tier row on O1. The tier is not observable in Codex logs, so a Codex response gets no dollars (R3.4, modifiers.openai_service_tier). This row is kept as a printed fact and is not applied."
+      },
+      "geo_us": null,
+      "source_ids": [
+        "O1",
+        "O2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "O2 calls the cached input rate model-dependent for GPT-5.5 and earlier, so no multiplier is stored. The cached input price is the figure listed on O1.",
+        "No cache write price is listed on O1 and O2 states no write charge for GPT-5.5 and earlier. Per R3.6 a response with cache write tokens above 0 on this model gets no dollars.",
+        "Minimum cacheable length is not fixed for GPT-5.5 and earlier (O2), stored as null."
+      ]
+    },
+    {
+      "id": "gpt-5.2",
+      "name": "GPT-5.2",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-5.2"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "1.75",
+        "cached_input": "0.175",
+        "cache_write": null,
+        "output": "14"
+      },
+      "multipliers": {
+        "cached_input": null,
+        "cache_write": null
+      },
+      "min_cacheable_tokens": null,
+      "tiers": null,
+      "long_context": null,
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "O1",
+        "O2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "O2 calls the cached input rate model-dependent for GPT-5.5 and earlier, so no multiplier is stored. The cached input price is the figure listed on O1.",
+        "No cache write price is listed on O1 and O2 states no write charge for GPT-5.5 and earlier. Per R3.6 a response with cache write tokens above 0 on this model gets no dollars.",
+        "Minimum cacheable length is not fixed for GPT-5.5 and earlier (O2), stored as null."
+      ]
+    },
+    {
+      "id": "gpt-5.1",
+      "name": "GPT-5.1",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-5.1"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "1.25",
+        "cached_input": "0.125",
+        "cache_write": null,
+        "output": "10"
+      },
+      "multipliers": {
+        "cached_input": null,
+        "cache_write": null
+      },
+      "min_cacheable_tokens": null,
+      "tiers": null,
+      "long_context": null,
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "O1",
+        "O2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "O2 calls the cached input rate model-dependent for GPT-5.5 and earlier, so no multiplier is stored. The cached input price is the figure listed on O1.",
+        "No cache write price is listed on O1 and O2 states no write charge for GPT-5.5 and earlier. Per R3.6 a response with cache write tokens above 0 on this model gets no dollars.",
+        "Minimum cacheable length is not fixed for GPT-5.5 and earlier (O2), stored as null."
+      ]
+    },
+    {
+      "id": "gpt-5",
+      "name": "GPT-5",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-5"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "1.25",
+        "cached_input": "0.125",
+        "cache_write": null,
+        "output": "10"
+      },
+      "multipliers": {
+        "cached_input": null,
+        "cache_write": null
+      },
+      "min_cacheable_tokens": null,
+      "tiers": null,
+      "long_context": null,
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "O1",
+        "O2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "O2 calls the cached input rate model-dependent for GPT-5.5 and earlier, so no multiplier is stored. The cached input price is the figure listed on O1.",
+        "No cache write price is listed on O1 and O2 states no write charge for GPT-5.5 and earlier. Per R3.6 a response with cache write tokens above 0 on this model gets no dollars.",
+        "Minimum cacheable length is not fixed for GPT-5.5 and earlier (O2), stored as null."
+      ]
+    },
+    {
+      "id": "gpt-5-mini",
+      "name": "GPT-5 mini",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-5-mini"
+      ],
+      "aliases": [],
+      "status": "available",
+      "prices_usd_per_mtok": {
+        "input": "0.25",
+        "cached_input": "0.025",
+        "cache_write": null,
+        "output": "2"
+      },
+      "multipliers": {
+        "cached_input": null,
+        "cache_write": null
+      },
+      "min_cacheable_tokens": null,
+      "tiers": null,
+      "long_context": null,
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "O1",
+        "O2"
+      ],
+      "verified": true,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "O2 calls the cached input rate model-dependent for GPT-5.5 and earlier, so no multiplier is stored. The cached input price is the figure listed on O1.",
+        "No cache write price is listed on O1 and O2 states no write charge for GPT-5.5 and earlier. Per R3.6 a response with cache write tokens above 0 on this model gets no dollars.",
+        "Minimum cacheable length is not fixed for GPT-5.5 and earlier (O2), stored as null."
+      ]
+    },
+    {
+      "id": "gpt-5-codex",
+      "name": "gpt-5-codex",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-5-codex"
+      ],
+      "aliases": [],
+      "status": "unpriced",
+      "prices_usd_per_mtok": null,
+      "multipliers": null,
+      "min_cacheable_tokens": null,
+      "tiers": null,
+      "long_context": null,
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "O2"
+      ],
+      "verified": false,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "No price for this model is on O1. It produces no dollars.",
+        "O2 names it for 24h retention only."
+      ]
+    },
+    {
+      "id": "gpt-5.1-codex",
+      "name": "gpt-5.1-codex",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-5.1-codex"
+      ],
+      "aliases": [],
+      "status": "unpriced",
+      "prices_usd_per_mtok": null,
+      "multipliers": null,
+      "min_cacheable_tokens": null,
+      "tiers": null,
+      "long_context": null,
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "O2"
+      ],
+      "verified": false,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "No price for this model is on O1. It produces no dollars.",
+        "O2 names it for 24h retention only."
+      ]
+    },
+    {
+      "id": "gpt-5.1-codex-max",
+      "name": "gpt-5.1-codex-max",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-5.1-codex-max"
+      ],
+      "aliases": [],
+      "status": "unpriced",
+      "prices_usd_per_mtok": null,
+      "multipliers": null,
+      "min_cacheable_tokens": null,
+      "tiers": null,
+      "long_context": null,
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "O2"
+      ],
+      "verified": false,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "No price for this model is on O1. It produces no dollars.",
+        "O2 names it for 24h retention only."
+      ]
+    },
+    {
+      "id": "gpt-5.1-codex-mini",
+      "name": "gpt-5.1-codex-mini",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-5.1-codex-mini"
+      ],
+      "aliases": [],
+      "status": "unpriced",
+      "prices_usd_per_mtok": null,
+      "multipliers": null,
+      "min_cacheable_tokens": null,
+      "tiers": null,
+      "long_context": null,
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [
+        "O2"
+      ],
+      "verified": false,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "No price for this model is on O1. It produces no dollars.",
+        "O2 names it for 24h retention only."
+      ]
+    },
+    {
+      "id": "gpt-5.2-codex",
+      "name": "gpt-5.2-codex",
+      "provider": "openai",
+      "model_ids": [
+        "gpt-5.2-codex"
+      ],
+      "aliases": [],
+      "status": "unpriced",
+      "prices_usd_per_mtok": null,
+      "multipliers": null,
+      "min_cacheable_tokens": null,
+      "tiers": null,
+      "long_context": null,
+      "fast": null,
+      "geo_us": null,
+      "source_ids": [],
+      "verified": false,
+      "verified_at": "2026-10-09",
+      "notes": [
+        "No price for this model is on O1. It produces no dollars.",
+        "Not named with a price on either page."
+      ]
+    }
+  ]
+}

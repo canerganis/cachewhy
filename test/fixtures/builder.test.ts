@@ -59,7 +59,7 @@ test('claude usage variants: bucket mismatch, missing cache_creation, no final c
   assert.equal('speed' in (ff.records[0]!.message as any).usage, true);
 });
 
-test('claude records: compact_boundary, duplicates and replay keep identity fields', () => {
+test('claude records: compact_boundary, duplicates and replay keep uuids and key fields', () => {
   const p = new ClaudeProject();
   const a = p.session({ sessionId: 'synthetic-session-a' });
   a.main.user();
@@ -75,7 +75,8 @@ test('claude records: compact_boundary, duplicates and replay keep identity fiel
   assert.deepEqual(a.main.records[n], a.main.records[n - 2]);
   const b = p.session({ sessionId: 'synthetic-session-b' });
   b.main.replay(a.main.records);
-  assert.equal(b.main.records[0]!.sessionId, 'synthetic-session-a');
+  assert.equal(b.main.records[0]!.sessionId, 'synthetic-session-b'); // the copying session owns the copy
+  assert.equal(b.main.records[0]!.uuid, a.main.records[0]!.uuid);
   assert.equal(b.main.records[1]!.uuid, a.main.records[1]!.uuid);
 });
 

@@ -161,7 +161,9 @@ function claudeReplay(opts: BuildOptions = {}): GeneratedFile[] {
   a.main.user();
   a.main.request({ usage: { input: 5, cacheRead: 10000, write5m: 500, output: 100 } });
   const b = p.session({ sessionId: 'synthetic-session-fork', startMs: Date.UTC(2026, 0, 1, 1) });
-  b.main.replay(a.main.records);
+  // Skip the first origin record: the origin stream must start strictly earlier than the copy, otherwise the
+  // replay ties on stream_start and ownership is ambiguous (R4.6).
+  b.main.replay(a.main.records.slice(1));
   b.main.user();
   // First own response of the fork: positive counters, must still be counted.
   b.main.request({ usage: { input: 5, cacheRead: 10500, write5m: 700, output: 150 } });

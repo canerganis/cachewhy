@@ -1,0 +1,217 @@
+// The `cachewhy/1` JSON writer (R14.3, R14.5). Every output string goes through the allowlist serializer of
+// `util/sanitize.ts`: values are copied only into declared fields, every string is an enum, a tool-generated id, a
+// bounded model id or version, or an ISO instant, and every BigInt is a decimal string (R17.1). A new field needs a
+// schema entry here, a test update and an allowlist entry (R14.3).
+//
+// Additions to the field list of R14.5 made for the accounting-only summary (documented here, covered by tests):
+//   totals[].tokens_total, totals[].total_input, totals[].usd_hi, totals[].output_unknown, totals[].requests_priced,
+//   totals[].models[] (per model rows), coverage.versions as an array of {version, lines}.
+// `events` and `boundaries` are empty arrays until sections 7 to 11 exist: the schema accepts no item, so adding one
+// forces a schema change.
+import {
+  ASSUMPTIONS,
+  COVERAGE_COUNT_FIELDS,
+  COVERAGE_TOKEN_FIELDS,
+  CONFLICT_KINDS,
+  ABSTAIN_CODES,
+  DRIFT_CODES,
+  GATE_ABSTAIN_CODES,
+  HEADLINE_STATUSES,
+  PROVIDERS,
+  REQUEST_KINDS,
+  SCHEMA_ID,
+  SPEC_ID,
+  UNLINKED_REASONS,
+  UNLOGGED_BUCKETS,
+  UNPRICED_MODIFIER_REASONS,
+} from "../model/types.js";
+import type { CoverageCounters, DriftFinding, ProviderTotals, ReportInput } from "../model/types.js";
+import { loadDefaultPriceBook } from "../pricing/index.js";
+import { modelIdSchema, s, serialize, versionSchema } from "../util/sanitize.js";
+import type { Schema } from "../util/sanitize.js";
+
+const TABLE_VERSION_RE = /^pt-[0-9]{4}-[0-9]{2}-[0-9]{2}(\.[0-9]+)?$/;
+
+function intRecord<K extends string>(keys: readonly K[]): Schema {
+  return s.object(Object.fromEntries(keys.map((k) => [k, s.int(0)])) as Record<string, Schema>);
+}
+
+function coverageSchema(): Schema {
+  const fields: Record<string, Schema> = {};
+  for (const f of COVERAGE_COUNT_FIELDS) fields[f] = s.int(0);
+  for (const f of COVERAGE_TOKEN_FIELDS) fields[f] = s.decimal();
+  fields["requests_unpriced_modifier_by_reason"] = intRecord(UNPRICED_MODIFIER_REASONS);
+  fields["requests_conflict_by_kind"] = intRecord(CONFLICT_KINDS);
+  fields["links_unlinked_by_reason"] = intRecord(UNLINKED_REASONS);
+  fields["pairs_abstained_by_code"] = intRecord(ABSTAIN_CODES);
+  fields["requests_gate_abstained_by_code"] = intRecord(GATE_ABSTAIN_CODES);
+  // R17.5: signed decimal strings
+  fields["unlogged_tokens_estimate"] = s.object(Object.fromEntries(UNLOGGED_BUCKETS.map((b) => [b, s.decimal()])));
+  fields["versions"] = s.array(s.object({ version: versionSchema, lines: s.int(0) }), 64);
+  return s.object(fields);
+}
+
+const SUM_FIELDS = [
+  "input_uncached",
+  "cache_read",
+  "cache_write_5m",
+  "cache_write_1h",
+  "cache_write_unknown_ttl",
+  "cache_write",
+  "output",
+  "output_lower_bound_unknown",
+] as const;
+
+function tokensSchema(): Schema {
+  return s.object(Object.fromEntries(SUM_FIELDS.map((f) => [f, s.decimal()])));
+}
+
+function totalsSchema(modelId: Schema): Schema {
+  const model = s.object({
+    // null: the model is not verified (R2.10). `unlisted`: verified but not in the table (R3.3).
+    model: s.nullable(modelId),
+    responses: s.int(0),
+    requests_priced: s.int(0),
+    tokens: tokensSchema(),
+    total_input: s.decimal(),
+    tokens_total: s.decimal(),
+    usd: s.nullable(s.decimal()),
+    usd_hi: s.nullable(s.decimal()),
+    tokens_unpriced: s.decimal(),
+    output_unknown: s.int(0),
+  });
+  return s.object({
+    provider: s.enum(PROVIDERS),
+    requests_by_kind: intRecord(REQUEST_KINDS),
+    requests_total: s.int(0),
+    requests_priced: s.int(0),
+    tokens: tokensSchema(),
+    total_input: s.decimal(),
+    tokens_total: s.decimal(),
+    usd: s.nullable(s.decimal()),
+    usd_hi: s.nullable(s.decimal()),
+    tokens_unpriced: s.decimal(),
+    output_unknown: s.int(0),
+    models: s.array(model, 512),
+  });
+}
+
+function reportSchema(modelId: Schema): Schema {
+  return s.object({
+    schema: s.const(SCHEMA_ID),
+    generated_at: s.iso(),
+    tool_version: s.pattern(/^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$/),
+    spec: s.const(SPEC_ID),
+    table_version: s.pattern(TABLE_VERSION_RE),
+    window: s.object({ since: s.iso(), until: s.iso() }),
+    headline_status: s.enum(HEADLINE_STATUSES),
+    withheld_reason: s.nullable(s.enum(DRIFT_CODES)),
+    assumptions: s.array(s.enum(ASSUMPTIONS), 64),
+    coverage: coverageSchema(),
+    totals: s.array(totalsSchema(modelId), 8),
+    events: s.array(s.object({}), 0),
+    boundaries: s.array(s.object({}), 0),
+  });
+}
+
+function driftSchema(): Schema {
+  return s.array(
+    s.object({
+      code: s.enum(DRIFT_CODES),
+      provider: s.enum(PROVIDERS),
+      numerator: s.decimal(),
+      denominator: s.decimal(),
+      tripped: s.boolean(),
+    }),
+    32,
+  );
+}
+
+/** serialize() without the deep generic inference of Infer<Schema>. */
+const ser = serialize as unknown as (schema: Schema, value: unknown) => unknown;
+
+const iso = (ms: number): string => new Date(ms).toISOString();
+
+/** Coverage in output form: `versions` becomes a sorted array. Pure. */
+export function coverageToJson(c: CoverageCounters): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...c };
+  out["versions"] = Object.entries(c.versions)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([version, lines]) => ({ version, lines }));
+  return out;
+}
+
+/** Model ids allowed in the output: the ids of the price table (public facts) and `unlisted` (R3.3, R14.3). */
+function allowedModelIds(known: ReadonlySet<string> | undefined): Schema {
+  const ids = new Set<string>(["unlisted"]);
+  for (const id of known ?? loadDefaultPriceBook().models.keys()) ids.add(id);
+  return modelIdSchema(ids);
+}
+
+function totalsToJson(t: ProviderTotals, hideUsd: boolean): Record<string, unknown> {
+  const usd = (x: bigint | null): bigint | null => (hideUsd ? null : x);
+  return {
+    provider: t.provider,
+    requests_by_kind: t.requests_by_kind,
+    requests_total: t.requests_total,
+    requests_priced: t.requests_priced,
+    tokens: t.tokens,
+    total_input: t.total_input,
+    tokens_total: t.tokens_total,
+    usd: usd(t.usd_pico),
+    usd_hi: usd(t.usd_pico_hi),
+    tokens_unpriced: t.tokens_unpriced,
+    output_unknown: t.output_unknown,
+    models: t.models.map((m) => ({
+      model: m.model,
+      responses: m.responses,
+      requests_priced: m.requests_priced,
+      tokens: m.tokens,
+      total_input: m.total_input,
+      tokens_total: m.tokens_total,
+      usd: usd(m.usd_pico),
+      usd_hi: usd(m.usd_pico_hi),
+      tokens_unpriced: m.tokens_unpriced,
+      output_unknown: m.output_unknown,
+    })),
+  };
+}
+
+/**
+ * The report object in schema form. Throws a `SafeError` (code `E_SCHEMA_VIOLATION`, path only) if a value does not
+ * fit its declared field. When the headline is withheld (R17.3), no dollar figure is written (R16.5).
+ */
+export function reportToJson(input: ReportInput, knownModels?: ReadonlySet<string>): unknown {
+  const hideUsd = input.headline_status === "withheld";
+  const value = {
+    schema: input.schema,
+    generated_at: iso(input.generated_at_ms),
+    tool_version: input.tool_version,
+    spec: input.spec,
+    table_version: input.table_version,
+    window: { since: iso(input.window.since_ms), until: iso(input.window.until_ms) },
+    headline_status: input.headline_status,
+    withheld_reason: input.withheld_reason,
+    assumptions: input.assumptions,
+    coverage: coverageToJson(input.coverage),
+    totals: input.totals.map((t) => totalsToJson(t, hideUsd)),
+    events: [],
+    boundaries: [],
+  };
+  return ser(reportSchema(allowedModelIds(knownModels)), value);
+}
+
+export function reportToJsonText(input: ReportInput, knownModels?: ReadonlySet<string>, space = 2): string {
+  return JSON.stringify(reportToJson(input, knownModels), null, space);
+}
+
+/** Coverage and drift only, for `doctor --json` (R14.6: the doctor prints coverage and drift counters only). */
+export function doctorCoverageToJson(coverage: CoverageCounters, drift: readonly DriftFinding[]): { coverage: unknown; drift: unknown } {
+  return {
+    coverage: ser(coverageSchema(), coverageToJson(coverage)),
+    drift: ser(
+      driftSchema(),
+      drift.map((d) => ({ code: d.code, provider: d.provider, numerator: d.numerator, denominator: d.denominator, tripped: d.tripped })),
+    ),
+  };
+}

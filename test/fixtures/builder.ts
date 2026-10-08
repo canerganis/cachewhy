@@ -313,7 +313,7 @@ export class ClaudeThread {
   constructor(o: ClaudeThreadOptions) {
     this.sessionId = o.sessionId;
     this.agentId = o.agentId ?? null;
-    this.version = o.version ?? '2.1.290';
+    this.version = o.version ?? '2.1.293';
     this.entrypoint = o.entrypoint ?? 'cli';
     this.model = o.model ?? 'claude-sonnet-4-5';
     this.clock = o.clock ?? new Clock();
@@ -488,9 +488,17 @@ export class ClaudeThread {
     this.records.push(...tail);
   }
 
-  /** Append records copied from another thread verbatim (same uuid, timestamp, requestId): a replay region. */
+  /**
+   * Append records copied from another thread: a replay region. uuid, timestamp, requestId and message are kept
+   * verbatim, `sessionId` is the one of the copying thread (R4.6, R4.11: identity is read per record, and a key
+   * seen in two logical streams is a replay; real logs behave this way).
+   */
   replay(records: readonly ClaudeRecord[]): void {
-    for (const r of records) this.records.push(structuredClone(r));
+    for (const r of records) {
+      const c = structuredClone(r);
+      c.sessionId = this.sessionId;
+      this.records.push(c);
+    }
   }
 
   /** JSONL text. With a canary: planted fields, extra lines and a truncated last line (no newline). */
@@ -568,7 +576,7 @@ export class ClaudeSession {
     this.sessionId = o.sessionId;
     this.ids = o.ids ?? new IdGen();
     this.clock = o.clock ?? new Clock();
-    this.version = o.version ?? '2.1.290';
+    this.version = o.version ?? '2.1.293';
     this.entrypoint = o.entrypoint ?? 'cli';
     this.main = new ClaudeThread({
       sessionId: o.sessionId,
