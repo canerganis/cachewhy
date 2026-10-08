@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "table_version": "pt-2026-10-09.1",
+  "table_version": "pt-2026-10-09.2",
   "verified_at": "2026-10-09",
   "mode": "current list price repricing",
   "currency": "USD",
@@ -87,6 +87,7 @@
       "applies_to": "openai",
       "threshold_input_tokens": 272000,
       "constant": "C25",
+      "verified": true,
       "source_ids": [
         "O1"
       ],
