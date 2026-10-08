@@ -19,7 +19,7 @@ Gate audits run with `gpt-6.1-sol` at high reasoning effort, read-only, with the
 | S8 | 2026-10-09 | `spec-1` revision 8, gate G0-spec and G0-pricing for table `pt-2026-10-09` | FAIL | 0 P0, 2 P1, 3 P2 (section "Round 8 resolutions"). All 5 resolved in revision 9 and table version `pt-2026-10-09.1`. Audited revision hash: not recorded here, so it cannot support a PASS. |
 | S9 | 2026-10-09 | `spec-1` revision 9, gate G0-spec and G0-pricing for table `pt-2026-10-09.1` | FAIL | 0 P0, 1 P1, 1 P2 (section "Round 9 resolutions"). Both resolved in revision 10 and table version `pt-2026-10-09.2`. Audited revision hash: not recorded here, so it cannot support a PASS. |
 | S10 | 2026-10-09 | `spec-1` revision 10 (commit `c88ef0e`), gate G0-spec and G0-pricing for table `pt-2026-10-09.2` | FAIL | 0 P0, 1 P1, 2 P2 (section "Round 10 resolutions"). All 3 resolved in revision 11 by the new rule R0.9. The auditor text was not saved verbatim, so this round cannot support a PASS. |
-| S11 | 2026-10-09 | `spec-1` revision 11 (R0.9), gate G0-spec and G0-pricing for table `pt-2026-10-09.2` | pending | Committed before the audit (R15.1); receipt in section "Round 11 receipt". |
+| S11 | 2026-10-09 | `spec-1` revision 11 (R0.9, commit `264ad00`), gate G0-spec and G0-pricing for table `pt-2026-10-09.2` | PASS | 0 P0, 0 P1, 4 P2 (section "Round 11 receipt"). The P2 findings stay open for revision 12 and do not block the gate. |
 
 Naming: earlier versions of this table counted rounds 3 and 4 globally and left a stale "Round 5 pending against revision 3" row. From round 5 on, "Round N" in the headings below means spec audit SN of this table (S1 and S2 are also headed "G0 spec audit round 1 and 2"). Rounds 0 to 2 audited the plan, not the spec.
 
@@ -328,3 +328,36 @@ Removed in revision 11 (ids kept where the rule survives): R7.2 checks E3 and E4
 3. The round 10 counterexample abstains in all three variants (R0.9 fixture (1), R15.7).
 4. Nothing removed in revision 11 left a dangling reference, and the subsumed rules are really covered by R0.9.
 5. The table is unchanged (`pt-2026-10-09.2`), and `docs/pricing.md` limits scope statements to the OpenAI objects.
+
+## Round 11 receipt (target: `spec-1`, revision 11)
+
+Auditor: `gpt-6.1-sol` through `codex exec`, read-only sandbox, ephemeral session, with the full content embedded in the prompt. Reasoning effort: medium, as the orchestrator instructed for this run; R15.1 names high effort, so the gate owner decides whether this round satisfies R15.1 or a high-effort confirmation round is run. Scope: G0-spec and G0-pricing (all four files embedded: `docs/methodology.md`, `src/pricing/table.json`, `docs/pricing.md`, `docs/audit-log.md`). Verdict: PASS. Counts: 0 P0, 0 P1, 4 P2. The auditor ran no application tests and did not verify this receipt.
+
+Audited content: commit `264ad00abddd5dc201647fabe074bcf3277f4b12`, committed before the audit (R15.1). The prompt was built by script from the committed blobs of that commit. sha256 of the committed files: `docs/methodology.md` `74556b34b98aec19b7168046bf9af53f5c379417371290452ae6372fa4c54ca2`, `src/pricing/table.json` `2c02796fa386bc03ef47dbeb3e563596cb841b1e8b056d4e2d3c3d48619b98e6`, `docs/pricing.md` `d5655a4501aa943363654fa63ad5028e7590cf3fe8581263446d126a09bc3f72`, `docs/audit-log.md` `e93e1d349345f8d245ee2f1a5ca27dc0272922bc3078982f5811897ea3ecdc0e`. Embedded prompt: 345804 bytes, sha256 `bf0ca40ebf0074a5a808319bc33995ac3defa16b1d29392b7c61adae52ee9cd1`. Spec length: 1154 lines in revision 10, 1082 lines in revision 11.
+
+Open P2 findings, deliberately not applied after the audit, so that the PASS stays tied to the audited bytes. They go into revision 12 with their own audit:
+
+| # | Sev | Rules | Finding (short) | Planned resolution |
+|---|---|---|---|---|
+| 1 | P2 | R3.10, R0.9 | Pricing fixtures 3 and 4 of R3.10 now conflict with R0.9: the model conflict of fixture 3 taints the family, and the unreadable archive of fixture 4 taints every Codex chain, so no dollar exists even under `codex_tier_for_test` | Expect `chain_tainted` and `usd = null` in those variants, and keep the request-scope price tests on clean inputs |
+| 2 | P2 | R8.2, R10.6, R1.2 | R8.2 lists a `toolsHash` difference as a marker, but R1.2 keeps only its presence and R10.6 defines no hash comparison | Remove the `toolsHash` item from R8.2; the prefix file stays agent-level corroboration |
+| 3 | P2 | R14.5, R7.1 | The event schema says "six" decimal-string fields but lists seven | Name all seven fields as decimal strings |
+| 4 | P2 | R15.1 | S11 points to a "Round 11 receipt" section that the audited content did not hold | Resolved by this section |
+
+## G0 PASS
+
+G0 passed in spec audit round 11 (S11), revision 11, commit `264ad00`, table `pt-2026-10-09.2`. Final answer of the auditor, verbatim:
+
+VERDICT: PASS
+P0: 0. P1: 0. Aşağıdaki P2 bulguları PASS’i engellemiyor.
+
+- P2 | R3.10, R0.9: Eski fiyatlama fixture’ları yeni global abstention ile çelişiyor. Fixture 3’te model çatışması aileyi, fixture 4’te okunamayan arşiv bütün Codex sağlayıcısını taint eder; test tier parametresiyle de dolar üretilemez. Düzeltme: bu varyantlarda `chain_tainted`, `usd = null` bekleyin; request-scope fiyat testlerini temiz girdilerle ayrı tutun.
+- P2 | R8.2, R10.6, R1.2: R8.2, `toolsHash` farkını koşullu figürü kapatan marker sayıyor; allowlist yalnız varlığını tutuyor ve R10.6 hash karşılaştırması tanımlamıyor. Düzeltme: `toolsHash` farkı maddesini kaldırın; prefix dosyasını agent düzeyinde corroboration ile sınırlayın.
+- P2 | R14.5, R7.1: Event şeması `k_prev, k_hi_prev, r, w, u, d` için “six” diyor fakat yedi alan listeliyor. Düzeltme: yedi alanın tamamını decimal-string olarak açıkça tanımlayın.
+- P2 | R15.1, audit-log: S11’in gönderme yaptığı “Round 11 receipt” bölümü verilen içerikte yok. Düzeltme: önceden kaydedilmiş denetim baytlarından hesaplanan commit SHA, içerik SHA256, kapsam ve bu verdict’i ekleyin.
+
+Önceki kritik düzeltmeler metinde korunuyor: R0.9, round 10’un üç varyantını da abstention ile kapatıyor; tainted ailelerden model doğrulaması, dolar, event, boundary veya cause çıkmıyor. Codex tier belirsizliği dolar üretmiyor; Codex zaman ve compaction belirsizlikleri doğrulanmış neden üretmiyor.
+
+Kontrol edilen fiyatlar, Claude minimumları, fast ile geo birleşimi ve OpenAI request/session scope ayrımı resmi kaynaklarla uyumlu: [Claude fiyatları](https://platform.claude.com/docs/en/about-claude/pricing), [cache minimumları](https://platform.claude.com/docs/en/build-with-claude/prompt-caching), [OpenAI fiyatları](https://developers.openai.com/api/docs/pricing), [GPT-6 Sol request scope](https://developers.openai.com/api/docs/models/gpt-6-sol), [GPT-5.5 session scope](https://developers.openai.com/api/docs/models/gpt-5.5).
+
+Bu verdict gömülü belgelerin G0 denetimidir. Uygulama testleri ve commit/hash receipt doğrulaması yapılmadı.
