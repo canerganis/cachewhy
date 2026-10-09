@@ -721,10 +721,13 @@ describe("Claude cost (R3.5)", () => {
     assertUnpriced(price(codex({ model: "gpt-5.5", usage: { i: 1000, o: 1 } })), "unpriced_modifier", "long_context_scope");
   });
 
-  it("dated model ids are normalized before the match (R3.3)", () => {
+  it("the price lookup does not strip a date suffix again: ids are normalized once at read time (R3.3, S2.4)", () => {
+    // The parsers strip one suffix when they read a model, so a response never carries a dated id. An id that still
+    // has a suffix here (a doubly dated one, after one strip) has no row.
     const a = price(claude({ model: "claude-sonnet-5-5-20260101" }));
-    const b = price(claude({ model: "claude-sonnet-5-5" }));
-    assert.equal(usdPico(a), usdPico(b));
+    assert.equal(a.cost.pico, null);
+    assert.equal(a.cost.reason, "unknown_model");
+    assert.notEqual(price(claude({ model: "claude-sonnet-5-5" })).cost.pico, null);
   });
 
   it("matches the independent oracle for every verified Claude entry and several usage shapes", () => {

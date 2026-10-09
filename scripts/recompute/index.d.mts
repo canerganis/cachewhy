@@ -39,6 +39,7 @@ export interface RecomputeOptions {
    * Test-only (R0.9, live families): the run start in epoch ms or as an ISO instant. Default: the clock, read once per
    * run. A file is live when it holds an unparseable line, names a chain, and its mtime is positive and at most 600 s before this
    * instant (a later mtime counts as live; a missing mtime, 0 or a failed stat never does). There is no CLI flag and no environment variable.
+   * An ISO instant is parsed by the S3.1 grammar (1 to 9 fraction digits, calendar checked).
    */
   runStartMs?: number | string;
 }
@@ -85,7 +86,10 @@ export interface RecomputeResponse {
   model_source?: string;
   flags?: string[];
   buckets?: RecomputeBuckets;
+  /** Event time (R5.9): floor of `event_ns` in milliseconds, for display. */
   event_ms?: number | null;
+  /** S3.2: the exact event time in nanoseconds since the epoch. Never truncated to milliseconds before a comparison. */
+  event_ns?: bigint | null;
   price?: RecomputePrice;
 }
 
@@ -117,6 +121,10 @@ export interface RecomputeTaintCoverage {
   chains_tainted_by_reason: Record<RecomputeTaintReason, number>;
   families_total: number;
   families_tainted: number;
+  /** R17.3 revision 11.1: families that hold a chain tainted with reason ordinal_unverified. */
+  families_ordinal_unverified: number;
+  /** R3.9 revision 11.1: unpriced tokens of the counted set by the first refusing gate (decimal strings, fixed enum order). */
+  tokens_unpriced_by_reason: Record<string, string>;
   families_live_skipped: number;
   responses_in_tainted_chains: number;
   tokens_in_tainted_chains: string;
@@ -125,6 +133,12 @@ export interface RecomputeTaintCoverage {
   tokens_live_skipped: string;
   /** R16.1 / C36: 10 * tainted families > 3 * families, or 10 * tainted tokens > 3 * tokens (BigInt). */
   taint_warn: boolean;
+  /** S6.3: tokens of the incomplete responses (R2.12) as one decimal string: Claude i + r + W + o, Codex I + O, all BigInt. */
+  tokens_in_incomplete_responses: string;
+  /** Extra output: the per-field maxima behind the scalar, decimal strings. */
+  tokens_in_incomplete_by_field: Record<string, string>;
+  /** S6.1: every conflict code of a request counted once per code, conflict_diagnostics included. */
+  requests_conflict_by_kind: Record<string, number>;
 }
 
 export interface RecomputeResult {

@@ -20,6 +20,7 @@
 
 import { newLineStats, readLines } from "../io/lines.js";
 import type { DiscoveredFile } from "../discover.js";
+import { instantProj, instantState, nsToMs } from "../window.js";
 import {
   CODEX_FULL_VERSIONS,
   EFFORTS,
@@ -67,23 +68,35 @@ function isObj(v: unknown): v is Obj {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** A non-empty string id, else null. Ids exist only inside the process (R14.4). */
+/** A non-empty string id, else null. Ids exist only inside the process (R14.4). S1.1. */
 function idOf(v: unknown): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
 }
 
-/** R2.15 range check for an ordinal or an integer field: integer, 0 <= v <= MAX_SAFE_INTEGER. */
-function safeInt(v: unknown): number | null {
-  return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : null;
+/** S1.1, S1.3, S5.1: projection text of an id, the raw string (in memory only) or its state `missing` / `bad`. */
+function idProj(v: unknown): string {
+  if (v === undefined || v === null) return "~missing";
+  return typeof v === "string" && v.length > 0 ? `s${v}` : "~bad";
 }
 
-const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+/** S4.1: a counter or optional integer is `missing` (absent or null), `bad` (not a JSON number), `range`, or a BigInt. */
+type Cnt = bigint | "missing" | "bad" | "range";
 
-/** ISO instant to epoch ms, or null when it does not parse (R4.12 (a)). */
-function parseInstant(v: unknown): number | null {
-  if (typeof v !== "string" || v.length > 40 || !ISO_RE.test(v)) return null;
-  const ms = Date.parse(v);
-  return Number.isNaN(ms) ? null : ms;
+function cnt(v: unknown): Cnt {
+  if (v === undefined || v === null) return "missing";
+  if (typeof v !== "number") return "bad";
+  if (!Number.isSafeInteger(v) || v < 0) return "range";
+  return BigInt(v); // S4.2: BigInt immediately after the range check; -0 is 0
+}
+const isBig = (c: Cnt): c is bigint => typeof c === "bigint";
+const cntProj = (c: Cnt): string => (typeof c === "bigint" ? c.toString() : `~${c}`);
+/** A valid optional integer as a Number (ordinals, window numbers, depths: not token quantities), else null. */
+const intOf = (c: Cnt): number | null => (isBig(c) ? Number(c) : null);
+
+/** S3: an own instant parser; a record keeps the exact nanoseconds and the projection text of the state. */
+function instOf(v: unknown): { ns: bigint | null; proj: string; present: boolean } {
+  const st = instantState(v);
+  return { ns: typeof st === "string" ? null : st.ns, proj: instantProj(st), present: st !== "missing" };
 }
 
 const FULL_VERSIONS: ReadonlySet<string> = new Set<string>(CODEX_FULL_VERSIONS);
@@ -94,14 +107,15 @@ function versionLabel(v: unknown): string {
   return typeof v === "string" && v.length <= 40 && VERSION_RE.test(v) ? v : "unlisted";
 }
 
-// R14.3 model id form. R3.3 normalization strips a trailing -YYYYMMDD.
+// R14.3 model id form. R3.3 normalization strips a trailing -YYYYMMDD. S2.3: no model and `unlisted` both give null.
 const MODEL_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 function normalizeModel(v: unknown): string | null {
-  if (typeof v !== "string" || v.length > 80) return null;
-  const n = v.replace(/-\d{8}$/, "");
+  if (typeof v !== "string" || v.length === 0 || v.length > 80) return null;
+  const n = v.replace(/-[0-9]{8}$/, "");
   return MODEL_RE.test(n) ? n : null;
 }
 
+/** S1.2: a listed string is itself, absent or null is null (`missing`), anything else is `other`. */
 function enumOf<T extends string>(v: unknown, allowed: readonly T[]): T | "other" | null {
   if (v === undefined || v === null) return null;
   return typeof v === "string" && (allowed as readonly string[]).includes(v) ? (v as T) : "other";
@@ -115,6 +129,11 @@ const EVENT_TYPES = ["token_count", "thread_settings_applied"] as const;
 
 function boundedToken(v: unknown): string | null {
   return typeof v === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(v) ? v : null;
+}
+/** Projection text of a bounded token: the value, `missing`, or `bad` (present and not a bounded token). */
+function tokenProj(v: unknown): string {
+  if (v === undefined || v === null) return "~missing";
+  return boundedToken(v) !== null ? `s${v as string}` : "~bad";
 }
 
 const USAGE_FIELDS = [
@@ -142,7 +161,6 @@ function cid(thread: string): ChainId {
 // ---------------------------------------------------------------------------
 
 type RecKind = "meta" | "tc" | "tur" | "compacted" | "marker" | "tokcount" | "generic";
-type FieldState = "ok" | "range" | "missing";
 
 interface MetaF {
   id: string | null;
@@ -155,13 +173,15 @@ interface MetaF {
   has_subagent: boolean;
   subagent_other: boolean;
   hist_start: number | null;
+  /** S1.4: the full state of `subagent_history_start_ordinal` (missing, bad, range or value), compared by R4.11. */
+  hist_st: Cnt;
   thread_source: string | null;
   agent_role: string | null;
 }
 interface TcF {
   turn_id: string | null;
   root_turn_id: string | null;
-  model: string | null; // normalized and valid, null = absent or invalid
+  model: string | null; // normalized and valid, null = absent or invalid (S2.3)
   effort: Effort | null;
   comp_hash: string | null;
   collab: string | null;
@@ -171,10 +191,10 @@ interface TurF {
   thread_id: string | null;
   session_id: string | null;
   turn_id: string | null;
-  u: number[]; // six counters, 0 where the state is not ok
-  us: FieldState[];
-  tt: number | null;
-  tt_state: FieldState;
+  /** S4.1, S4.2: the six `usage` integers as BigInt or their state. */
+  u: Cnt[];
+  /** `thread_token_usage.total_tokens`, read only for R13.6. */
+  tt_st: Cnt;
   /** R1.2, R4.12: the integer members of `thread_token_usage` and `turn_token_usage` (sorted by name). Part of the
    * retained projection, so two occurrences that differ here are not the same record (R4.4). Never printed. */
   cum: string;
@@ -187,7 +207,8 @@ interface CompF {
 interface Rec {
   readonly kind: RecKind;
   readonly key: string;
-  readonly ts: number | null;
+  /** Envelope instant, exact nanoseconds (S3.2); null when missing or not a valid instant. */
+  readonly ts: bigint | null;
   readonly ts_present: boolean;
   readonly ord: number | null;
   readonly ord_present: boolean;
@@ -204,7 +225,7 @@ interface Draft {
   kind: RecKind;
   known: boolean;
   key: string;
-  ts: number | null;
+  ts: bigint | null;
   ts_present: boolean;
   ord: number | null;
   ord_present: boolean;
@@ -218,19 +239,18 @@ function isDecision(r: Rec): boolean {
   return r.kind === "meta" || r.kind === "tc" || r.kind === "tur" || r.kind === "compacted" || r.kind === "marker";
 }
 
-function fieldState(v: unknown): FieldState {
-  if (typeof v !== "number") return "missing";
-  return Number.isSafeInteger(v) && v >= 0 ? "ok" : "range";
-}
-
-/** Integer members of a cumulative counter object, sorted by member name, as a stable string (R1.2, R4.12). */
-function cumMembers(v: unknown): string | null {
-  if (!isObj(v)) return v === undefined ? null : "!";
-  // A member outside R2.15 is reduced to the state `"r"`; its raw value is not kept.
-  const out: Array<[string, number | "r"]> = [];
+/**
+ * Integer members of a cumulative counter object, sorted by member name, as a stable string (R1.2, R4.12, S5.1). The
+ * object itself is `missing` (absent or null) or `bad` (not an object). A member outside R2.15 is reduced to `range`;
+ * its raw value is not kept.
+ */
+function cumMembers(v: unknown): string {
+  if (v === undefined || v === null) return "~missing";
+  if (!isObj(v)) return "~bad";
+  const out: Array<[string, string]> = [];
   for (const k of Object.keys(v)) {
     const x = (v as Obj)[k];
-    if (typeof x === "number" && Number.isInteger(x)) out.push([k, Number.isSafeInteger(x) && x >= 0 ? x + 0 : "r"]);
+    if (typeof x === "number" && Number.isInteger(x)) out.push([k, Number.isSafeInteger(x) && x >= 0 ? BigInt(x).toString() : "range"]);
   }
   out.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
   return JSON.stringify(out);
@@ -239,14 +259,15 @@ function cumMembers(v: unknown): string | null {
 function draftOf(obj: unknown): Draft {
   const o = isObj(obj) ? obj : null;
   const type = o !== null && typeof o["type"] === "string" ? (o["type"] as string) : null;
-  const tsRaw = o?.["timestamp"];
-  const ordRaw = o?.["ordinal"];
-  const ts_present = tsRaw !== undefined && tsRaw !== null;
-  const ord_present = ordRaw !== undefined && ordRaw !== null;
-  const ts = parseInstant(tsRaw);
-  const ord = safeInt(ordRaw);
-  const tsKey = ts !== null ? ts : ts_present ? "!" : null;
-  const ordKey = ord !== null ? ord : ord_present ? "!" : null;
+  const tsI = instOf(o?.["timestamp"]);
+  const ordC = cnt(o?.["ordinal"]);
+  const ts = tsI.ns;
+  const ord = intOf(ordC);
+  const ts_present = tsI.present;
+  const ord_present = ordC !== "missing";
+  // S3.2, S4.1: the envelope instant as exact nanoseconds or its state; the ordinal as a value or its state.
+  const tsKey = tsI.proj;
+  const ordKey = cntProj(ordC);
   const p = o !== null && isObj(o["payload"]) ? (o["payload"] as Obj) : EMPTY;
   const base = { ts, ts_present, ord, ord_present };
 
@@ -257,38 +278,43 @@ function draftOf(obj: unknown): Draft {
       let has_spawn = false;
       let subagent_other = false;
       let spawn_parent: string | null = null;
-      let spawn_depth: number | null = null;
+      let spawnParentRaw: unknown;
+      let depthC: Cnt = "missing";
       if (isObj(src) && isObj(src["subagent"])) {
         has_subagent = true;
         const sub = src["subagent"] as Obj;
-        subagent_other = sub["other"] !== undefined;
+        subagent_other = sub["other"] !== undefined && sub["other"] !== null; // S1.3: null is absent
         if (isObj(sub["thread_spawn"])) {
           has_spawn = true;
           const sp = sub["thread_spawn"] as Obj;
-          spawn_parent = idOf(sp["parent_thread_id"]);
-          spawn_depth = safeInt(sp["depth"]);
+          spawnParentRaw = sp["parent_thread_id"];
+          spawn_parent = idOf(spawnParentRaw);
+          depthC = cnt(sp["depth"]);
         }
       }
+      const histC = cnt(p["subagent_history_start_ordinal"]);
       const meta: MetaF = {
         id: idOf(p["id"]),
         session_id: idOf(p["session_id"]),
         label: versionLabel(p["cli_version"]),
         forked_from_id: idOf(p["forked_from_id"]),
         spawn_parent,
-        spawn_depth,
+        spawn_depth: intOf(depthC),
         has_spawn,
         has_subagent,
         subagent_other,
-        hist_start: safeInt(p["subagent_history_start_ordinal"]),
+        hist_start: intOf(histC),
+        hist_st: histC,
         thread_source: enumOf(p["thread_source"], THREAD_SOURCES),
         agent_role: enumOf(p["agent_role"], AGENT_ROLES),
       };
-      const srcKind = typeof src === "string" ? enumOf(src, SOURCE_KINDS) : has_subagent ? "subagent" : src === undefined ? null : "other";
+      const srcKind =
+        typeof src === "string" ? enumOf(src, SOURCE_KINDS) : has_subagent ? "subagent" : src === undefined || src === null ? null : "other";
       const key = JSON.stringify([
-        "session_meta", tsKey, ordKey, meta.id, meta.session_id, parseInstant(p["timestamp"]) ?? (p["timestamp"] === undefined ? null : "!"),
-        meta.label, meta.forked_from_id, p["parent_thread_id"] === undefined ? null : idOf(p["parent_thread_id"]),
-        meta.spawn_parent, meta.spawn_depth, meta.has_spawn, meta.has_subagent, meta.subagent_other,
-        meta.hist_start, p["subagent_history_start_ordinal"] === undefined ? null : meta.hist_start ?? "!",
+        "session_meta", tsKey, ordKey, idProj(p["id"]), idProj(p["session_id"]), instOf(p["timestamp"]).proj,
+        meta.label, idProj(p["forked_from_id"]), idProj(p["parent_thread_id"]),
+        idProj(spawnParentRaw), cntProj(depthC), meta.has_spawn, meta.has_subagent, meta.subagent_other,
+        cntProj(histC),
         enumOf(p["originator"], ORIGINATORS), srcKind, meta.thread_source, meta.agent_role,
       ]);
       return { kind: "meta", known: true, key, ...base, meta };
@@ -296,45 +322,37 @@ function draftOf(obj: unknown): Draft {
     case "turn_context": {
       const effortRaw = enumOf(p["effort"], EFFORTS);
       const cm = p["collaboration_mode"];
-      const mode = isObj(cm) ? boundedToken(cm["mode"]) : null;
+      const modeRaw: unknown = isObj(cm) ? cm["mode"] : undefined; // a container that is not retained: leaves only
       const tc: TcF = {
         turn_id: idOf(p["turn_id"]),
         root_turn_id: idOf(p["root_turn_id"]),
         model: normalizeModel(p["model"]),
         effort: effortRaw as Effort | null,
         comp_hash: boundedToken(p["comp_hash"]),
-        collab: mode,
+        collab: boundedToken(modeRaw),
       };
-      const key = JSON.stringify(["turn_context", tsKey, ordKey, tc.turn_id, tc.root_turn_id, tc.model, p["model"] === undefined ? 0 : 1, tc.effort, tc.comp_hash, tc.collab]);
+      const key = JSON.stringify([
+        "turn_context", tsKey, ordKey, idProj(p["turn_id"]), idProj(p["root_turn_id"]), tc.model, tc.effort, tokenProj(p["comp_hash"]), tokenProj(modeRaw),
+      ]);
       return { kind: "tc", known: true, key, ...base, tc };
     }
     case "token_usage_record": {
       const usage = isObj(p["usage"]) ? (p["usage"] as Obj) : EMPTY;
-      const u: number[] = [];
-      const us: FieldState[] = [];
-      for (const f of USAGE_FIELDS) {
-        const v = usage[f];
-        const st = fieldState(v);
-        us.push(st);
-        u.push(st === "ok" ? (v as number) : 0);
-      }
+      const u: Cnt[] = USAGE_FIELDS.map((f) => cnt(usage[f]));
       const tu = p["thread_token_usage"];
-      const ttRaw = isObj(tu) ? tu["total_tokens"] : undefined;
-      const tt_state = fieldState(ttRaw);
+      const tt_st = cnt(isObj(tu) ? tu["total_tokens"] : undefined);
       const tur: TurF = {
         response_id: idOf(p["response_id"]),
         thread_id: idOf(p["thread_id"]),
         session_id: idOf(p["session_id"]),
         turn_id: idOf(p["turn_id"]),
         u,
-        us,
-        tt: tt_state === "ok" ? (ttRaw as number) : null,
-        tt_state,
+        tt_st,
         cum: JSON.stringify([cumMembers(tu), cumMembers(p["turn_token_usage"])]),
       };
       const key = JSON.stringify([
-        "token_usage_record", tsKey, ordKey, tur.response_id, tur.thread_id, tur.session_id, tur.turn_id,
-        us.map((s, i) => (s === "ok" ? u[i] : s === "range" ? "r" : null)), tt_state === "ok" ? tur.tt : tt_state === "range" ? "r" : null,
+        "token_usage_record", tsKey, ordKey, idProj(p["response_id"]), idProj(p["thread_id"]), idProj(p["session_id"]), idProj(p["turn_id"]),
+        u.map(cntProj), cntProj(tt_st),
         tur.cum,
       ]);
       return { kind: "tur", known: true, key, ...base, tur };
@@ -342,13 +360,15 @@ function draftOf(obj: unknown): Draft {
     case "event_msg": {
       const pt = enumOf(p["type"], EVENT_TYPES);
       const kind: RecKind = pt === "thread_settings_applied" ? "marker" : pt === "token_count" ? "tokcount" : "generic";
-      return { kind, known: true, key: JSON.stringify(["event_msg", tsKey, ordKey, pt === null ? "other" : pt]), ...base };
+      // S1.2: an absent type is `missing`, an unlisted one is `other`, and the two differ.
+      return { kind, known: true, key: JSON.stringify(["event_msg", tsKey, ordKey, pt === null ? "missing" : pt]), ...base };
     }
     case "compacted": {
-      const comp: CompF = { window_number: safeInt(p["window_number"]), latest_null: p["latest_token_usage_record"] === undefined || p["latest_token_usage_record"] === null };
+      const wnC = cnt(p["window_number"]);
+      const comp: CompF = { window_number: intOf(wnC), latest_null: p["latest_token_usage_record"] === undefined || p["latest_token_usage_record"] === null };
       const key = JSON.stringify([
-        "compacted", tsKey, ordKey, idOf(p["compaction_response_id"]), idOf(p["window_id"]),
-        comp.window_number, p["window_number"] === undefined ? null : comp.window_number ?? "!", comp.latest_null,
+        "compacted", tsKey, ordKey, idProj(p["compaction_response_id"]), idProj(p["window_id"]),
+        cntProj(wnC), comp.latest_null,
       ]);
       return { kind: "compacted", known: true, key, ...base, comp };
     }
@@ -357,7 +377,8 @@ function draftOf(obj: unknown): Draft {
       return { kind: "generic", known: true, key: JSON.stringify(["response_item", tsKey, ordKey]), ...base };
     default:
       // R1.4: the raw type string is never stored; an unlisted type is the enum `other`.
-      return { kind: "generic", known: false, key: JSON.stringify(["other", tsKey, ordKey]), ...base };
+      // S1.2: an absent envelope type is `missing`, an unlisted one is `other`, and the two differ.
+      return { kind: "generic", known: false, key: JSON.stringify([o?.["type"] === undefined || o["type"] === null ? "missing" : "other", tsKey, ordKey]), ...base };
   }
 }
 
@@ -473,6 +494,8 @@ interface StreamB {
   root: string;
   /** The session_meta that describes the thread: an own one, else a copied one (the id is in V(S), so one exists). */
   pm: MetaF;
+  /** S10.4: the first own session_meta of the id (anywhere in the scan, whatever its file) with a forked_from_id. */
+  forkMeta: MetaF | null;
   label: string;
   ord_verified: boolean;
   fork: { from: string; hist: number | null; resolved: boolean } | null;
@@ -481,17 +504,37 @@ interface StreamB {
   tcs_by_turn: Map<string, Rec[]>;
   markers: Rec[]; // sorted by position
   single_model: string | null; // R2.17 (b): one valid model over G(S)
-  start_ms: number | null;
+  /** stream_start, exact nanoseconds (R4.6, S3.2). */
+  start: bigint | null;
   chain: ChainKey;
 }
 
+/** Instants ascending, an absent one first (the order of a record without a valid instant is only a tie break). */
+function cmpTime(a: bigint | null, b: bigint | null): number {
+  if (a === b) return 0;
+  if (a === null) return -1;
+  if (b === null) return 1;
+  return a < b ? -1 : 1;
+}
+
 function cmpPos(a: Rec, b: Rec): number {
-  const at = a.ts ?? Number.NEGATIVE_INFINITY;
-  const bt = b.ts ?? Number.NEGATIVE_INFINITY;
-  if (at !== bt) return at < bt ? -1 : 1;
+  const t = cmpTime(a.ts, b.ts);
+  if (t !== 0) return t;
   const ao = a.ord ?? -1;
   const bo = b.ord ?? -1;
   return ao === bo ? 0 : ao < bo ? -1 : 1;
+}
+
+/** S10.3: session_metas are ordered by (ordinal value, then projection key); a record without an ordinal value is last. */
+function cmpMetaOrder(a: Rec, b: Rec): number {
+  const ao = a.ord;
+  const bo = b.ord;
+  if (ao !== bo) {
+    if (ao === null) return 1;
+    if (bo === null) return -1;
+    return ao < bo ? -1 : 1;
+  }
+  return cmpKey(a, b);
 }
 
 function cmpKey(a: Rec, b: Rec): number {
@@ -518,11 +561,13 @@ function ordinalVerified(recs: readonly Rec[]): boolean {
     }
   }
   const ords = [...byOrd.keys()].sort((x, y) => x - y);
-  let last = Number.NEGATIVE_INFINITY;
+  // (c) S3.5: the instants of the ordinal-bearing records in ordinal order never decrease; a record without a valid instant
+  // is skipped. The comparison is on exact nanoseconds (S3.2).
+  let last: bigint | null = null;
   for (const o of ords) {
     const ts = (byOrd.get(o) as Rec).ts;
     if (ts === null) continue;
-    if (ts < last) return false; // (c)
+    if (last !== null && ts < last) return false;
     last = ts;
   }
   return true;
@@ -699,7 +744,8 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
       // A missing value is a value of its own: abstaining on a doubt (R4.11).
       const sess = new Set(ms.map((m) => (m.meta as MetaF).session_id));
       const forks = new Set(ms.map((m) => (m.meta as MetaF).forked_from_id));
-      const hists = new Set(ms.map((m) => (m.meta as MetaF).hist_start));
+      // S1.4: the history start keeps its full state (missing, bad, range or value) in this comparison.
+      const hists = new Set(ms.map((m) => cntProj((m.meta as MetaF).hist_st)));
       if (sess.size > 1 || forks.size > 1 || hists.size > 1) triggers.threads("stream_unresolved", [id]);
     }
   }
@@ -764,14 +810,18 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
       if (fa.assignment === "assigned") assigned.push(fa.sf.index);
       for (const m of fa.own_metas) if ((m.meta as MetaF).id === id && !own.includes(m)) own.push(m);
     }
-    own.sort(cmpKey);
-    const copies = (metasById.get(id) ?? []).slice().sort(cmpKey);
+    // S10.3: the describing session_meta is the stream's own one (several own ones are ordered by ordinal value, then
+    // projection key); a stream with no own one uses its copies in the same order.
+    own.sort(cmpMetaOrder);
+    const copies = (metasById.get(id) ?? []).slice().sort(cmpMetaOrder);
     const pool = own.length > 0 ? own : copies;
-    const primary = pool.find((m) => (m.meta as MetaF).forked_from_id !== null) ?? (pool[0] as Rec);
+    const primary = pool[0] as Rec;
     builds.set(id, {
       id, files: filesOfStream, assigned, own_metas: own, tur: turByThread.get(id) ?? [], root: id,
-      pm: primary.meta as MetaF, label: "unlisted", ord_verified: false, fork: null, tcs: [], tcs_by_turn: new Map(),
-      markers: [], single_model: null, start_ms: null, chain: { provider: "codex", root_session: id, thread: id },
+      pm: primary.meta as MetaF,
+      forkMeta: (own.find((m) => (m.meta as MetaF).forked_from_id !== null)?.meta as MetaF | undefined) ?? null,
+      label: "unlisted", ord_verified: false, fork: null, tcs: [], tcs_by_turn: new Map(),
+      markers: [], single_model: null, start: null, chain: { provider: "codex", root_session: id, thread: id },
     });
   }
   const streams: StreamB[] = [...builds.values()];
@@ -789,17 +839,16 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
     s.chain = { provider: "codex", root_session: root, thread: s.id };
     s.label = sortedUnique((s.own_metas.length > 0 ? s.own_metas : (metasById.get(s.id) ?? [])).map((m) => (m.meta as MetaF).label))[0] ?? "unlisted";
 
-    // records of the stream (R4.11): assigned files, own session_metas, its token_usage_records
+    // S3.5: the records of a stream for R4.12 are the records of the files assigned to it (R4.11). A token_usage_record or
+    // an own session_meta in a stream-conflict file is accounted by its thread_id but is not a record of the stream.
     const recSet = new Set<Rec>();
     for (const fi of s.assigned) for (const r of (fileAByIndex.get(fi) as FileA).sf.recs) recSet.add(r);
-    for (const m of s.own_metas) recSet.add(m);
-    for (const r of s.tur) recSet.add(r);
     const recs = [...recSet];
     s.ord_verified = ordinalVerified(recs);
     if (!s.ord_verified) triggers.threads("ordinal_unverified", [s.id]); // R4.12
-    let start: number | null = null;
+    let start: bigint | null = null;
     for (const r of recs) if (r.ts !== null && (start === null || r.ts < start)) start = r.ts;
-    s.start_ms = start;
+    s.start = start;
 
     // G(S): every turn_context of the assigned files, copied prefix included (R2.17 (c)); markers likewise.
     const tcSet = new Set<Rec>();
@@ -829,9 +878,11 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
     s.single_model = !anyInvalid && models.size === 1 ? ([...models][0] as string) : null;
 
     // fork facts (R4.9): a fork whose prefix cannot be cut is fork_prefix_unresolved and tainted (R0.9)
-    if (pm.forked_from_id !== null) {
-      const resolved = s.ord_verified && pm.hist_start !== null;
-      s.fork = { from: pm.forked_from_id, hist: pm.hist_start, resolved };
+    // S10.4: a fork iff an own session_meta of the id has a non-null forked_from_id; the prefix check reads those records.
+    const fm = s.forkMeta;
+    if (fm !== null && fm.forked_from_id !== null) {
+      const resolved = s.ord_verified && fm.hist_start !== null;
+      s.fork = { from: fm.forked_from_id, hist: fm.hist_start, resolved };
       if (!resolved) triggers.threads("fork_prefix_unresolved", [s.id]);
     }
   }
@@ -881,8 +932,8 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
         // "between" is symmetric: a usage record can be logged before the context of its own turn.
         let eo = earliest.ord;
         for (const t of own) if ((t.ord ?? Number.POSITIVE_INFINITY) < eo) eo = t.ord as number;
-        const lo = Math.min(eo, rec.ord);
-        const hi = Math.max(eo, rec.ord);
+        const lo = eo < rec.ord ? eo : rec.ord;
+        const hi = eo < rec.ord ? rec.ord : eo;
         settingsExcluded = !s.markers.some((m) => m.ord !== null && m.ord > lo && m.ord < hi);
       }
       if (single !== null && settingsExcluded) return { source: "own_turn", candidate: single, verified: true, ctx: earliest };
@@ -916,6 +967,9 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
   const turRecs = [...intern.values()].filter((r) => r.kind === "tur" && r.tur).sort(cmpKey);
 
   const filesOf = (rec: Rec): number[] => [...rec.files].sort((a, b) => a - b);
+  // Ledger entry of a record or response at the exact instant `ns`; `t_ms` is its floor (S3.3).
+  const at = (ns: bigint | null): { t_ms: number | null; t_ns: bigint | null } => ({ t_ms: ns === null ? null : nsToMs(ns), t_ns: ns });
+  const goneCnt = (c: Cnt): boolean => c === "missing" || c === "bad";
   for (const rec of turRecs) {
     const tur = rec.tur as TurF;
     if (tur.thread_id === null) {
@@ -924,7 +978,7 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
       triggers.provider("unattributed_record");
       cov.records_usage_bearing++;
       cov.records_unkeyed++;
-      ledger.push({ t_ms: rec.ts, chain: null, n: { records_usage_bearing: 1, records_unkeyed: 1 } });
+      ledger.push({ ...at(rec.ts), chain: null, n: { records_usage_bearing: 1, records_unkeyed: 1 } });
       continue;
     }
     const stream = streamById.get(tur.thread_id);
@@ -936,20 +990,23 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
     }
     cov.records_usage_bearing++;
     const streamChainId = chainIdOf(stream.chain);
-    if (tur.tt_state === "range") {
+    if (tur.tt_st === "range") {
       cov.fields_range_failed++;
-      ledger.push({ t_ms: rec.ts, chain: streamChainId, n: { fields_range_failed: 1 } });
+      ledger.push({ ...at(rec.ts), chain: streamChainId, n: { fields_range_failed: 1 } });
     }
     if (tur.response_id === null) {
       cov.records_unkeyed++; // R2.13
-      ledger.push({ t_ms: rec.ts, chain: streamChainId, n: { records_usage_bearing: 1, records_unkeyed: 1 } });
+      ledger.push({ ...at(rec.ts), chain: streamChainId, n: { records_usage_bearing: 1, records_unkeyed: 1 } });
       triggers.threads("request_anomaly", [tur.thread_id]); // unkeyed with a known chain
-      excluded.push({ provider: "codex", chain: stream.chain, reason: "unkeyed", event_ms: rec.ts ?? 0, ordinal: rec.ord, files: filesOf(rec) });
+      // A record without a valid instant has no place in the chain order (S3.4: never the epoch), so it is not listed.
+      if (rec.ts !== null) {
+        excluded.push({ provider: "codex", chain: stream.chain, reason: "unkeyed", event_ms: nsToMs(rec.ts), event_ns: rec.ts, ordinal: rec.ord, files: filesOf(rec) });
+      }
       continue;
     }
-    const unmappable = tur.us.some((x) => x === "missing") || rec.ts === null; // R2.12, R17.3 drift_unmappable
+    const unmappable = tur.u.some(goneCnt) || rec.ts === null; // R2.12, R17.3 drift_unmappable
     if (unmappable) cov.records_usage_unmappable++;
-    ledger.push({ t_ms: rec.ts, chain: streamChainId, n: unmappable ? { records_usage_bearing: 1, records_usage_unmappable: 1 } : { records_usage_bearing: 1 } });
+    ledger.push({ ...at(rec.ts), chain: streamChainId, n: unmappable ? { records_usage_bearing: 1, records_usage_unmappable: 1 } : { records_usage_bearing: 1 } });
     const arr = verifiedKeyed.get(tur.response_id);
     if (arr) arr.push(rec);
     else verifiedKeyed.set(tur.response_id, [rec]);
@@ -977,7 +1034,10 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
     const stream = streamById.get(tur.thread_id as string) as StreamB;
     const a = attrOf(rec);
     const ctxTc = a.ctx?.tc;
-    const ev = rec.ts ?? 0;
+    // A response without a valid envelope instant is `usage_incomplete` and never accounted; its placeholder time is the
+    // epoch and is read by no decision.
+    const evN = rec.ts ?? 0n;
+    const ev = nsToMs(evN);
     const fileList = extraFiles.length > 0 ? [...new Set([...filesOf(rec), ...extraFiles])].sort((x, y) => x - y) : filesOf(rec);
     const model: ModelAttribution = { candidate: a.candidate, verified: a.verified, source: a.source, model: a.verified ? a.candidate : null };
     const flags: ResponseFlag[] = [];
@@ -994,9 +1054,12 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
       flags,
       modifiers: { speed: null, inference_geo: null, service_tier: null },
       effort: ctxTc?.effort ?? null,
-      time: { event_ms: ev, t_first_ms: ev, t_last_ms: ev, t_asm_ms: null, start_lo_ms: null, start_hi_ms: ev, gap_basis: "none" },
+      time: {
+        event_ms: ev, t_first_ms: ev, t_last_ms: ev, t_asm_ms: null, start_lo_ms: null, start_hi_ms: ev, gap_basis: "none",
+        event_ns: evN, t_first_ns: evN, t_last_ns: evN, t_asm_ns: null, start_lo_ns: null,
+      },
       ordinal: rec.ord,
-      ownership: { role: "owner", ambiguous: false, owner_stream_start_ms: stream.start_ms },
+      ownership: { role: "owner", ambiguous: false, owner_stream_start_ms: stream.start === null ? null : nsToMs(stream.start), owner_stream_start_ns: stream.start },
       provenance: { files: fileList, from_copy_exposed_file: fileList.some((fi) => (fileAByIndex.get(fi) as FileA).copy_exposed) },
       thread_id: stream.id,
       session_id: tur.session_id ?? stream.root,
@@ -1004,7 +1067,7 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
       root_turn_id: ctxTc?.root_turn_id ?? null,
       comp_hash: ctxTc?.comp_hash ?? null,
       collaboration_mode: ctxTc?.collab ?? null,
-      thread_total: tur.tt !== null ? BigInt(tur.tt) : null,
+      thread_total: isBig(tur.tt_st) ? tur.tt_st : null,
     };
   };
 
@@ -1013,8 +1076,8 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
     const recs = (verifiedKeyed.get(key) as Rec[]).slice().sort(cmpKey);
     cov.requests_total++;
     cov.responses_total++;
-    const keyTs = recs.map((r) => r.ts).filter((t): t is number => t !== null);
-    const keyT = keyTs.length > 0 ? Math.min(...keyTs) : null;
+    let keyT: bigint | null = null;
+    for (const r of recs) if (r.ts !== null && (keyT === null || r.ts < keyT)) keyT = r.ts;
     const keyChain = chainIdOf((streamById.get((recs[0]!.tur as TurF).thread_id as string) as StreamB).chain);
     if (recs.length > 1) {
       // R4.4: not every occurrence is the same record. Every thread that holds an occurrence is tainted (R0.9).
@@ -1022,7 +1085,7 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
       const kind = sameUsage ? "conflict_attribution" : "conflict_usage";
       cov.requests_conflict++;
       cov.requests_conflict_by_kind[kind]++;
-      ledger.push({ t_ms: keyT, chain: keyChain, n: { responses_total: 1, requests_conflict: 1 }, conflict_kinds: [kind] });
+      ledger.push({ ...at(keyT), chain: keyChain, n: { responses_total: 1, requests_conflict: 1 }, conflict_kinds: [kind] });
       triggers.threads("request_anomaly", recs.map((r) => (r.tur as TurF).thread_id as string));
       const allFiles = [...new Set(recs.flatMap((r) => filesOf(r)))].sort((x, y) => x - y);
       conflicts.push({ provider: "codex", kind, key, files: allFiles, effect: "excluded" });
@@ -1039,40 +1102,49 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
     const rec = recs[0] as Rec;
     const tur = rec.tur as TurF;
     const thread = tur.thread_id as string;
-    const st = tur.us;
-    const missing = st.some((x) => x === "missing") || rec.ts === null;
+    const st = tur.u;
+    // R2.12 (revision 11.1): a counter `missing` or `bad`, or an envelope timestamp that is missing or not a valid instant.
+    const missing = st.some(goneCnt) || rec.ts === null;
     const range = st.some((x) => x === "range");
     if (range) {
       // R2.15: the range check precedes everything else (as for Claude): a failing value makes the response
       // usage_range_failed even when another counter is missing. Removed from accounting entirely, raw values not stored.
       cov.responses_usage_range_failed++;
-      ledger.push({ t_ms: keyT, chain: keyChain, n: { responses_total: 1, responses_usage_range_failed: 1 } });
+      ledger.push({ ...at(keyT), chain: keyChain, n: { responses_total: 1, responses_usage_range_failed: 1 } });
       triggers.threads("request_anomaly", [thread]);
       responses.push(build(rec, "usage_range_failed", null, []));
       continue;
     }
     if (missing) {
-      // R2.12: never treated as 0. Present counters that pass R2.15 are reported (input and output are the base fields).
-      let inc = 0n;
-      if (st[U_IN] === "ok") inc += BigInt(tur.u[U_IN] as number);
-      if (st[U_OUT] === "ok") inc += BigInt(tur.u[U_OUT] as number);
+      // R2.12, S6.3: never treated as 0. Present counters that pass R2.15 are reported as I + O, where I is `in` when
+      // valid, else the valid ones of `c` and `cw`, and O is `out` when valid, else `rs` when valid. `in` includes `c`
+      // and `cw` and `out` includes `rs` (R2.6, R2.8), so a valid inner counter is carried only when its outer one is not.
+      const vin = st[U_IN] as Cnt;
+      const vout = st[U_OUT] as Cnt;
+      const vc = st[U_C] as Cnt;
+      const vcw = st[U_CW] as Cnt;
+      const vrs = st[U_RS] as Cnt;
+      const inI = isBig(vin) ? vin : (isBig(vc) ? vc : 0n) + (isBig(vcw) ? vcw : 0n);
+      const inO = isBig(vout) ? vout : isBig(vrs) ? vrs : 0n;
+      const inc = inI + inO;
       cov.tokens_in_incomplete_responses += inc;
-      ledger.push({ t_ms: keyT, chain: keyChain, n: { responses_total: 1 }, tokens_incomplete: inc });
+      ledger.push({ ...at(keyT), chain: keyChain, n: { responses_total: 1 }, tokens_incomplete: inc });
       triggers.threads("request_anomaly", [thread]);
       responses.push(build(rec, "usage_incomplete", null, []));
       continue;
     }
-    const inn = BigInt(tur.u[U_IN] as number);
-    const c = BigInt(tur.u[U_C] as number);
-    const cw = BigInt(tur.u[U_CW] as number);
-    const out = BigInt(tur.u[U_OUT] as number);
-    const rs = BigInt(tur.u[U_RS] as number);
-    const total = BigInt(tur.u[U_TOTAL] as number);
+    // Every counter is valid here (range and incomplete were handled above) and already a BigInt (S4.2).
+    const inn = tur.u[U_IN] as bigint;
+    const c = tur.u[U_C] as bigint;
+    const cw = tur.u[U_CW] as bigint;
+    const out = tur.u[U_OUT] as bigint;
+    const rs = tur.u[U_RS] as bigint;
+    const total = tur.u[U_TOTAL] as bigint;
     // R2.7 validity invariants, all in BigInt (R2.16)
     if (c + cw > inn || rs > out || total !== inn + out) {
       cov.responses_usage_invariant_failed++;
       cov.tokens_in_invalid_responses += inn + out;
-      ledger.push({ t_ms: keyT, chain: keyChain, n: { responses_total: 1, responses_usage_invariant_failed: 1 }, tokens_invalid: inn + out });
+      ledger.push({ ...at(keyT), chain: keyChain, n: { responses_total: 1, responses_usage_invariant_failed: 1 }, tokens_invalid: inn + out });
       triggers.threads("request_anomaly", [thread]);
       responses.push(build(rec, "usage_invariant_failed", null, []));
       continue;
@@ -1089,7 +1161,7 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
       reasoning: rs,
       reasoning_included_in_output: true,
     };
-    ledger.push({ t_ms: keyT, chain: keyChain, n: { responses_total: 1 } });
+    ledger.push({ ...at(keyT), chain: keyChain, n: { responses_total: 1 } });
     responses.push(build(rec, null, usage, []));
   }
 
@@ -1107,10 +1179,13 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
     if (s.fork && list.length > 0) {
       const kept = list.filter((r) => r.exclusion === null);
       if (kept.length > 0) {
-        let minT = Number.POSITIVE_INFINITY;
-        for (const r of kept) if (r.time.event_ms < minT) minT = r.time.event_ms;
+        let minT: bigint | null = null;
+        for (const r of kept) {
+          const t = r.time.event_ns as bigint;
+          if (minT === null || t < minT) minT = t;
+        }
         for (const r of list) {
-          if (r.exclusion === null && r.time.event_ms === minT) {
+          if (r.exclusion === null && r.time.event_ns === minT) {
             finalResponses.push({ ...r, flags: [...r.flags, "fork_first_own"] });
           } else finalResponses.push(r);
         }
@@ -1123,7 +1198,9 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
     const ca = chainKeyOf(a.chain);
     const cb = chainKeyOf(b.chain);
     if (ca !== cb) return ca < cb ? -1 : 1;
-    if (a.time.event_ms !== b.time.event_ms) return a.time.event_ms - b.time.event_ms;
+    const ta = a.time.event_ns as bigint;
+    const tb = b.time.event_ns as bigint;
+    if (ta !== tb) return ta < tb ? -1 : 1;
     return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
   });
   for (const r of finalResponses) {
@@ -1134,7 +1211,9 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
     const ca = chainKeyOf(a.chain);
     const cb = chainKeyOf(b.chain);
     if (ca !== cb) return ca < cb ? -1 : 1;
-    if (a.event_ms !== b.event_ms) return a.event_ms - b.event_ms;
+    const ta = a.event_ns as bigint;
+    const tb = b.event_ns as bigint;
+    if (ta !== tb) return ta < tb ? -1 : 1;
     if (a.reason !== b.reason) return a.reason < b.reason ? -1 : 1;
     return (a.ordinal ?? -1) - (b.ordinal ?? -1);
   });
@@ -1146,7 +1225,8 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
       chain: s.chain,
       provider: "codex",
       files: [...s.files].sort((a, b) => a - b),
-      start_ms: s.start_ms,
+      start_ms: s.start === null ? null : nsToMs(s.start),
+      start_ns: s.start,
       ordinal_verified: s.ord_verified,
       fork,
       has_settings_marker: s.markers.length > 0,
@@ -1162,7 +1242,7 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
     let parent: ChainKey | null = null;
     if (pm.subagent_other && !pm.has_spawn) reason = "other_source";
     else if (pm.spawn_parent === null) reason = "no_parent_id"; // R5.6: also thread_source subagent without thread_spawn
-    else if (pm.forked_from_id !== null && pm.forked_from_id !== pm.spawn_parent) reason = "fork_parent_mismatch";
+    else if (s.fork !== null && s.fork.from !== pm.spawn_parent) reason = "fork_parent_mismatch";
     else {
       const ps = streamById.get(pm.spawn_parent);
       if (ps === undefined) reason = "parent_file_missing";
@@ -1176,7 +1256,7 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
       reason,
       parent,
       depth: pm.spawn_depth,
-      is_fork: pm.forked_from_id !== null,
+      is_fork: s.fork !== null,
     });
     if (reason === null) cov.links_verified++;
     else {
@@ -1202,9 +1282,13 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
     }
     for (const [r, owners] of seen) {
       owners.sort((a, b) => {
-        const as = a.start_ms ?? Number.POSITIVE_INFINITY;
-        const bs = b.start_ms ?? Number.POSITIVE_INFINITY;
-        if (as !== bs) return as - bs;
+        const as = a.start;
+        const bs = b.start;
+        if (as !== bs) {
+          if (as === null) return 1; // a stream without an instant never wins
+          if (bs === null) return -1;
+          return as < bs ? -1 : 1;
+        }
         return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
       });
       const o = owners[0] as StreamB;
@@ -1212,7 +1296,7 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
       compactions.push({
         chain: o.chain,
         ordinal: r.ord,
-        ts_ms: r.ts,
+        ts_ms: r.ts === null ? null : nsToMs(r.ts),
         window_number: comp.window_number,
         latest_usage_is_null: comp.latest_null,
         in_copied_prefix: o.fork !== null && o.fork.resolved && o.fork.hist !== null && r.ord !== null && r.ord < o.fork.hist,
@@ -1234,7 +1318,12 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
     const kept = list.filter((r) => r.exclusion === null);
     if (kept.length === 0) continue;
     // keep the record order: by (event time, ordinal, key)
-    kept.sort((a, b) => a.time.event_ms - b.time.event_ms || (a.ordinal ?? -1) - (b.ordinal ?? -1) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    kept.sort((a, b) => {
+      const ta = a.time.event_ns as bigint;
+      const tb = b.time.event_ns as bigint;
+      if (ta !== tb) return ta < tb ? -1 : 1;
+      return (a.ordinal ?? -1) - (b.ordinal ?? -1) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+    });
     let summed = 0n;
     let prev = 0n;
     let complete = list.length === kept.length;
@@ -1369,9 +1458,10 @@ function integrityFacts(
 // Helpers shared by the assembly code
 // ---------------------------------------------------------------------------
 
+/** R4.4, S5.2: the `usage` of an occurrence, six counters with their states. Differing usage is `conflict_usage`. */
 function usageKey(rec: Rec): string {
   const t = rec.tur as TurF;
-  return JSON.stringify([t.us.map((s, i) => (s === "ok" ? t.u[i] : s === "range" ? "r" : null))]);
+  return JSON.stringify(t.u.map(cntProj));
 }
 
 function chainKeyOf(k: ChainKey): string {

@@ -4,7 +4,7 @@
 // R16.5 (withheld), R17.2, R0.9 (taint lines).
 //
 // G1 prints no boundary, event or delta line (sections 7 to 11 are not computed) and says so.
-import { PROVIDERS, REQUEST_KINDS } from "../model/types.js";
+import { PROVIDERS, REQUEST_KINDS, UNPRICED_TOKEN_REASONS } from "../model/types.js";
 import type { CoverageCounters, DriftFinding, HeadlineFigures, ModelTotals, Provider, ProviderTotals, ReportInput } from "../model/types.js";
 import { formatBig, formatInt, formatPercentBig, formatTable, formatUsdPico, makePainter } from "./format.js";
 import type { Painter } from "./format.js";
@@ -46,15 +46,31 @@ function warningLines(h: HeadlineFigures): string[] {
     const t = h.taint_by_provider[p];
     if (!t.warn) continue;
     out.push(
-      `Warning: ${formatPercentBig(BigInt(t.families_tainted), BigInt(t.families_total))} of ${PROVIDER_LABEL[p]} session families and ${formatPercentBig(t.tokens_in_tainted_chains, t.tokens_total)} of ${PROVIDER_LABEL[p]} tokens are tainted (R0.9); dollars below cover only the rest, and no event or boundary is computed in this version.`,
+      `Warning: ${formatPercentBig(BigInt(t.families_tainted), BigInt(t.families_total))} of ${PROVIDER_LABEL[p]} session families and ${formatPercentBig(t.tokens_in_tainted_chains, t.tokens_total)} of ${PROVIDER_LABEL[p]} tokens are tainted (R0.9); dollars below cover only untainted chains, and no event or boundary is computed in this version.`,
     );
   }
   return out;
 }
 
+/**
+ * R3.9 revision 11.1: the priced share of tokens and the unpriced tokens by reason, largest first (equal amounts in the
+ * fixed enum order of `tokens_unpriced_by_reason`), all non-zero reasons, at most four, each with its share of the
+ * total tokens. Token facts, not dollars, so a withheld provider prints them too.
+ */
+export function pricedShareLine(t: ProviderTotals): string {
+  const priced = t.tokens_total - t.tokens_unpriced;
+  const head = `  Priced share: ${formatPercentBig(priced, t.tokens_total)} of tokens (${formatBig(priced)} of ${formatBig(t.tokens_total)})`;
+  const top = UNPRICED_TOKEN_REASONS.map((k, i) => ({ k, i, n: t.tokens_unpriced_by_reason[k] }))
+    .filter((x) => x.n > 0n)
+    .sort((a, b) => (a.n === b.n ? a.i - b.i : a.n > b.n ? -1 : 1))
+    .slice(0, 4);
+  if (top.length === 0) return `${head}; no unpriced tokens.`;
+  return `${head}; unpriced by reason: ${top.map((x) => `${x.k} ${formatPercentBig(x.n, t.tokens_total)} (${formatBig(x.n)})`).join(", ")}.`;
+}
+
 function providerBlock(t: ProviderTotals, input: ReportInput, paint: Painter): string[] {
   const lines: string[] = [];
-  const withheld = input.headline_status === "withheld";
+  const withheld = input.withheld_by_provider[t.provider] !== null;
   const partial = input.headline.partial_by_provider[t.provider];
   lines.push(paint("bold", withheld ? `${PROVIDER_LABEL[t.provider]} (unverified)` : PROVIDER_LABEL[t.provider]));
   const kinds = REQUEST_KINDS.filter((k) => t.requests_by_kind[k] > 0).map((k) => `${formatInt(t.requests_by_kind[k])} ${k}`);
@@ -77,6 +93,7 @@ function providerBlock(t: ProviderTotals, input: ReportInput, paint: Painter): s
       `  List-price equivalent: ${partial ? "partial " : ""}${formatUsdPico(t.usd_pico)} at table ${input.table_version} over ${formatInt(t.requests_priced)} of ${formatInt(t.requests_total)} responses; ${unpricedShare}${unknownOutput}.`,
     );
   }
+  lines.push(pricedShareLine(t));
   lines.push(taintLine(input.headline.taint_by_provider[t.provider]));
   if (t.models.length > 0) {
     const rows = t.models.map((m) => [
@@ -220,6 +237,15 @@ export function renderReport(input: ReportInput & { readonly shown_providers?: r
   const h = input.headline;
   const lines: string[] = [];
   const shown = input.shown_providers ?? PROVIDERS;
+  // R16.5 revision 11.1: when one provider is closed and the other is not, one line per closed provider comes first.
+  if (input.headline_status === "partial") {
+    for (const p of PROVIDERS) {
+      const code = input.withheld_by_provider[p];
+      if (code !== null) {
+        lines.push(`Headline withheld for ${PROVIDER_LABEL[p]}: ${code}; its tokens below are unverified and none of its dollars is printed.`);
+      }
+    }
+  }
   // R16.1: the warning is the first line of the output when any provider of the scan is over C36.
   lines.push(...warningLines(h));
   lines.push(paint("bold", "cachewhy summary") + " (token and list-price-equivalent accounting; rebuild events, boundaries and causes are not computed yet)");

@@ -44,7 +44,8 @@ import {
 // Decimal parsing (R3.8). Strings only, BigInt only.
 // ---------------------------------------------------------------------------
 
-const DECIMAL = /^([0-9]+)(?:\.([0-9]+))?$/;
+// S8.5a: no leading zeros, `0` alone or `0.` followed by digits; `05`, `00.5`, `.5`, `5.` and signs are malformed.
+const DECIMAL = /^(0|[1-9][0-9]*)(?:\.([0-9]+))?$/;
 const PRICE_SCALE = 1_000_000n; // price units are 1e-6 USD per MTok
 
 /** Exact rational of a non-negative decimal string, or null when it is not one. */
@@ -183,10 +184,12 @@ interface RowParse {
  * Parse a table price row into integer units. Anthropic needs all five prices. OpenAI needs input,
  * cached input and output; `cache_write` MAY be null (`n/a`, R3.6). A missing row is `{null, null}`.
  */
-function parseRow(provider: TableProvider, p: TablePriceRow | null | undefined): RowParse {
+function parseRow(provider: TableProvider, p: TablePriceRow | null | undefined, grammar?: (path: string) => void): RowParse {
   if (p === null || p === undefined) return { row: null, error: null };
   const get = (v: unknown, name: string, required: boolean): bigint | null | "bad" => {
     if (v === null || v === undefined) return required ? "bad" : null;
+    // S8.5a: a price that is not a string of the decimal grammar makes the table malformed, verified entry or not.
+    if (parseDecimal(v) === null) grammar?.(name);
     const u = parsePriceUnits(v);
     return u === null ? "bad" : u;
   };
@@ -345,6 +348,9 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
     checkGeoMultiplier(geoMod["multiplier"], "modifiers.geo_us.multiplier", ctx);
   }
   const fastWithGeoVerified = isVerified(fastGeo, null, ctx);
+  // S8.2: the geo multiplier applies only if the table-level object `modifiers.geo_us` is verified (own date, else the
+  // table's) in addition to the model's own `geo_us` object.
+  const geoTableVerified = isVerified(geoMod, null, ctx);
 
   table.models.forEach((entry, idx) => {
     const path = `models[${idx}]`;
@@ -370,7 +376,11 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
 
     // Standard row.
     const rawPrices = (entry.prices_usd_per_mtok ?? null) as TablePriceRow | null;
-    const std = parseRow(provider, rawPrices);
+    // S8.5a: a price that is not a decimal string of the grammar makes the table malformed (fatal), verified or not.
+    const badPrice = (where: string) => (name: string): void => {
+      c.add("schema", `${where}.${name}`, "price is not a decimal string of the grammar ^(0|[1-9][0-9]*)(\\.[0-9]+)?$ (S8.5a)");
+    };
+    const std = parseRow(provider, rawPrices, badPrice(`${path}.prices_usd_per_mtok`));
     if (std.error !== null && entryVerified) c.add("schema", `${path}.prices_usd_per_mtok`, std.error);
     if (std.row === null && entryVerified) {
       c.add("schema", `${path}.prices_usd_per_mtok`, "a verified entry needs a standard price row");
@@ -384,7 +394,7 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
     let fast: PriceRow | null = null;
     if (entry.fast !== null && entry.fast !== undefined) {
       auditVerified(entry.fast, entry, `${path}.fast`, ctx);
-      const f = parseRow(provider, entry.fast.prices_usd_per_mtok);
+      const f = parseRow(provider, entry.fast.prices_usd_per_mtok, badPrice(`${path}.fast.prices_usd_per_mtok`));
       // R3.2: the effective multipliers of a fast row are the ones stored beside it, else the entry's.
       const fastMult = entry.fast.multipliers ?? entry.multipliers;
       if (entry.fast.multipliers !== undefined && entry.fast.multipliers !== null && !sameMultipliers(entry.fast.multipliers, entry.multipliers)) {
@@ -406,7 +416,7 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
         c.add("constant_mismatch", `${path}.tiers.split_tokens`, "must equal C26 (HAIKU_TIER_SPLIT)");
       }
       tierSplit = CONSTANTS.HAIKU_TIER_SPLIT;
-      const t = parseRow(provider, entry.tiers.high);
+      const t = parseRow(provider, entry.tiers.high, badPrice(`${path}.tiers.high`));
       const highMult = entry.tiers.high_multipliers ?? entry.multipliers;
       if (
         entry.tiers.high_multipliers !== undefined &&
@@ -438,7 +448,7 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
         const pricesVerified = isVerified(lc, entry, ctx) && lc.prices_usd_per_mtok !== null && lc.prices_usd_per_mtok !== undefined;
         let lcRow: PriceRow | null = null;
         if (lc.prices_usd_per_mtok !== null && lc.prices_usd_per_mtok !== undefined) {
-          const l = parseRow(provider, lc.prices_usd_per_mtok);
+          const l = parseRow(provider, lc.prices_usd_per_mtok, badPrice(`${path}.long_context.prices_usd_per_mtok`));
           // R3.2: a long-context row stores its own multiplier object; an absent one falls back to the entry's.
           if (l.row !== null && lc.verified === true) ratioTest(lc.multipliers ?? entry.multipliers, l.row, `${path}.long_context`, ctx);
           if (pricesVerified) {
@@ -457,7 +467,7 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
       if (entry.geo_us.multiplier !== null && entry.geo_us.multiplier !== undefined) {
         checkGeoMultiplier(entry.geo_us.multiplier, `${path}.geo_us.multiplier`, ctx);
       }
-      geoApplies = isVerified(entry.geo_us, entry, ctx) && entry.geo_us.applies === true;
+      geoApplies = geoTableVerified && isVerified(entry.geo_us, entry, ctx) && entry.geo_us.applies === true;
     }
 
     // Explicit service tier rows (R3.4).
@@ -471,7 +481,7 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
         }
         if (v === undefined || v === null) continue;
         auditVerified(v, entry, sp, ctx);
-        const s = parseRow(provider, v.prices_usd_per_mtok);
+        const s = parseRow(provider, v.prices_usd_per_mtok, badPrice(`${sp}.prices_usd_per_mtok`));
         if (isVerified(v, entry, ctx)) {
           if (s.row === null) c.add("schema", sp, s.error ?? "verified service_tier row without prices");
           else serviceRows[k as ServiceTier] = s.row;
@@ -556,9 +566,13 @@ export function loadDefaultPriceBook(): PriceBook {
   return defaultBook;
 }
 
-/** Look up a model id (R3.3 normalization, exact match, aliases never used). Null when there is no row at all. */
+/**
+ * Look up a model id (R3.3, S2.4). The id is already normalized (once, at read time) and is matched exactly: a suffix is
+ * never stripped again here, so `claude-opus-5-5-20251001-20251001` (normalized once to `claude-opus-5-5-20251001`) has no
+ * row. The table side is normalized once when the book is built. Aliases are never used. Null when there is no row.
+ */
 export function lookupModel(book: PriceBook, modelId: string): ModelPrice | null {
-  return book.models.get(normalizeModelId(modelId)) ?? null;
+  return book.models.get(modelId) ?? null;
 }
 
 // ---------------------------------------------------------------------------

@@ -12,7 +12,8 @@ import { recompute, type RecomputeResult } from "../scripts/recompute/index.mjs"
 import { analyze } from "../src/analyze.ts";
 import { discover } from "../src/discover.ts";
 import { countedResponseIndices } from "../src/graph/index.ts";
-import { chainIdOf, responseTokens, TAINT_REASONS } from "../src/model/types.ts";
+import { chainIdOf, responseTokens, TAINT_REASONS, UNPRICED_TOKEN_REASONS } from "../src/model/types.ts";
+import { buildReportInput } from "../src/report/input.ts";
 import type { Provider } from "../src/model/types.ts";
 import { ClaudeProject, CodexHome, CodexThread, writeFiles, type GeneratedFile } from "./fixtures/builder.ts";
 import { splitAt, splitPositions } from "./fixtures/metamorphic.ts";
@@ -105,9 +106,31 @@ function assertAgree(analysis: Awaited<ReturnType<typeof analyze>>, rec: Recompu
       assert.equal(price.priced, false, `${label}: tainted response is unpriced`);
     }
   }
+  // R3.9 revision 11.1: the unpriced token breakdown, from the report view, against the recompute breakdown.
+  const view = buildReportInput(
+    {
+      graph: analysis.graph,
+      parsed: analysis.parsed,
+      priced: analysis.priced,
+      detection: analysis.detection,
+      book: analysis.book,
+      options: { command: "default", json: false, show_ids: false, demo: false, color: false },
+      generated_at_ms: NOW,
+      tool_version: "0.0.0",
+    },
+    analysis.filter,
+  );
   for (const pv of PROVIDER_LIST) {
     const g = analysis.graph.coverage_by_provider[pv];
     const c = rec.coverage[pv];
+    const vc = view.coverage_by_provider[pv];
+    let sum = 0n;
+    for (const k of UNPRICED_TOKEN_REASONS) {
+      assert.equal(vc.tokens_unpriced_by_reason[k].toString(), c.tokens_unpriced_by_reason[k], `${label}: ${pv} tokens_unpriced_by_reason.${k}`);
+      sum += vc.tokens_unpriced_by_reason[k];
+    }
+    assert.equal(sum, vc.tokens_unpriced, `${label}: ${pv} the reasons sum to tokens_unpriced`);
+    assert.equal(g.families_ordinal_unverified, c.families_ordinal_unverified, `${label}: ${pv} families_ordinal_unverified`);
     assert.equal(g.chains_total, c.chains_total, `${label}: ${pv} chains_total`);
     assert.equal(g.chains_tainted, c.chains_tainted, `${label}: ${pv} chains_tainted`);
     for (const k of TAINT_REASONS) assert.equal(g.chains_tainted_by_reason[k], c.chains_tainted_by_reason[k], `${label}: ${pv} chains_tainted_by_reason.${k}`);

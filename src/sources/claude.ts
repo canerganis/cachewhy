@@ -27,6 +27,7 @@ import { createHash } from "node:crypto";
 import { promises as fsp } from "node:fs";
 import type { DiscoveredFile } from "../discover.js";
 import { mapWithLimit, newLineStats, readLines } from "../io/lines.js";
+import { instantProj, instantState, nsToMs } from "../window.js";
 import {
   CLAUDE_FULL_VERSIONS,
   RESPONSE_FLAGS,
@@ -83,13 +84,14 @@ import type {
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => typeof v === "object" && v !== null && !Array.isArray(v);
 const cmpStr = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
-/** Ascending, null last. */
-const cmpNum = (a: number | null, b: number | null): number => {
+/** Ascending, null last. Instants are BigInt nanoseconds (S3.2). */
+const cmpNum = (a: bigint | null, b: bigint | null): number => {
   if (a === b) return 0;
   if (a === null) return 1;
   if (b === null) return -1;
   return a < b ? -1 : 1;
 };
+const msOf = (ns: bigint | null): number | null => (ns === null ? null : nsToMs(ns));
 const cmpNullStr = (a: string | null, b: string | null): number => {
   if (a === b) return 0;
   if (a === null) return 1;
@@ -97,7 +99,6 @@ const cmpNullStr = (a: string | null, b: string | null): number => {
   return cmpStr(a, b);
 };
 
-const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 const VERSION_RE = /^[0-9]+\.[0-9]+\.[0-9]+$/;
 const BUILD_VERSION_RE = /^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$/;
 const MODEL_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
@@ -105,22 +106,34 @@ const FULL_VERSIONS: ReadonlySet<string> = new Set<string>(CLAUDE_FULL_VERSIONS)
 const MAX_SIDECAR_BYTES = 8 * 1024 * 1024;
 const READ_CONCURRENCY = 8;
 
-function parseTs(v: unknown): number | null {
-  if (typeof v !== "string" || !ISO_RE.test(v)) return null;
-  const t = Date.parse(v);
-  return Number.isNaN(t) ? null : t;
-}
-
+/** S1.1: a valid id is a non-empty JSON string. */
 function str(v: unknown): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
 }
 
-/** R3.3: strip a trailing -YYYYMMDD. R14.3: anything that is not a plain model id becomes `unlisted`. */
+/** S1.1, S1.3, S5.1: projection text of an id, the raw string (kept in memory only) or its state `missing` / `bad`. */
+function idProj(v: unknown): string {
+  if (v === undefined || v === null) return "~missing";
+  return typeof v === "string" && v.length > 0 ? `s${v}` : "~bad";
+}
+
+/** S5.1: a boolean field is its value or `missing` (absent, null or not a boolean). */
+function boolProj(v: unknown): string {
+  return typeof v === "boolean" ? (v ? "t" : "f") : "~missing";
+}
+
+/**
+ * S2.1, S2.2 (Claude `message.model`, `advisorModel`). Not a string, empty or longer than 80 characters: no model.
+ * The exact string `<synthetic>` is the reserved value `<synthetic>`. Otherwise strip one trailing `-YYYYMMDD`; a plain
+ * model id is the normalized id, anything else is `unlisted`.
+ */
 function normModel(v: unknown): string | null {
-  if (typeof v !== "string" || v.length === 0) return null;
-  const s = v.replace(/-\d{8}$/, "");
+  if (typeof v !== "string" || v.length === 0 || v.length > 80) return null;
+  if (v === SYNTHETIC) return SYNTHETIC;
+  const s = v.replace(/-[0-9]{8}$/, "");
   return MODEL_RE.test(s) ? s : "unlisted";
 }
+const SYNTHETIC = "<synthetic>";
 
 function pick<T extends string>(v: unknown, allowed: readonly T[]): T | "other" | null {
   if (v === undefined || v === null) return null;
@@ -216,7 +229,8 @@ interface Rec {
   uuid: string | null;
   parent: string | null;
   lparent: string | null;
-  ts: number | null;
+  /** Exact instant, nanoseconds (S3.2). Null when the timestamp is missing or not a valid instant (S3.4). */
+  tn: bigint | null;
   isSummary: boolean;
   files: number[];
   a?: Asst;
@@ -270,11 +284,15 @@ function parseAsst(o: Obj, ctx: FileCtx): { a: Asst; proj: unknown[] } {
   const m = isObj(o["message"]) ? o["message"] : undefined;
   const u = m !== undefined && isObj(m["usage"]) ? m["usage"] : undefined;
   const modelRaw = m?.["model"];
-  const isErr = o["isApiErrorMessage"] === true || modelRaw === "<synthetic>";
+  const model = normModel(modelRaw);
+  // R2.14: `<synthetic>` and `isApiErrorMessage = true` are not requests. The projection keeps the normalized model and
+  // the raw boolean (S5.1); this derived flag is a decision input only.
+  const isErr = o["isApiErrorMessage"] === true || model === SYNTHETIC;
   let sideRangeFailed = 0;
 
   // content blocks
-  const blocks: Array<[BlockType, string | null, ToolName | null, string | null]> = [];
+  // S5.1: the projection keeps the block type (absent is `missing`, unlisted is `other`) and the ids with their states.
+  const blocks: Array<[string | null, string | null, string | null, string | null]> = [];
   const tools: Array<[string, ToolName]> = [];
   const content = m?.["content"];
   if (Array.isArray(content)) {
@@ -283,16 +301,18 @@ function parseAsst(o: Obj, ctx: FileCtx): { a: Asst; proj: unknown[] } {
         blocks.push(["other", null, null, null]);
         continue;
       }
-      const bt = (pick(b["type"], BLOCK_VALUES) ?? "other") as BlockType;
+      const btRaw = pick(b["type"], BLOCK_VALUES);
+      const bt = (btRaw ?? "other") as BlockType;
       if (bt === "tool_use") {
         const id = str(b["id"]);
-        const nm = (pick(b["name"], TOOL_NAMES) ?? "other") as ToolName;
-        blocks.push([bt, id, nm, null]);
+        const nmRaw = pick(b["name"], TOOL_NAMES);
+        const nm = (nmRaw ?? "other") as ToolName;
+        blocks.push([btRaw, idProj(b["id"]), nmRaw, null]);
         if (id !== null && ctx.neededToolUse.has(id)) tools.push([id, nm]);
       } else if (bt === "tool_result") {
-        blocks.push([bt, null, null, str(b["tool_use_id"])]);
+        blocks.push([btRaw, null, null, idProj(b["tool_use_id"])]);
       } else {
-        blocks.push([bt, null, null, null]);
+        blocks.push([btRaw, null, null, null]);
       }
     }
   }
@@ -308,9 +328,10 @@ function parseAsst(o: Obj, ctx: FileCtx): { a: Asst; proj: unknown[] } {
   let hasCC = false;
   let ccBad = false;
   let iter: Asst["iter"] = null;
-  // R1.2, R17.6: every in-range integer member of iterations[0], by member name, as a decimal string. It takes part in
-  // record identity only (hashed); the four shared members are the ones compared (R4.2) and kept.
-  let iterMembers: [string, string][] | null = null;
+  // R1.2, R17.6, S5.1: every integer member of iterations[0], by member name, as a decimal string or `range`; the
+  // object itself is `missing` (absent or null) or `bad` (not an object). It takes part in record identity only
+  // (hashed); the four shared members are the ones compared (R4.2) and kept.
+  let iterMembers: [string, string][] | "missing" | "bad" = "missing";
   let rangeFail = false;
   let speed: Speed | null = null;
   let geo: Geo | null = null;
@@ -332,8 +353,10 @@ function parseAsst(o: Obj, ctx: FileCtx): { a: Asst; proj: unknown[] } {
     const det = u["output_tokens_details"];
     if (isObj(det)) think = cnt(det["thinking_tokens"]);
     const its = u["iterations"];
-    if (Array.isArray(its) && isObj(its[0])) {
-      const it0 = its[0];
+    const it0Raw: unknown = Array.isArray(its) ? its[0] : undefined;
+    if (it0Raw !== undefined && it0Raw !== null && !isObj(it0Raw)) iterMembers = "bad";
+    if (isObj(it0Raw)) {
+      const it0 = it0Raw;
       iter = {};
       iterMembers = [];
       // R1.2, R2.15: EVERY integer member of iterations[0] belongs to the counter row and is range checked. Only the
@@ -348,6 +371,7 @@ function parseAsst(o: Obj, ctx: FileCtx): { a: Asst; proj: unknown[] } {
         if (typeof v !== "number" || !Number.isInteger(v)) continue; // integer members only (R1.2)
         if (!Number.isSafeInteger(v) || v < 0) {
           rangeFail = true;
+          iterMembers.push([name, "range"]);
           continue;
         }
         iterMembers.push([name, BigInt(v).toString()]);
@@ -365,30 +389,24 @@ function parseAsst(o: Obj, ctx: FileCtx): { a: Asst; proj: unknown[] } {
   }
 
   // stop reason
-  let stop: StopReason | null = null;
-  if (m !== undefined && "stop_reason" in m) {
-    const sr = m["stop_reason"];
-    stop = sr === null ? "null" : ((pick(sr, STOP_VALUES) ?? null) as StopReason | null);
-  }
+  // S1.3: JSON null and absence are the same state `missing`, so records that differ only there are one record and
+  // must read alike.
+  const stop = (m !== undefined ? pick(m["stop_reason"], STOP_VALUES) : null) as StopReason | null;
 
   // diagnostics (R10.1)
+  // S1.2, S5.1: a container that is not retained (`diagnostics`, `cache_miss_reason`) contributes only its leaves, so an
+  // absent container and a container without the leaf are the same state. An absent `type` is `missing` (no type
+  // evidence for R4.2), an unlisted one is `other`; `cache_missed_input_tokens` keeps its counter state (S1.4).
   let diagType: DiagType | null = null;
   let diagMissed: bigint | null = null;
+  let diagMissedSt: Cnt = "missing";
   const dg = m?.["diagnostics"];
-  if (isObj(dg)) {
-    const cmr = dg["cache_miss_reason"];
-    if (cmr !== undefined && cmr !== null) {
-      if (isObj(cmr)) {
-        const t = cmr["type"];
-        diagType =
-          typeof t === "string" && (DIAG_VALUES as readonly string[]).includes(t) ? (t as DiagType) : "other";
-        const mc = cnt(cmr["cache_missed_input_tokens"]);
-        if (isBig(mc)) diagMissed = mc;
-        else if (mc === "range") sideRangeFailed++;
-      } else {
-        diagType = "other";
-      }
-    }
+  const cmrObj = isObj(dg) && isObj(dg["cache_miss_reason"]) ? (dg["cache_miss_reason"] as Obj) : undefined;
+  if (cmrObj !== undefined) {
+    diagType = pick(cmrObj["type"], DIAG_VALUES) as DiagType | null;
+    diagMissedSt = cnt(cmrObj["cache_missed_input_tokens"]);
+    if (isBig(diagMissedSt)) diagMissed = diagMissedSt;
+    else if (diagMissedSt === "range") sideRangeFailed++;
   }
 
   const effort = pick(o["effort"], EFFORT_VALUES) as Effort | null;
@@ -397,7 +415,6 @@ function parseAsst(o: Obj, ctx: FileCtx): { a: Asst; proj: unknown[] } {
   const advisor = normModel(o["advisorModel"]);
   const classifier = o["serverClassifierRequest"] !== undefined && o["serverClassifierRequest"] !== null;
   const sidechain = typeof o["isSidechain"] === "boolean" ? o["isSidechain"] : null;
-  const model = normModel(modelRaw);
   const key = str(o["requestId"]);
   const msgId = m !== undefined ? str(m["id"]) : null;
 
@@ -435,10 +452,10 @@ function parseAsst(o: Obj, ctx: FileCtx): { a: Asst; proj: unknown[] } {
     sideRangeFailed,
   };
   const proj: unknown[] = [
-    key,
-    msgId,
+    idProj(o["requestId"]),
+    idProj(m?.["id"]),
     model,
-    isErr,
+    boolProj(o["isApiErrorMessage"]),
     u !== undefined,
     cntProj(i),
     cntProj(r),
@@ -450,14 +467,12 @@ function parseAsst(o: Obj, ctx: FileCtx): { a: Asst; proj: unknown[] } {
     cntProj(o2),
     cntProj(think),
     iterMembers,
-    rangeFail,
     speed,
-    hasSpeed,
     geo,
     tier,
     stop,
     diagType,
-    diagMissed === null ? null : diagMissed.toString(),
+    cntProj(diagMissedSt),
     blocks,
     effort,
     perTurn,
@@ -470,27 +485,31 @@ function parseAsst(o: Obj, ctx: FileCtx): { a: Asst; proj: unknown[] } {
 }
 
 function parseSys(o: Obj): { s: SysData; side: number; proj: unknown[] } {
-  const boundary = o["subtype"] === "compact_boundary";
+  const subtype = pick(o["subtype"], ["compact_boundary"] as const); // S1.2: missing (null) differs from other
+  const boundary = subtype === "compact_boundary";
   let trigger: SysData["trigger"] = null;
   let pre: bigint | null = null;
   let post: bigint | null = null;
+  let preSt: Cnt = "missing";
+  let postSt: Cnt = "missing";
   let side = 0;
   if (boundary) {
     const cm = o["compactMetadata"];
     if (isObj(cm)) {
       trigger = pick(cm["trigger"], ["manual", "auto"] as const) as SysData["trigger"];
-      const p = cnt(cm["preTokens"]);
-      const q = cnt(cm["postTokens"]);
-      if (isBig(p)) pre = p;
-      else if (p === "range") side++;
-      if (isBig(q)) post = q;
-      else if (q === "range") side++;
+      preSt = cnt(cm["preTokens"]);
+      postSt = cnt(cm["postTokens"]);
+      if (isBig(preSt)) pre = preSt;
+      else if (preSt === "range") side++;
+      if (isBig(postSt)) post = postSt;
+      else if (postSt === "range") side++;
     }
   }
   return {
     s: { boundary, trigger, pre, post },
     side,
-    proj: [boundary, trigger, pre === null ? null : pre.toString(), post === null ? null : post.toString()],
+    // S1.4, S5.1: preTokens and postTokens keep their counter states in the projection.
+    proj: [subtype, trigger, cntProj(preSt), cntProj(postSt)],
   };
 }
 
@@ -508,13 +527,16 @@ function parseCost(o: Obj): { c: CostData; side: number; proj: unknown[] } {
       ? ((o["costState"] as Obj)["modelUsage"] as Obj)
       : undefined;
   const models: CostData["models"] = [];
+  const projRows: Array<[string, string[]]> = [];
   let side = 0;
   if (raw !== undefined) {
     for (const [name, val] of Object.entries(raw)) {
       const model = normModel(name) ?? "unlisted";
       const slots: Array<bigint | null> = [];
+      const states: string[] = [];
       for (const [camel, snake] of COST_SLOTS) {
         const c = isObj(val) ? cnt(val[camel] ?? val[snake]) : "missing";
+        states.push(cntProj(c));
         if (isBig(c)) slots.push(c);
         else {
           if (c === "range") side++;
@@ -522,14 +544,13 @@ function parseCost(o: Obj): { c: CostData; side: number; proj: unknown[] } {
         }
       }
       models.push([model, slots]);
+      projRows.push([model, states]);
     }
-    models.sort((x, y) => cmpStr(x[0], y[0]));
+    // Two keys can normalize to one model: the order must not depend on key order (R4.10), so ties break on the slots.
+    models.sort((x, y) => cmpStr(x[0], y[0]) || cmpStr(JSON.stringify(x[1].map(String)), JSON.stringify(y[1].map(String))));
+    projRows.sort((x, y) => cmpStr(x[0], y[0]) || cmpStr(JSON.stringify(x[1]), JSON.stringify(y[1])));
   }
-  return {
-    c: { models },
-    side,
-    proj: models.map(([m, s]) => [m, s.map((v) => (v === null ? null : v.toString()))]),
-  };
+  return { c: { models }, side, proj: projRows };
 }
 
 /** Parse one JSON value into a record. Returns the record and its projection digest. */
@@ -547,7 +568,7 @@ function makeRec(v: unknown, ctx: FileCtx): Rec {
       uuid: null,
       parent: null,
       lparent: null,
-      ts: null,
+      tn: null,
       isSummary: false,
       files: [],
       sideRangeFailed: 0,
@@ -555,14 +576,18 @@ function makeRec(v: unknown, ctx: FileCtx): Rec {
   }
   const tstr = typeof v["type"] === "string" ? v["type"] : "";
   const type: RecType = KNOWN_TYPES.has(tstr) ? (tstr as RecType) : "other";
-  const ts = parseTs(v["timestamp"]);
+  // S3: an own parser decides validity; the value is the exact nanosecond count and its projection text.
+  const tsSt = instantState(v["timestamp"]);
+  const tn = typeof tsSt === "string" ? null : tsSt.ns;
+  const tsP = instantProj(tsSt);
   const uuid = str(v["uuid"]);
   if (type === "other") {
     // Unlisted type (R1.4): the structural id, the time and the chain key are used for equality. The raw type is
     // dropped. The chain key is read so that the file names its chain (R0.9 "Named chains").
     const rc = resolveChain(v);
     return {
-      d: sha(JSON.stringify(["other", uuid, ts, rc.S, rc.T])),
+      // S1.2: an absent record type is `missing`, an unlisted one is `other`, and the two differ.
+      d: sha(JSON.stringify([v["type"] === undefined || v["type"] === null ? "missing" : "other", idProj(v["uuid"]), tsP, idProj(v["sessionId"]), idProj(v["agentId"])])),
       type,
       graph: false,
       ver: "unlisted",
@@ -573,7 +598,7 @@ function makeRec(v: unknown, ctx: FileCtx): Rec {
       uuid: null,
       parent: null,
       lparent: null,
-      ts: null,
+      tn: null,
       isSummary: false,
       files: [],
       sideRangeFailed: 0,
@@ -587,7 +612,19 @@ function makeRec(v: unknown, ctx: FileCtx): Rec {
   const parent = str(v["parentUuid"]);
   const lparent = str(v["logicalParentUuid"]);
   const isSummary = v["isCompactSummary"] === true;
-  const common: unknown[] = [type, uuid, parent, lparent, S, T, ts, ver, isSummary];
+  // S5.1: ids are raw or their state, an absent agentId is `missing` and never the string `main` (the chain id still
+  // uses `main`), the instant is its nanosecond value or its state, booleans are their value or `missing`.
+  const common: unknown[] = [
+    type,
+    idProj(v["uuid"]),
+    idProj(v["parentUuid"]),
+    idProj(v["logicalParentUuid"]),
+    idProj(v["sessionId"]),
+    idProj(v["agentId"]),
+    tsP,
+    ver,
+    boolProj(v["isCompactSummary"]),
+  ];
   const rec: Rec = {
     d: "",
     type,
@@ -600,7 +637,7 @@ function makeRec(v: unknown, ctx: FileCtx): Rec {
     uuid,
     parent,
     lparent,
-    ts,
+    tn,
     isSummary,
     files: [],
     sideRangeFailed: 0,
@@ -632,8 +669,8 @@ function makeRec(v: unknown, ctx: FileCtx): Rec {
           blocks.push(["other", null]);
           continue;
         }
-        const bt = pick(b["type"], BLOCK_VALUES) ?? "other";
-        blocks.push([bt, bt === "tool_result" ? str(b["tool_use_id"]) : null]);
+        const bt = pick(b["type"], BLOCK_VALUES);
+        blocks.push([bt, bt === "tool_result" ? idProj(b["tool_use_id"]) : null]);
       }
     }
     extra = [role, blocks];
@@ -641,8 +678,8 @@ function makeRec(v: unknown, ctx: FileCtx): Rec {
   // Fields read on every graph record (R1.2) that are not used downstream still take part in equality.
   const shared: unknown[] = graph
     ? [
-        typeof v["isSidechain"] === "boolean" ? v["isSidechain"] : null,
-        v["isApiErrorMessage"] === true,
+        boolProj(v["isSidechain"]),
+        boolProj(v["isApiErrorMessage"]),
         pick(v["entrypoint"], ENTRY_VALUES),
         pick(v["effort"], EFFORT_VALUES),
         pick(v["perTurnEffort"], EFFORT_VALUES),
@@ -811,12 +848,12 @@ function copyOrder(x: Rec, y: Rec): number {
   const ox = isBig(ax.o) ? ax.o : -1n;
   const oy = isBig(ay.o) ? ay.o : -1n;
   if (ox !== oy) return ox > oy ? -1 : 1;
-  return cmpNum(x.ts, y.ts) || cmpNullStr(x.uuid, y.uuid) || cmpStr(x.d, y.d);
+  return cmpNum(x.tn, y.tn) || cmpNullStr(x.uuid, y.uuid) || cmpStr(x.d, y.d);
 }
 
 /** Natural "earliest copy" order: timestamp asc, uuid asc, digest. */
 function earliestOrder(x: Rec, y: Rec): number {
-  return cmpNum(x.ts, y.ts) || cmpNullStr(x.uuid, y.uuid) || cmpStr(x.d, y.d);
+  return cmpNum(x.tn, y.tn) || cmpNullStr(x.uuid, y.uuid) || cmpStr(x.d, y.d);
 }
 
 interface Shared {
@@ -887,12 +924,8 @@ function analyzeKey(allCopies: readonly Rec[], keyConflict: boolean): Shared {
     modelConflict = true;
   }
 
-  // exclusion ladder
-  if (keyConflict) {
-    sh.exclusion = "key_conflict";
-    conflicts.push({ kind: "key_conflict", effect: "excluded" });
-    return sh;
-  }
+  // exclusion ladder (S6.1): range, then incomplete (a copy without a valid timestamp included), then key_conflict,
+  // then conflict_input and conflict_model. Only the first code is recorded and counted.
   if (usageCopies.some((c) => (c.a as Asst).rangeFail)) {
     sh.exclusion = "usage_range_failed";
     sh.rangeFailed = true;
@@ -900,29 +933,39 @@ function analyzeKey(allCopies: readonly Rec[], keyConflict: boolean): Shared {
   }
   const incomplete = (c: Rec): boolean => {
     const a = c.a as Asst;
-    if (c.ts === null || a.ccBad) return true;
+    if (a.ccBad) return true;
     // R2.12: output_tokens is a counter of the R1.2 row like the others. A copy that lacks it (or holds a non-integer)
     // makes the request incomplete, a final copy included: a missing value is never treated as 0.
     if (!isBig(a.i) || !isBig(a.r) || !isBig(a.wt) || !isBig(a.o)) return true;
     if (a.hasCC && (!isBig(a.w5) || !isBig(a.w1))) return true;
     return false;
   };
-  if (usageCopies.length === 0 || usageCopies.some(incomplete)) {
+  // Revision 11.1 (R2.12): any copy, usage-bearing or not, whose timestamp is missing or not a valid instant makes the
+  // request incomplete, because its window membership cannot be decided.
+  if (usageCopies.length === 0 || usageCopies.some(incomplete) || ordered.some((c) => c.tn === null)) {
     sh.exclusion = "usage_incomplete";
-    // R2.12: present integer fields that pass R2.15 are reported in coverage.
-    const p = usageCopies[0];
-    if (p) {
-      const a = p.a as Asst;
-      let sum = 0n;
-      if (isBig(a.i)) sum += a.i;
-      if (isBig(a.r)) sum += a.r;
-      if (a.hasCC) {
-        if (isBig(a.w5)) sum += a.w5;
-        if (isBig(a.w1)) sum += a.w1;
-      } else if (isBig(a.wt)) sum += a.wt;
-      if (isBig(a.o)) sum += a.o;
-      sh.incompleteTokens = sum;
-    }
+    // R2.12, S6.3: the present integer fields that pass R2.15 are reported. Each field is the maximum of its valid
+    // values over the usage-bearing copies (BigInt), the total is i + r + W + o with W = cache_creation_input_tokens
+    // when valid, else the valid ones of w5 and w1. Each term counts once.
+    const maxOf = (get: (a: Asst) => Cnt): bigint | null => {
+      let m: bigint | null = null;
+      for (const c of usageCopies) {
+        const v = get(c.a as Asst);
+        if (isBig(v) && (m === null || v > m)) m = v;
+      }
+      return m;
+    };
+    const mi = maxOf((a) => a.i);
+    const mr = maxOf((a) => a.r);
+    const mo = maxOf((a) => a.o);
+    const mwt = maxOf((a) => a.wt);
+    const w = mwt !== null ? mwt : (maxOf((a) => a.w5) ?? 0n) + (maxOf((a) => a.w1) ?? 0n);
+    sh.incompleteTokens = (mi ?? 0n) + (mr ?? 0n) + w + (mo ?? 0n);
+    return sh;
+  }
+  if (keyConflict) {
+    sh.exclusion = "key_conflict";
+    conflicts.push({ kind: "key_conflict", effect: "excluded" });
     return sh;
   }
   // input counters of all copies must be equal (R4.2)
@@ -1087,7 +1130,8 @@ function analyzeKey(allCopies: readonly Rec[], keyConflict: boolean): Shared {
 interface ChainAgg {
   S: string;
   T: string;
-  start: number | null;
+  /** stream_start, exact nanoseconds (R4.6, S3.3). */
+  start: bigint | null;
   files: Set<number>;
   workflowFile: boolean;
 }
@@ -1146,7 +1190,10 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     }
     const sess = f.sessionId ?? "";
     const v = val.value;
-    if (f.kind === "claude-subagent-meta") {
+    if (f.workflowAgent === true && (f.kind === "claude-subagent-meta" || f.kind === "claude-subagent-prefix")) {
+      // S12.6, R5.4: a workflow agent sidecar is counted (file, line, parse error) and read for nothing: workflow agents
+      // never link by toolUseId, so its fields enter no link, no tool_use filter and no prefix hint.
+    } else if (f.kind === "claude-subagent-meta") {
       const k = chainStr(sess, f.agentId ?? "");
       if (!metas.has(k)) {
         const m = parseMeta(v);
@@ -1302,14 +1349,15 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
   const bySession = new Map<string, Set<ChainId>>(); // R0.9 link (i)
   const named: Array<Set<ChainId>> = files.map(() => new Set<ChainId>());
   const triggerMap = new Map<string, TaintTrigger>();
-  const addTrigger = (reason: TaintTrigger["reason"], names: Iterable<ChainId> | "provider"): void => {
+  const addTrigger = (reason: TaintTrigger["reason"], names: Iterable<ChainId> | "provider", scope: "family" | "chains" = "family"): void => {
     if (names === "provider") {
       triggerMap.set(`${reason}\u0000*`, { reason, names: "provider" });
       return;
     }
     const list = [...new Set(names)].sort(cmpStr);
     if (list.length === 0) return;
-    triggerMap.set(`${reason}\u0000${list.join("\u0001")}`, { reason, names: list });
+    // Revision 11.1: the scope is part of the identity of a trigger (only a Claude request_anomaly is chain scoped).
+    triggerMap.set(`${reason}\u0000${scope}\u0000${list.join("\u0001")}`, scope === "chains" ? { reason, names: list, scope } : { reason, names: list });
   };
   for (const r of recs) {
     if (!r.hasSid) {
@@ -1333,32 +1381,33 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     const k = recChain(r);
     let c = chains.get(k);
     if (!c) chains.set(k, (c = { S: r.S, T: r.T, start: null, files: new Set(), workflowFile: false }));
-    if (r.ts !== null && (c.start === null || r.ts < c.start)) c.start = r.ts;
+    if (r.tn !== null && (c.start === null || r.tn < c.start)) c.start = r.tn;
     for (const fi of r.files) {
       c.files.add(fi);
       if ((files[fi] as DiscoveredFile).workflowAgent === true) c.workflowFile = true;
     }
   }
 
-  const pickOwner = (cs: readonly string[]): { owner: string; ambiguous: boolean; start: number | null } => {
+  const pickOwner = (cs: readonly string[]): { owner: string; ambiguous: boolean; start: bigint | null } => {
+    // R4.6: the earliest stream_start owns; a chain without any valid instant never wins against one with an instant.
     let best: string[] = [];
-    let bestStart = Number.POSITIVE_INFINITY;
+    let bestStart: bigint | null = null;
     for (const c of cs) {
-      const s = (chains.get(c) as ChainAgg).start ?? Number.POSITIVE_INFINITY;
-      if (s < bestStart) {
+      const s = (chains.get(c) as ChainAgg).start;
+      if (best.length === 0 || cmpNum(s, bestStart) < 0) {
         best = [c];
         bestStart = s;
-      } else if (s === bestStart) best.push(c);
+      } else if (cmpNum(s, bestStart) === 0) best.push(c);
     }
     if (best.length === 1) {
-      return { owner: best[0] as string, ambiguous: false, start: bestStart === Number.POSITIVE_INFINITY ? null : bestStart };
+      return { owner: best[0] as string, ambiguous: false, start: bestStart };
     }
     best.sort((x, y) => {
       const a = chains.get(x) as ChainAgg;
       const b = chains.get(y) as ChainAgg;
       return cmpStr(a.S, b.S) || cmpStr(a.T, b.T);
     });
-    return { owner: best[0] as string, ambiguous: true, start: bestStart === Number.POSITIVE_INFINITY ? null : bestStart };
+    return { owner: best[0] as string, ambiguous: true, start: bestStart };
   };
 
   // ----- uuid index and compact boundaries (R6.3, R11.7) --------------------------------------------------------
@@ -1373,18 +1422,19 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
   const compactBoundaries: ClaudeCompactBoundary[] = [];
   const uuidKeys = [...byUuid.keys()].sort(cmpStr);
   for (const u of uuidKeys) {
-    const cands = (byUuid.get(u) as Rec[]).slice().sort((x, y) => cmpNum(x.ts, y.ts) || cmpNullStr(x.parent, y.parent) || cmpStr(x.d, y.d));
+    const cands = (byUuid.get(u) as Rec[]).slice().sort((x, y) => cmpNum(x.tn, y.tn) || cmpNullStr(x.parent, y.parent) || cmpStr(x.d, y.d));
     const first = cands[0] as Rec;
     const owner = pickOwner([...new Set(cands.map(recChain))].sort(cmpStr));
     const oc = chains.get(owner.owner) as ChainAgg;
     const isBoundary = cands.some((c) => c.sys?.boundary === true);
     // R6.3: a uuid that names records with different timestamps or parents does not resolve.
-    const unresolved = cands.some((c) => c.ts !== first.ts || c.parent !== first.parent || c.lparent !== first.lparent);
+    const unresolved = cands.some((c) => c.tn !== first.tn || c.parent !== first.parent || c.lparent !== first.lparent);
     uuidIndex.set(u, {
       uuid: u,
       parent_uuid: unresolved ? null : first.parent,
       logical_parent_uuid: unresolved ? null : first.lparent,
-      ts_ms: unresolved ? null : first.ts,
+      ts_ms: unresolved ? null : msOf(first.tn),
+      ts_ns: unresolved ? null : first.tn,
       is_compact_summary: first.isSummary,
       is_compact_boundary: isBoundary,
       chain: chainKeyOf(oc.S, oc.T),
@@ -1399,7 +1449,7 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
         trigger: b.trigger,
         pre_tokens: b.pre,
         post_tokens: b.post,
-        ts_ms: unresolved ? null : first.ts,
+        ts_ms: unresolved ? null : msOf(first.tn),
       });
     }
   }
@@ -1408,38 +1458,51 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
   // R15.7: a request key is supported iff every copy of it in the scan carries a version with full support. All
   // copies of every version are read to decide this; only keys with no unsupported copy are accounted.
   const byKey = new Map<string, Rec[]>(); // supported copies of a key
-  const keyChains = new Map<string, Map<string, number | null>>(); // key -> chain -> min ts, copies of any version
+  const keyChains = new Map<string, Map<string, bigint | null>>(); // key -> chain -> min instant, copies of any version
   const unverifiedKeySet = new Set<string>();
   const excluded: ExcludedRecord[] = [];
   const ledger: LedgerEntry[] = []; // event-time ledger of the logical counters (LEDGER_COUNT_FIELDS)
   const reqToMsg = new Map<string, Set<string>>();
   const msgToReq = new Map<string, Set<string>>();
-  const noteCopy = (key: string, ck: string, ts: number | null): void => {
+  const noteCopy = (key: string, ck: string, ts: bigint | null): void => {
     let m = keyChains.get(key);
     if (!m) keyChains.set(key, (m = new Map()));
     const prev = m.get(ck);
-    m.set(ck, prev === undefined ? ts : prev === null ? ts : ts === null ? prev : Math.min(prev, ts));
+    m.set(ck, prev === undefined || prev === null ? ts : ts === null ? prev : ts < prev ? ts : prev);
   };
+  // Ledger entry of a record or response at the exact instant `tn`; `t_ms` is its floor (S3.3).
+  const at = (tn: bigint | null): { t_ms: number | null; t_ns: bigint | null } => ({ t_ms: msOf(tn), t_ns: tn });
   for (const r of recs) {
     if (r.type === "cost-state") {
       cov.fields_range_failed += r.sideRangeFailed;
-      if (r.sideRangeFailed > 0) ledger.push({ t_ms: r.ts, chain: null, n: { fields_range_failed: r.sideRangeFailed } });
+      if (r.sideRangeFailed > 0) ledger.push({ ...at(r.tn), chain: null, n: { fields_range_failed: r.sideRangeFailed } });
       continue;
     }
     // R0.9 `unattributed_record`: no chain, no accounting, no counters. Its version still counts for the key
     // (R15.7: every copy of the key decides, whatever the chain of the copy): a copy of an unsupported version
     // makes the key unverified, so a supported peer cannot enter the totals next to it.
     if (!r.hasSid) {
-      if (r.type === "assistant" && !r.supported) {
+      if (r.type === "assistant") {
         const sa = r.a as Asst;
-        if (!sa.isErr && sa.key !== null) unverifiedKeySet.add(sa.key);
+        if (!r.supported) {
+          if (!sa.isErr && sa.key !== null) unverifiedKeySet.add(sa.key);
+        } else if (sa.isErr) {
+          // R2.14: an API error record is counted whatever its chain key (no chain, so its ledger entry is never live).
+          cov.api_error_records += 1;
+          ledger.push({ ...at(r.tn), chain: null, n: { api_error_records: 1 } });
+        } else if (sa.hasUsage && sa.key === null) {
+          // S12.3: a usage-bearing record without a valid key is unkeyed whatever its chain key; one that also lacks a
+          // chain key is `unattributed_record` as well (added above). No chain, so the ledger entry is never live.
+          cov.records_unkeyed += 1;
+          ledger.push({ ...at(r.tn), chain: null, n: { records_unkeyed: 1 } });
+        }
       }
       continue;
     }
     if (r.type !== "assistant") {
       if (r.supported) {
         cov.fields_range_failed += r.sideRangeFailed;
-        if (r.sideRangeFailed > 0) ledger.push({ t_ms: r.ts, chain: cidOf(r.S, r.T), n: { fields_range_failed: r.sideRangeFailed } });
+        if (r.sideRangeFailed > 0) ledger.push({ ...at(r.tn), chain: cidOf(r.S, r.T), n: { fields_range_failed: r.sideRangeFailed } });
       }
       continue;
     }
@@ -1450,20 +1513,20 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
       if (!a.isErr) {
         if (a.key !== null) {
           unverifiedKeySet.add(a.key);
-          noteCopy(a.key, ck, r.ts);
+          noteCopy(a.key, ck, r.tn);
         } else {
-          addTrigger("request_anomaly", [cidOf(r.S, r.T)]); // R2.13: an unkeyed record with a known chain
+          addTrigger("request_anomaly", [cidOf(r.S, r.T)], "chains"); // R2.13: an unkeyed record with a known chain (chain scoped, R0.9 rev 11.1)
         }
       }
       continue;
     }
     cov.fields_range_failed += r.sideRangeFailed;
-    if (r.sideRangeFailed > 0) ledger.push({ t_ms: r.ts, chain: cidOf(r.S, r.T), n: { fields_range_failed: r.sideRangeFailed } });
+    if (r.sideRangeFailed > 0) ledger.push({ ...at(r.tn), chain: cidOf(r.S, r.T), n: { fields_range_failed: r.sideRangeFailed } });
     if (a.isErr) {
       cov.api_error_records += 1; // R2.14
-      ledger.push({ t_ms: r.ts, chain: cidOf(r.S, r.T), n: { api_error_records: 1 } });
-      if (r.ts !== null && chains.has(ck)) {
-        excluded.push({ provider: "claude", chain: chainKeyOf(r.S, r.T), reason: "api_error", event_ms: r.ts, ordinal: null, files: r.files });
+      ledger.push({ ...at(r.tn), chain: cidOf(r.S, r.T), n: { api_error_records: 1 } });
+      if (r.tn !== null && chains.has(ck)) {
+        excluded.push({ provider: "claude", chain: chainKeyOf(r.S, r.T), reason: "api_error", event_ms: nsToMs(r.tn), event_ns: r.tn, ordinal: null, files: r.files });
       }
       continue;
     }
@@ -1473,7 +1536,7 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
       recN.records_usage_bearing = 1;
       const gone = (c: Cnt): boolean => c === "missing" || c === "bad";
       const unmappable =
-        r.ts === null || a.ccBad || gone(a.i) || gone(a.r) || gone(a.wt) || gone(a.o) || (a.hasCC && (gone(a.w5) || gone(a.w1)));
+        r.tn === null || a.ccBad || gone(a.i) || gone(a.r) || gone(a.wt) || gone(a.o) || (a.hasCC && (gone(a.w5) || gone(a.w1)));
       if (unmappable) {
         cov.records_usage_unmappable += 1;
         recN.records_usage_unmappable = 1;
@@ -1481,22 +1544,22 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     }
     if (a.key === null) {
       // R2.13: unkeyed. The chain is known (string sessionId), so it is tainted (R0.9 `request_anomaly`).
-      addTrigger("request_anomaly", [cidOf(r.S, r.T)]);
+      addTrigger("request_anomaly", [cidOf(r.S, r.T)], "chains");
       if (a.hasUsage) {
         cov.records_unkeyed += 1;
         recN.records_unkeyed = 1;
-        ledger.push({ t_ms: r.ts, chain: cidOf(r.S, r.T), n: recN });
-        if (r.ts !== null) {
-          excluded.push({ provider: "claude", chain: chainKeyOf(r.S, r.T), reason: "unkeyed", event_ms: r.ts, ordinal: null, files: r.files });
+        ledger.push({ ...at(r.tn), chain: cidOf(r.S, r.T), n: recN });
+        if (r.tn !== null) {
+          excluded.push({ provider: "claude", chain: chainKeyOf(r.S, r.T), reason: "unkeyed", event_ms: nsToMs(r.tn), event_ns: r.tn, ordinal: null, files: r.files });
         }
       }
       continue;
     }
-    if (a.hasUsage) ledger.push({ t_ms: r.ts, chain: cidOf(r.S, r.T), n: recN });
+    if (a.hasUsage) ledger.push({ ...at(r.tn), chain: cidOf(r.S, r.T), n: recN });
     let l = byKey.get(a.key);
     if (!l) byKey.set(a.key, (l = []));
     l.push(r);
-    noteCopy(a.key, ck, r.ts);
+    noteCopy(a.key, ck, r.tn);
     if (a.msgId !== null) {
       let s = reqToMsg.get(a.key);
       if (!s) reqToMsg.set(a.key, (s = new Set()));
@@ -1536,8 +1599,12 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     const own = pickOwner(chainSet);
     const allFiles = [...new Set(copies.flatMap((c) => c.files))].sort((a, b) => a - b);
     if (chainSet.length > 1) {
-      cov.replay_requests_excluded += chainSet.length - 1;
-      keyN.replay_requests_excluded = chainSet.length - 1;
+      // S7.5: replayed representations of accounted (not excluded) responses only. The ledger entry below carries the
+      // request time, so the windowed counter counts the accounted responses of the window.
+      if (sh.exclusion === null) {
+        cov.replay_requests_excluded += chainSet.length - 1;
+        keyN.replay_requests_excluded = chainSet.length - 1;
+      }
       if (own.ambiguous) {
         cov.replay_ownership_ambiguous += 1;
         keyN.replay_ownership_ambiguous = 1;
@@ -1549,7 +1616,7 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
       sh.exclusion === "usage_incomplete" ||
       sh.conflicts.some((c) => c.kind !== "conflict_diagnostics") ||
       sh.flags.has("bucket_mismatch");
-    if (anomaly) addTrigger("request_anomaly", chainSet.map(chainIdOfAgg));
+    if (anomaly) addTrigger("request_anomaly", chainSet.map(chainIdOfAgg), "chains"); // chain scoped: no family propagation (R0.9 rev 11.1)
     if (chainSet.length > 1 && own.ambiguous) addTrigger("ownership_ambiguous", chainSet.map(chainIdOfAgg));
     // R17.1 requests_conflict counts requests: one per request with at least one conflict code except
     // `conflict_diagnostics` (no exclusion, no taint, R4.2). The per-code counts stay in requests_conflict_by_kind.
@@ -1577,12 +1644,20 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     // R6.3, R4.2, R5.9: the times of a request are min and max over EVERY copy of the key, whatever chain holds the
     // copy. The owner and the replay streams then carry one and the same event time, so the window and the ledger
     // cannot depend on which stream owns the request.
-    const allTs = copies.map((c) => c.ts).filter((t): t is number => t !== null);
-    const reqFirst = allTs.length > 0 ? Math.min(...allTs) : 0;
-    const reqLast = allTs.length > 0 ? Math.max(...allTs) : 0;
+    // Exact instants (S3.2): BigInt nanoseconds, never truncated before a comparison. A key without any valid instant is
+    // `usage_incomplete` and never accounted; its placeholder time is the epoch and is read by no decision.
+    const allTs = copies.map((c) => c.tn).filter((t): t is bigint => t !== null);
+    let reqFirstN: bigint | null = null;
+    let reqLastN: bigint | null = null;
+    for (const t of allTs) {
+      if (reqFirstN === null || t < reqFirstN) reqFirstN = t;
+      if (reqLastN === null || t > reqLastN) reqLastN = t;
+    }
+    const reqFirst = reqFirstN ?? 0n;
+    const reqLast = reqLastN ?? 0n;
     {
       ledger.push({
-        t_ms: allTs.length > 0 ? reqFirst : null,
+        ...at(reqFirstN),
         chain: chainIdOfAgg(own.owner),
         n: keyN,
         conflict_kinds: sh.conflicts.map((c) => c.kind),
@@ -1599,8 +1674,9 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
       const tFirst = reqFirst;
       const tLast = reqLast;
       const parentNode = earliest.parent !== null ? uuidIndex.get(earliest.parent) : undefined;
-      const tAsm = parentNode?.ts_ms ?? null;
-      const startLo = tAsm !== null && tAsm <= tFirst ? tAsm : null;
+      const tAsm = parentNode?.ts_ns ?? null;
+      // R6.4 (S3.3): the guard compares exact instants.
+      const startLo = tAsm !== null && reqFirstN !== null && tAsm <= tFirst ? tAsm : null;
       if (startLo !== null) anyStartLo = true;
       const flags = new Set<ResponseFlag>(sh.flags);
       if (own.ambiguous) flags.add("ownership_ambiguous");
@@ -1621,16 +1697,21 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
         modifiers: sh.modifiers,
         effort: sh.effort,
         time: {
-          event_ms: tFirst,
-          t_first_ms: tFirst,
-          t_last_ms: tLast,
-          t_asm_ms: tAsm,
-          start_lo_ms: startLo,
-          start_hi_ms: tFirst,
+          event_ms: nsToMs(tFirst),
+          t_first_ms: nsToMs(tFirst),
+          t_last_ms: nsToMs(tLast),
+          t_asm_ms: msOf(tAsm),
+          start_lo_ms: msOf(startLo),
+          start_hi_ms: nsToMs(tFirst),
           gap_basis: startLo !== null ? "parent_record" : "none",
+          event_ns: tFirst,
+          t_first_ns: tFirst,
+          t_last_ns: tLast,
+          t_asm_ns: tAsm,
+          start_lo_ns: startLo,
         },
         ordinal: null,
-        ownership: { role, ambiguous: own.ambiguous, owner_stream_start_ms: own.start },
+        ownership: { role, ambiguous: own.ambiguous, owner_stream_start_ms: msOf(own.start), owner_stream_start_ns: own.start },
         provenance: { files: [...new Set(mine.flatMap((c) => c.files))].sort((a, b) => a - b), from_copy_exposed_file: false },
         message_id: sh.msgId,
         uuid: earliest.uuid,
@@ -1651,7 +1732,7 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
   for (const key of [...unverifiedKeySet].sort(cmpStr)) {
     cov.requests_total += 1;
     cov.requests_unverified_version += 1;
-    const m = keyChains.get(key) ?? new Map<string, number | null>();
+    const m = keyChains.get(key) ?? new Map<string, bigint | null>();
     addTrigger(
       "version_unverified",
       [...m.keys()].map((ck) => {
@@ -1662,7 +1743,7 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     for (const [ck, ts] of [...m.entries()].sort((x, y) => cmpStr(x[0], y[0]))) {
       const agg = chains.get(ck);
       if (!agg || ts === null) continue; // a chain without a supported record has no stream to sit in
-      excluded.push({ provider: "claude", chain: chainKeyOf(agg.S, agg.T), reason: "unverified_version", event_ms: ts, ordinal: null, files: [] });
+      excluded.push({ provider: "claude", chain: chainKeyOf(agg.S, agg.T), reason: "unverified_version", event_ms: nsToMs(ts), event_ns: ts, ordinal: null, files: [] });
     }
   }
 
@@ -1763,7 +1844,8 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
       chain: chainKeyOf(agg.S, agg.T),
       provider: "claude",
       files: [...agg.files].sort((a, b) => a - b),
-      start_ms: agg.start,
+      start_ms: msOf(agg.start),
+      start_ns: agg.start,
       ordinal_verified: null,
       fork: null,
       has_settings_marker: false,
@@ -1782,19 +1864,19 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     }));
 
   // cost-state: latest record per (session, model), summed over sessions (R17.5)
-  const latest = new Map<string, { ts: number | null; sum: bigint; d: string; slots: Array<bigint | null>; S: string; model: string }>();
+  const latest = new Map<string, { ts: bigint | null; sum: bigint; d: string; slots: Array<bigint | null>; S: string; model: string }>();
   for (const r of recs) {
     if (r.type !== "cost-state" || !r.cost) continue;
     for (const [model, slots] of r.cost.models) {
       const k = chainStr(r.S, model);
       const sum = slots.reduce<bigint>((s, v) => s + (v ?? 0n), 0n);
       const cur = latest.get(k);
-      const newer = (x: number | null, y: number | null): boolean => x !== null && (y === null || x > y);
+      const newer = (x: bigint | null, y: bigint | null): boolean => x !== null && (y === null || x > y);
       const better =
         !cur ||
-        newer(r.ts, cur.ts) ||
-        (r.ts === cur.ts && (sum > cur.sum || (sum === cur.sum && cmpStr(r.d, cur.d) < 0)));
-      if (better) latest.set(k, { ts: r.ts, sum, d: r.d, slots, S: r.S, model });
+        newer(r.tn, cur.ts) ||
+        (r.tn === cur.ts && (sum > cur.sum || (sum === cur.sum && cmpStr(r.d, cur.d) < 0)));
+      if (better) latest.set(k, { ts: r.tn, sum, d: r.d, slots, S: r.S, model });
     }
   }
   const costByModel = new Map<string, { input: bigint; output: bigint; read: bigint; write: bigint }>();
@@ -1863,21 +1945,27 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
   conflicts.sort((x, y) => cmpStr(x.kind, y.kind) || cmpStr(x.key, y.key));
   excluded.sort(
     (x, y) =>
-      cmpStr(chainKeyString(x.chain), chainKeyString(y.chain)) || x.event_ms - y.event_ms || cmpStr(x.reason, y.reason) || cmpStr(x.files.join(","), y.files.join(",")),
+      cmpStr(chainKeyString(x.chain), chainKeyString(y.chain)) ||
+      cmpNum(x.event_ns ?? null, y.event_ns ?? null) ||
+      cmpStr(x.reason, y.reason) ||
+      cmpStr(x.files.join(","), y.files.join(",")),
   );
   compactBoundaries.sort((x, y) => cmpStr(x.uuid, y.uuid));
 
   // ----- R0.9 integrity facts -----------------------------------------------------------------------------------
   // R15.7 structural reads feed only the family relation and the taint, which can only withdraw output.
   const groupSet = new Map<string, readonly ChainId[]>();
-  const addGroup = (ids: Iterable<ChainId>): void => {
+  const keyGroupSet = new Map<string, readonly ChainId[]>(); // link (iii) alone: the scope of a chain scoped request_anomaly
+  const addGroup = (ids: Iterable<ChainId>, set: Map<string, readonly ChainId[]> = groupSet): void => {
     const g = [...new Set(ids)].sort(cmpStr);
-    if (g.length >= 2) groupSet.set(g.join("\u0001"), g); // a group of one links nothing
+    if (g.length >= 2) set.set(g.join("\u0001"), g); // a group of one links nothing
   };
   for (const g of bySession.values()) addGroup(g); // link (i): a shared sessionId
   for (const m of keyChains.values()) {
     // link (iii): copies of one request key (Claude replays, R4.6)
-    addGroup([...m.keys()].map((ck) => cidOf(...(ck.split("\u0000") as [string, string]))));
+    const keyIds = [...m.keys()].map((ck) => cidOf(...(ck.split("\u0000") as [string, string])));
+    addGroup(keyIds, keyGroupSet);
+    addGroup(keyIds);
   }
   fileUnreadable.forEach((u) => {
     if (u) addTrigger("file_unreadable", "provider"); // R17.1: the file cannot be read, its records are unknown
@@ -1891,11 +1979,12 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     readable: !(fileUnreadable[i] as boolean),
   }));
   const reasonOrder: ReadonlyMap<string, number> = new Map(TAINT_REASONS.map((r, i) => [r, i]));
-  const trigKey = (t: TaintTrigger): string => (t.names === "provider" ? "*" : t.names.join("\u0001"));
+  const trigKey = (t: TaintTrigger): string => (t.names === "provider" ? "*" : `${t.scope ?? "family"}\u0000${t.names.join("\u0001")}`);
   const integrity: IntegrityFacts = {
     provider: "claude",
     chains: [...seenChains].sort(cmpStr),
     family_groups: [...groupSet.values()].sort((x, y) => cmpStr(x.join("\u0001"), y.join("\u0001"))),
+    key_groups: [...keyGroupSet.values()].sort((x, y) => cmpStr(x.join("\u0001"), y.join("\u0001"))),
     triggers: [...triggerMap.values()].sort(
       (x, y) => (reasonOrder.get(x.reason) as number) - (reasonOrder.get(y.reason) as number) || cmpStr(trigKey(x), trigKey(y)),
     ),

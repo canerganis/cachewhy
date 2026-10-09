@@ -13,6 +13,11 @@
 //   by a live file is live. A live file gives no unparsed_line taint. A file that names no chain is never live.
 // - Taint. A reason taints every chain of the family of each chain it names, and a reason that names no chain
 //   (names = "provider") taints every chain of the provider. A chain is tainted iff at least one reason applies.
+//   Exception (revision 11.1): a trigger with scope "chains" (the request_anomaly of a Claude request) taints exactly
+//   the chains it names plus the chains connected to them over link (iii) alone (key_groups), taken transitively, and
+//   does not propagate over link (i) or (ii).
+// - Families. A family counts as tainted iff any of its chains is tainted. `families_ordinal_unverified` counts the
+//   families that hold a chain tainted with the reason ordinal_unverified (R17.3 drift_stream_integrity).
 // - Coverage. Live families are excluded from chains_total, chains_tainted, families_total and families_tainted.
 
 import { CONSTANTS, TAINT_REASONS, chainIdOf } from "../model/types.js";
@@ -82,6 +87,7 @@ export function computeTaint(facts: IntegrityFacts, files: readonly FileFacts[],
   // ---- nodes: every chain any fact mentions, sorted --------------------------------------------------------
   const idSet = new Set<ChainId>(facts.chains);
   for (const g of facts.family_groups) for (const c of g) idSet.add(c);
+  for (const g of facts.key_groups ?? []) for (const c of g) idSet.add(c);
   for (const t of facts.triggers) if (t.names !== "provider") for (const c of t.names) idSet.add(c);
   for (const f of files) for (const c of f.named_chains) idSet.add(c);
   const ids = [...idSet].sort(cmp);
@@ -95,6 +101,21 @@ export function computeTaint(facts: IntegrityFacts, files: readonly FileFacts[],
     if (first === undefined) continue;
     const a = index.get(first) as number;
     for (let k = 1; k < g.length; k++) dsu.union(a, index.get(g[k] as ChainId) as number);
+  }
+  // Link (iii) components (revision 11.1): the scope of a chain scoped trigger. Computed over the key groups alone.
+  const keyDsu = new Dsu(ids.length);
+  for (const g of facts.key_groups ?? []) {
+    const first = g[0];
+    if (first === undefined) continue;
+    const a = index.get(first) as number;
+    for (let k = 1; k < g.length; k++) keyDsu.union(a, index.get(g[k] as ChainId) as number);
+  }
+  const keyMembers = new Map<number, number[]>();
+  for (let i = 0; i < ids.length; i++) {
+    const root = keyDsu.find(i);
+    const list = keyMembers.get(root);
+    if (list === undefined) keyMembers.set(root, [i]);
+    else list.push(i);
   }
   // Family numbers in order of the smallest member (ids are sorted, so the first id met opens the next number).
   const familyOfRoot = new Map<number, number>();
@@ -123,15 +144,21 @@ export function computeTaint(facts: IntegrityFacts, files: readonly FileFacts[],
 
   // ---- reasons ---------------------------------------------------------------------------------------------
   const famReasons: Set<TaintReason>[] = Array.from({ length: familyCount }, () => new Set<TaintReason>());
+  const chainReasons: Set<TaintReason>[] = Array.from({ length: ids.length }, () => new Set<TaintReason>());
   const providerWide = new Set<TaintReason>();
-  const apply = (reason: TaintReason, names: readonly ChainId[] | "provider"): void => {
+  const apply = (reason: TaintReason, names: readonly ChainId[] | "provider", scope: "family" | "chains" = "family"): void => {
     if (names === "provider") {
       providerWide.add(reason);
       return;
     }
-    for (const c of names) (famReasons[familyOf[index.get(c) as number] as number] as Set<TaintReason>).add(reason);
+    for (const c of names) {
+      const i = index.get(c) as number;
+      if (scope === "chains") {
+        for (const j of keyMembers.get(keyDsu.find(i)) as number[]) (chainReasons[j] as Set<TaintReason>).add(reason);
+      } else (famReasons[familyOf[i] as number] as Set<TaintReason>).add(reason);
+    }
   };
-  for (const t of facts.triggers) apply(t.reason, t.names);
+  for (const t of facts.triggers) apply(t.reason, t.names, t.scope ?? "family");
   for (const f of files) {
     if (!f.readable) {
       // Defensive: parsers also emit this trigger. Same reason, same naming, so the union is idempotent.
@@ -149,26 +176,34 @@ export function computeTaint(facts: IntegrityFacts, files: readonly FileFacts[],
   let familiesTotal = 0;
   let familiesTainted = 0;
   let familiesLive = 0;
+  let familiesOrdinal = 0;
   const wideOrdered = TAINT_REASONS.filter((r) => providerWide.has(r));
   for (let fam = 0; fam < familyCount; fam++) {
     const live = liveFamily[fam] as boolean;
-    const reasons = new Set<TaintReason>(famReasons[fam]);
-    for (const r of providerWide) reasons.add(r);
-    const ordered = TAINT_REASONS.filter((r) => reasons.has(r));
-    const tainted = ordered.length > 0;
-    if (live) familiesLive++;
-    else {
-      familiesTotal++;
-      if (tainted) familiesTainted++;
-    }
+    let anyTainted = false;
+    let anyOrdinal = false;
     for (const i of members[fam] as number[]) {
+      // Family scoped reasons and provider wide reasons apply to every chain; chain scoped reasons to their chain only.
+      const reasons = new Set<TaintReason>(famReasons[fam]);
+      for (const r of providerWide) reasons.add(r);
+      for (const r of chainReasons[i] as Set<TaintReason>) reasons.add(r);
+      const ordered = TAINT_REASONS.filter((r) => reasons.has(r));
+      const tainted = ordered.length > 0;
       chains.set(ids[i] as ChainId, { chain: ids[i] as ChainId, family: fam, tainted, reasons: ordered, live });
+      if (tainted) anyTainted = true;
+      if (reasons.has("ordinal_unverified")) anyOrdinal = true;
       if (live) continue;
       chainsTotal++;
       if (tainted) {
         chainsTainted++;
         for (const r of ordered) byReason[r]++;
       }
+    }
+    if (live) familiesLive++;
+    else {
+      familiesTotal++;
+      if (anyTainted) familiesTainted++;
+      if (anyOrdinal) familiesOrdinal++;
     }
   }
 
@@ -178,6 +213,7 @@ export function computeTaint(facts: IntegrityFacts, files: readonly FileFacts[],
     families_total: familiesTotal,
     families_tainted: familiesTainted,
     families_live: familiesLive,
+    families_ordinal_unverified: familiesOrdinal,
     chains_total: chainsTotal,
     chains_tainted: chainsTainted,
     chains_tainted_by_reason: byReason,

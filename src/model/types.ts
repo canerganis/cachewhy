@@ -368,7 +368,8 @@ export const DRIFT_CODES = [
 ] as const;
 export type DriftCode = (typeof DRIFT_CODES)[number];
 
-export const HEADLINE_STATUSES = ["ok", "withheld"] as const;
+/** R14.5, R17.3 (revision 11.1): `partial` when some but not every provider with input is closed. */
+export const HEADLINE_STATUSES = ["ok", "partial", "withheld"] as const;
 export type HeadlineStatus = (typeof HEADLINE_STATUSES)[number];
 
 /** R0.9. The closed enum of taint reasons, in spec table order (the order used wherever reasons are listed). */
@@ -612,6 +613,16 @@ export interface TimeInfo {
   readonly start_lo_ms: EpochMs | null;
   readonly start_hi_ms: EpochMs;
   readonly gap_basis: GapBasis;
+  /**
+   * Exact instants, BigInt nanoseconds since the epoch (accounting-semantics S3.2). The `*_ms` fields above are their
+   * floor in milliseconds and serve display; every decision (chain order, ties, window membership, the `t_asm` guard)
+   * reads these when present and falls back to `* 1e6` of the millisecond field for hand-built responses.
+   */
+  readonly event_ns?: bigint;
+  readonly t_first_ns?: bigint;
+  readonly t_last_ns?: bigint;
+  readonly t_asm_ns?: bigint | null;
+  readonly start_lo_ns?: bigint | null;
 }
 
 export interface Ownership {
@@ -621,6 +632,8 @@ export interface Ownership {
   readonly ambiguous: boolean;
   /** `stream_start` of the owning stream (R4.6). */
   readonly owner_stream_start_ms: EpochMs | null;
+  /** Exact `stream_start` of the owner in nanoseconds (S3.2); ties of R4.6 are decided on it. */
+  readonly owner_stream_start_ns?: bigint | null;
 }
 
 /** Index into ParseResult.files / Graph.files. Files are labelled `file_<N>` on output (R14.6). */
@@ -701,6 +714,8 @@ export interface ExcludedRecord {
   readonly chain: ChainKey;
   readonly reason: ExcludedRecordReason;
   readonly event_ms: EpochMs;
+  /** Exact instant in nanoseconds (S3.2), when the parser had one. */
+  readonly event_ns?: bigint;
   readonly ordinal: number | null;
   readonly files: readonly FileIndex[];
 }
@@ -787,6 +802,8 @@ export interface Stream {
   readonly files: readonly FileIndex[];
   /** R4.6: minimum timestamp over all records of all files of the stream. */
   readonly start_ms: EpochMs | null;
+  /** Exact `stream_start` in nanoseconds (S3.2). */
+  readonly start_ns?: bigint | null;
   /** R4.12. Always null for Claude, which has no ordinal. A failing stream is tainted `ordinal_unverified` (R0.9). */
   readonly ordinal_verified: boolean | null;
   /** Codex only, null when the thread is not a fork (R4.9). */
@@ -815,6 +832,8 @@ export interface ClaudeUuidNode {
   readonly parent_uuid: string | null;
   readonly logical_parent_uuid: string | null;
   readonly ts_ms: EpochMs | null;
+  /** Exact instant in nanoseconds (S3.2); null exactly when `ts_ms` is null. */
+  readonly ts_ns?: bigint | null;
   readonly is_compact_summary: boolean;
   readonly is_compact_boundary: boolean;
   readonly chain: ChainKey | null;
@@ -932,6 +951,8 @@ export const COVERAGE_COUNT_FIELDS = [
   "chains_tainted",
   "families_total",
   "families_tainted",
+  /** R17.3 revision 11.1: families that hold a chain tainted with reason `ordinal_unverified` (Codex; 0 for Claude). */
+  "families_ordinal_unverified",
   "responses_in_tainted_chains",
   /** R0.9 effect 2: replaces every other unpriced reason for a response of a tainted chain. */
   "requests_unpriced_tainted",
@@ -1000,6 +1021,13 @@ export const UNPRICED_MODIFIER_REASONS = [
 ] as const;
 export type UnpricedModifierReason = (typeof UNPRICED_MODIFIER_REASONS)[number];
 
+/**
+ * R3.9 (revision 11.1): the closed enum of reasons under `tokens_unpriced_by_reason`, in fixed order. It partitions
+ * `tokens_unpriced`. `excluded` is listed for completeness and is always 0 (an excluded response is in no total).
+ */
+export const UNPRICED_TOKEN_REASONS = ["chain_tainted", "model_unknown", "unknown_model", "excluded", ...UNPRICED_MODIFIER_REASONS] as const;
+export type UnpricedTokenReason = (typeof UNPRICED_TOKEN_REASONS)[number];
+
 export const UNLOGGED_BUCKETS = ["input_uncached", "cache_read", "cache_write", "output"] as const;
 export type UnloggedBucket = (typeof UNLOGGED_BUCKETS)[number];
 
@@ -1007,6 +1035,8 @@ export type CoverageCounters = Record<CoverageCountField, number> &
   Record<CoverageTokenField, Tokens> & {
     /** Reason counts. The totals are the matching plain counters (they must equal the sum). */
     requests_unpriced_modifier_by_reason: Record<UnpricedModifierReason, number>;
+    /** R3.9 revision 11.1: the amounts sum to `tokens_unpriced`. Decimal strings on output (R17.1). */
+    tokens_unpriced_by_reason: Record<UnpricedTokenReason, Tokens>;
     /** R0.9: a chain with several reasons counts once under each. The total is `chains_tainted`. */
     chains_tainted_by_reason: Record<TaintReason, number>;
     requests_conflict_by_kind: Record<ConflictKind, number>;
@@ -1034,6 +1064,7 @@ export function emptyCoverage(): CoverageCounters {
     tokens_in_tainted_chains: 0n,
     tokens_live_skipped: 0n,
     requests_unpriced_modifier_by_reason: zeroCounts(UNPRICED_MODIFIER_REASONS),
+    tokens_unpriced_by_reason: Object.fromEntries(UNPRICED_TOKEN_REASONS.map((k) => [k, 0n])),
     chains_tainted_by_reason: zeroCounts(TAINT_REASONS),
     requests_conflict_by_kind: zeroCounts(CONFLICT_KINDS),
     links_unlinked_by_reason: zeroCounts(UNLINKED_REASONS),
@@ -1054,6 +1085,7 @@ export function mergeCoverage(a: CoverageCounters, b: CoverageCounters): Coverag
     for (const k of keys) dst[k] = x[k] + y[k];
   };
   addMap(out.requests_unpriced_modifier_by_reason, a.requests_unpriced_modifier_by_reason, b.requests_unpriced_modifier_by_reason, UNPRICED_MODIFIER_REASONS);
+  for (const k of UNPRICED_TOKEN_REASONS) out.tokens_unpriced_by_reason[k] = a.tokens_unpriced_by_reason[k] + b.tokens_unpriced_by_reason[k];
   addMap(out.chains_tainted_by_reason, a.chains_tainted_by_reason, b.chains_tainted_by_reason, TAINT_REASONS);
   addMap(out.requests_conflict_by_kind, a.requests_conflict_by_kind, b.requests_conflict_by_kind, CONFLICT_KINDS);
   addMap(out.links_unlinked_by_reason, a.links_unlinked_by_reason, b.links_unlinked_by_reason, UNLINKED_REASONS);
@@ -1095,6 +1127,12 @@ export interface ParseOptions {}
 export interface TaintTrigger {
   readonly reason: Exclude<TaintReason, "unparsed_line">;
   readonly names: readonly ChainId[] | "provider";
+  /**
+   * Scope of the reason (R0.9, revision 11.1). `family` (the default when absent): every chain of the family of each
+   * named chain is tainted. `chains`: exactly the named chains, with no family propagation. Only the
+   * `request_anomaly` of a Claude request is chain scoped.
+   */
+  readonly scope?: "family" | "chains";
 }
 
 /** Per-physical-file facts for R0.9 (liveness, `unparsed_line`, `file_unreadable`). */
@@ -1120,6 +1158,12 @@ export interface IntegrityFacts {
   readonly chains: readonly ChainId[];
   /** Groups of chains that are linked to each other. Each group is fully connected: R0.9 links (i), (ii) and (iii). */
   readonly family_groups: readonly (readonly ChainId[])[];
+  /**
+   * Revision 11.1: the groups of link (iii) alone (copies of one request key). A chain scoped trigger taints the
+   * chains it names and every chain connected to them over these groups, transitively, and over no other link.
+   * Absent: no such group. Every group here is also in `family_groups`.
+   */
+  readonly key_groups?: readonly (readonly ChainId[])[];
   readonly triggers: readonly TaintTrigger[];
   readonly files: readonly FileFacts[];
 }
@@ -1141,8 +1185,11 @@ export interface ProviderTaint {
   readonly provider: Provider;
   readonly chains: ReadonlyMap<ChainId, ChainTaint>;
   readonly families_total: number;
+  /** A family is tainted iff any of its chains is tainted (chain scoped reasons taint a single chain, R0.9 rev 11.1). */
   readonly families_tainted: number;
   readonly families_live: number;
+  /** R17.3 revision 11.1: families (live excluded) that hold a chain tainted with reason `ordinal_unverified`. */
+  readonly families_ordinal_unverified: number;
   readonly chains_total: number;
   readonly chains_tainted: number;
   readonly chains_tainted_by_reason: Record<TaintReason, number>;
@@ -1179,6 +1226,8 @@ export type LedgerCountField = (typeof LEDGER_COUNT_FIELDS)[number];
 export interface LedgerEntry {
   /** Event time of the record or response. Null when no timestamp parsed: such an entry is never filtered out. */
   readonly t_ms: EpochMs | null;
+  /** Exact instant in nanoseconds (S3.2), the source of `t_ms` (its floor). */
+  readonly t_ns?: bigint | null;
   /** The chain the record or response belongs to. Null: no chain (provider-wide), never live. */
   readonly chain: ChainId | null;
   readonly n: Readonly<Partial<Record<LedgerCountField, number>>>;
@@ -1298,6 +1347,12 @@ export interface Chain {
   readonly tainted: boolean;
   /** R0.9: the reasons that apply, in `TAINT_REASONS` order. Empty iff not tainted. */
   readonly taint_reasons: readonly TaintReason[];
+  /**
+   * R0.9 effect 4 (link guard, revision 11.1): true iff the chain's link is `verified` and the chain and its parent
+   * chain are both untainted. A link decides a boundary only then. G1 computes no boundary, so this is the structural
+   * fact the later stages read; the link itself is still counted in `links_*` whatever this flag says.
+   */
+  readonly link_decides_boundary: boolean;
 }
 
 export interface Graph {
@@ -1575,6 +1630,8 @@ export interface ProviderTotals {
   /** Picodollars. Null when nothing was priced. */
   readonly usd_pico: Pico | null;
   readonly tokens_unpriced: Tokens;
+  /** R3.9 revision 11.1: the unpriced tokens of these totals by reason; the values sum to `tokens_unpriced`. */
+  readonly tokens_unpriced_by_reason: Readonly<Record<UnpricedTokenReason, Tokens>>;
   /** Responses with unknown output (R16.1 `V`). */
   readonly output_unknown: number;
 }
@@ -1670,7 +1727,10 @@ export interface ReportInput {
   readonly table_version: string;
   readonly window: TimeWindow;
   readonly headline_status: HeadlineStatus;
+  /** The first tripped code in provider order (R17.3). */
   readonly withheld_reason: DriftCode | null;
+  /** R17.3 revision 11.1: drift is decided per provider; the tripped code of each provider, or null. */
+  readonly withheld_by_provider: Readonly<Record<Provider, DriftCode | null>>;
   readonly drift: readonly DriftFinding[];
   readonly assumptions: readonly Assumption[];
   /** Merged coverage (R17.2) and the per-provider parts (drift codes are per provider). */

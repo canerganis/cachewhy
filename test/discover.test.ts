@@ -20,6 +20,9 @@ function layoutClaude(projects: string): void {
   put(join(projects, "proj-a", S, "subagents", "agent-abc.prefix.json"));
   put(join(projects, "proj-a", S, "subagents", "workflows", "wf_run1", "journal.jsonl"));
   put(join(projects, "proj-a", S, "subagents", "workflows", "wf_run1", "agent-w1.jsonl"));
+  put(join(projects, "proj-a", S, "subagents", "workflows", "wf_run1", "agent-w1.meta.json"));
+  put(join(projects, "proj-a", S, "subagents", "workflows", "wf_run1", "agent-w1.prefix.json"));
+  put(join(projects, "proj-a", S, "subagents", "workflows", "wf_run1", "agent-w1.other.json"));
   put(join(projects, "proj-a", S, "workflows", "wf_run1.json"));
   put(join(projects, "proj-a", "notes.txt"));
   put(join(projects, "proj-a", S, "subagents", "other.txt"));
@@ -54,7 +57,7 @@ describe("discover", () => {
     layoutClaude(join(home, ".claude", "projects"));
     const r = await discover({ home, env: {} });
     const by = new Map(r.files.map((f) => [`${f.kind}:${f.relPath}`, f]));
-    assert.equal(r.files.length, 7);
+    assert.equal(r.files.length, 9);
     const main = by.get(`claude-main:proj-a/${S}.jsonl`);
     assert.equal(main?.size, 8);
     assert.equal(main?.sessionId, S);
@@ -69,6 +72,13 @@ describe("discover", () => {
     const wa = by.get(`claude-subagent:proj-a/${S}/subagents/workflows/wf_run1/agent-w1.jsonl`);
     assert.equal(wa?.workflowAgent, true);
     assert.ok(by.has(`claude-workflow-run:proj-a/${S}/workflows/wf_run1.json`));
+    // S12.6: the JSON sidecars of a workflow agent are discovered files; an unknown name in that directory is not
+    const wm = by.get(`claude-subagent-meta:proj-a/${S}/subagents/workflows/wf_run1/agent-w1.meta.json`);
+    assert.equal(wm?.workflowAgent, true);
+    assert.equal(wm?.agentId, "w1");
+    assert.equal(wm?.runId, "run1");
+    assert.equal(by.get(`claude-subagent-prefix:proj-a/${S}/subagents/workflows/wf_run1/agent-w1.prefix.json`)?.workflowAgent, true);
+    assert.ok(![...by.keys()].some((k) => k.endsWith("agent-w1.other.json")));
   });
 
   it("classifyClaude ignores unknown shapes", () => {
@@ -86,7 +96,7 @@ describe("discover", () => {
     put(join(c2, "projects", "proj-b", "synthetic-session-0002.jsonl"));
     const r = await discover({ home, env: { CLAUDE_CONFIG_DIR: `${c1},${c2},${c1}` } });
     assert.equal(r.files.filter((f) => f.kind === "claude-main").length, 2);
-    assert.equal(r.files.length, 8);
+    assert.equal(r.files.length, 10);
     assert.ok(r.diagnostics.some((d) => d.code === "root_duplicate"));
   });
 
@@ -101,7 +111,7 @@ describe("discover", () => {
       return;
     }
     const r = await discover({ home, env: {} });
-    assert.equal(r.files.length, 7);
+    assert.equal(r.files.length, 9);
     assert.equal(r.roots.filter((x) => x.agent === "claude").length, 1);
     assert.ok(r.diagnostics.some((d) => d.code === "root_duplicate"));
   });

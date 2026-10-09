@@ -17,6 +17,7 @@ import {
   SCHEMA_ID,
   SPEC_ID,
   TAINT_REASONS,
+  UNPRICED_TOKEN_REASONS,
   chainIdOf,
   contextTokens,
   emptyCoverage,
@@ -35,6 +36,7 @@ import type {
   GraphNode,
   HeadlineFigures,
   ModelTotals,
+  PricedResponse,
   Provider,
   ProviderTotals,
   ReportBuildArgs,
@@ -42,8 +44,8 @@ import type {
   RequestKind,
   Response,
   UnpricedModifierReason,
+  UnpricedTokenReason,
 } from "../model/types.js";
-import { normalizeModelId } from "../pricing/index.js";
 
 /** What is printed (R5.9). `chains` null means every chain of the shown providers. */
 export interface ReportFilter {
@@ -78,8 +80,13 @@ interface Acc {
   total_input: bigint;
   usd: bigint;
   tokens_unpriced: bigint;
+  /** R3.9 revision 11.1: `tokens_unpriced` split by the first gate that refused the response. */
+  unpriced_by_reason: Record<UnpricedTokenReason, bigint>;
   output_unknown: number;
 }
+
+const zeroReasonTokens = (): Record<UnpricedTokenReason, bigint> =>
+  Object.fromEntries(UNPRICED_TOKEN_REASONS.map((k) => [k, 0n])) as Record<UnpricedTokenReason, bigint>;
 
 const newAcc = (): Acc => ({
   responses: 0,
@@ -88,8 +95,28 @@ const newAcc = (): Acc => ({
   total_input: 0n,
   usd: 0n,
   tokens_unpriced: 0n,
+  unpriced_by_reason: zeroReasonTokens(),
   output_unknown: 0,
 });
+
+/**
+ * R3.9 revision 11.1: the reason of an unpriced response is the first gate that refused it, which is the order of
+ * `priceResponse`. `not_owner` and `excluded` responses carry no tokens here, so they add 0 under `excluded`.
+ */
+function unpricedReasonOf(pr: PricedResponse): UnpricedTokenReason | null {
+  if (pr.cost.pico !== null) return null;
+  switch (pr.cost.reason) {
+    case "chain_tainted":
+    case "model_unknown":
+    case "unknown_model":
+    case "excluded":
+      return pr.cost.reason;
+    case "unpriced_modifier":
+      return pr.modifier_reason ?? "modifier_unverified";
+    default:
+      return "excluded"; // not_owner: zero tokens
+  }
+}
 
 function tokensTotal(a: Acc): bigint {
   return a.total_input + a.tokens.output + a.tokens.output_lower_bound_unknown;
@@ -167,12 +194,12 @@ export function computeDrift(byProvider: Readonly<Record<Provider, CoverageCount
       const trip = c.requests_with_final_marker === 0 && c.responses_total > CONSTANTS.NO_FINAL_MARKER_MIN;
       finding("drift_no_final_marker", p, c.requests_with_final_marker, c.responses_total, null, trip);
     } else {
-      // R17.3: Codex files in conflict, unassigned or copy exposed against C10 of Codex files, or Codex chains tainted
-      // with reason `ordinal_unverified` against C10 of Codex chains.
+      // R17.3: Codex files in conflict, unassigned or copy exposed against C10 of Codex files, or Codex families that
+      // hold a chain tainted with reason `ordinal_unverified` against C10 of Codex families (revision 11.1: families,
+      // not chains, so one failing stream with many subagent threads is not read as a format change).
       const bad = c.files_stream_conflict + c.files_unassigned_stream + c.files_copy_exposed;
       const filesTrip = BigInt(bad) * c10.den > c10.num * BigInt(c.files_total);
-      const ordinal = c.chains_tainted_by_reason.ordinal_unverified;
-      const ordTrip = BigInt(ordinal) * c10.den > c10.num * BigInt(c.chains_total);
+      const ordTrip = BigInt(c.families_ordinal_unverified) * c10.den > c10.num * BigInt(c.families_total);
       finding("drift_stream_integrity", p, bad, c.files_total, null, filesTrip || ordTrip);
     }
   }
@@ -196,9 +223,10 @@ export const buildReportInput = (args: ReportBuildArgs, filter: ReportFilter = A
   const modelKey = (r: Response): { model: string | null; verified: boolean } => {
     const verified = r.model.verified && r.model.model !== null;
     const raw = verified ? r.model.model : r.provider === "claude" ? r.model.candidate : null;
-    if (raw === null) return { model: null, verified };
-    const id = normalizeModelId(raw);
-    return { model: known.has(id) ? id : "unlisted", verified };
+    // S12.7: a Claude response with no model at all is keyed `unlisted` (R14.3); an unverified Codex one has no key.
+    if (raw === null) return { model: r.provider === "claude" ? "unlisted" : null, verified };
+    // S2.4: the id was normalized once at read time and is matched as is.
+    return { model: known.has(raw) ? raw : "unlisted", verified };
   };
 
   /** One pass over the counted responses, restricted to the responses `keep` accepts. */
@@ -251,6 +279,8 @@ export const buildReportInput = (args: ReportBuildArgs, filter: ReportFilter = A
         }
         a.total_input += contextTokens(u);
         a.tokens_unpriced += pr.tokens_unpriced;
+        const why = unpricedReasonOf(pr);
+        if (why !== null) a.unpriced_by_reason[why] += pr.tokens_unpriced;
         if (pr.cost.pico !== null) {
           a.priced++;
           a.usd += pr.cost.pico;
@@ -312,10 +342,10 @@ export const buildReportInput = (args: ReportBuildArgs, filter: ReportFilter = A
   for (const p of PROVIDERS) {
     const c = covBy[p];
     const pv = scan[p];
-    // Unverified-version keys are scan-wide and never in the window (R15.7): keep that surplus.
-    const surplus = Math.max(0, c.requests_total - c.responses_total);
     applyLedger(c, p);
-    c.requests_total = pv.all.responses + surplus;
+    // S12.2: the accounted responses of the window (owner, supported, not excluded, not live); unverified-version keys are
+    // counted in requests_unverified_version only.
+    c.requests_total = pv.all.responses;
     // R2.10: counted after the taint override (a tainted chain has no verified model), not from the parser's as-if-
     // untainted attribution, so it moves only with taint (R17.7).
     c.responses_model_unverified = pv.modelUnverified;
@@ -326,6 +356,7 @@ export const buildReportInput = (args: ReportBuildArgs, filter: ReportFilter = A
       c.requests_unpriced_modifier_by_reason[k] = pv.byModifier.get(k) ?? 0;
     }
     c.tokens_unpriced = pv.all.tokens_unpriced;
+    for (const k of UNPRICED_TOKEN_REASONS) c.tokens_unpriced_by_reason[k] = pv.all.unpriced_by_reason[k];
     c.output_unknown_requests = pv.all.output_unknown;
     c.baseline_requests_loaded = pv.baseline;
     // Chains, families, links and live counters come from the graph, after taint and the cross-chain checks
@@ -336,6 +367,7 @@ export const buildReportInput = (args: ReportBuildArgs, filter: ReportFilter = A
     for (const k of TAINT_REASONS) c.chains_tainted_by_reason[k] = g.chains_tainted_by_reason[k];
     c.families_total = g.families_total;
     c.families_tainted = g.families_tainted;
+    c.families_ordinal_unverified = g.families_ordinal_unverified;
     c.families_live_skipped = g.families_live_skipped;
     c.responses_live_skipped = g.responses_live_skipped;
     c.tokens_live_skipped = g.tokens_live_skipped;
@@ -353,6 +385,13 @@ export const buildReportInput = (args: ReportBuildArgs, filter: ReportFilter = A
   const coverage = mergeCoverage(covBy.claude, covBy.codex);
   const drift = computeDrift(covBy);
   const tripped = drift.filter((d) => d.tripped);
+  // R17.3 revision 11.1: drift is decided per provider and closes that provider only. A provider with input has a
+  // drift finding; a provider without input is neither open nor closed for the status.
+  const withheldBy = { claude: null, codex: null } as Record<Provider, DriftCode | null>;
+  for (const p of PROVIDERS) withheldBy[p] = tripped.find((d) => d.provider === p)?.code ?? null;
+  const withInput = PROVIDERS.filter((p) => drift.some((d) => d.provider === p));
+  const closed = PROVIDERS.filter((p) => withheldBy[p] !== null);
+  const headlineStatus: ReportInput["headline_status"] = closed.length === 0 ? "ok" : closed.length >= withInput.length ? "withheld" : "partial";
 
   const totals: ProviderTotals[] = PROVIDERS.map((p) => {
     const pv = shown[p];
@@ -373,6 +412,7 @@ export const buildReportInput = (args: ReportBuildArgs, filter: ReportFilter = A
       models,
       usd_pico: pv.all.priced > 0 ? pv.all.usd : null,
       tokens_unpriced: pv.all.tokens_unpriced,
+      tokens_unpriced_by_reason: { ...pv.all.unpriced_by_reason },
       output_unknown: pv.all.output_unknown,
     };
   });
@@ -382,7 +422,9 @@ export const buildReportInput = (args: ReportBuildArgs, filter: ReportFilter = A
   const zeroBoundaries = {} as Record<BoundaryType, number>;
   for (const b of ["model_switch", "context_reset", "subagent_cold_start", "fork_inherit", "first_observation"] as const) zeroBoundaries[b] = 0;
   const tokensTotalAll = tokensTotal(cl.all) + tokensTotal(cx.all);
-  const usdAll = cl.all.priced + cx.all.priced > 0 ? cl.all.usd + cx.all.usd : null;
+  // The headline dollar figure sums the open providers only (R17.3 revision 11.1); a closed provider adds none.
+  const openPriced = (p: Provider): number => (withheldBy[p] === null ? shown[p].all.priced : 0);
+  const usdAll = openPriced("claude") + openPriced("codex") > 0 ? (withheldBy.claude === null ? cl.all.usd : 0n) + (withheldBy.codex === null ? cx.all.usd : 0n) : null;
 
   // R16.1 / C36: the shares are scan-wide per provider.
   const taintFor = (p: Provider): HeadlineFigures["taint_by_provider"][Provider] => {
@@ -443,11 +485,10 @@ export const buildReportInput = (args: ReportBuildArgs, filter: ReportFilter = A
     clo_c: 0n,
   };
 
-  const withheld = tripped.length > 0;
   const assumptionSet = new Set<Assumption>([...graph.assumptions, ...detection.assumptions]);
   for (const x of parsed) for (const a of x.assumptions) assumptionSet.add(a);
-  // A dollar figure is printed only when the headline is open and something was priced (R16.5).
-  if (!withheld && (cl.anyPriced || cx.anyPriced)) assumptionSet.add("no_regional_surcharge_assumed");
+  // A dollar figure is printed only for an open provider that has a priced response (R16.5, R17.3).
+  if ((withheldBy.claude === null && cl.anyPriced) || (withheldBy.codex === null && cx.anyPriced)) assumptionSet.add("no_regional_surcharge_assumed");
   if (PROVIDERS.some((p) => covBy[p].families_live_skipped > 0)) assumptionSet.add("live_session_skipped");
   if (PROVIDERS.some((p) => covBy[p].requests_unverified_version > 0 || covBy[p].lines_unverified_version > 0)) assumptionSet.add("unverified_version");
 
@@ -458,8 +499,9 @@ export const buildReportInput = (args: ReportBuildArgs, filter: ReportFilter = A
     tool_version: args.tool_version,
     table_version: book.table_version,
     window: win,
-    headline_status: withheld ? "withheld" : "ok",
-    withheld_reason: withheld ? (tripped[0] as DriftFinding).code : null,
+    headline_status: headlineStatus,
+    withheld_reason: tripped.length > 0 ? (tripped[0] as DriftFinding).code : null,
+    withheld_by_provider: withheldBy,
     drift,
     assumptions: ASSUMPTIONS.filter((a) => assumptionSet.has(a)),
     coverage,

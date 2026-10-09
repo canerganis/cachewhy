@@ -180,6 +180,11 @@ export function classifyClaude(segments: string[]): ClassifiedClaude | null {
       if (name === "journal.jsonl") return { kind: "claude-workflow-journal", sessionId, runId, workflowAgent: true } as ClassifiedClaude;
       const a = /^agent-(.+)\.jsonl$/.exec(name);
       if (a) return { kind: "claude-subagent", sessionId, agentId: a[1], runId, workflowAgent: true };
+      // S12.6: the JSON sidecars of a workflow agent are discovered files (one file, one line). They link nothing (R5.4).
+      const wm = /^agent-(.+)\.meta\.json$/.exec(name);
+      if (wm) return { kind: "claude-subagent-meta", sessionId, agentId: wm[1], runId, workflowAgent: true };
+      const wp = /^agent-(.+)\.prefix\.json$/.exec(name);
+      if (wp) return { kind: "claude-subagent-prefix", sessionId, agentId: wp[1], runId, workflowAgent: true };
       return null;
     }
     if (segments.length !== subIdx + 2) return null;

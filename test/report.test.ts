@@ -127,7 +127,7 @@ describe("drift (R17.3)", () => {
     assert.equal(tripped(cov(f(1000, 1)), "drift_no_final_marker"), false);
   });
 
-  it("drift_stream_integrity (Codex) reads physical file counts and the ordinal_unverified chain count (R17.3)", () => {
+  it("drift_stream_integrity (Codex) reads physical file counts and the ordinal_unverified family count (R17.3, revision 11.1)", () => {
     const run2 = (f: (c: CoverageCounters) => void) => {
       const by = cov(() => undefined);
       f(by.codex);
@@ -135,10 +135,12 @@ describe("drift (R17.3)", () => {
     };
     assert.equal(run2((c) => { c.files_total = 200; c.files_stream_conflict = 1; c.files_unassigned_stream = 1; }), false);
     assert.equal(run2((c) => { c.files_total = 200; c.files_stream_conflict = 1; c.files_unassigned_stream = 1; c.files_copy_exposed = 1; }), true);
-    assert.equal(run2((c) => { c.files_total = 1000; c.chains_total = 100; c.chains_tainted_by_reason.ordinal_unverified = 2; }), true);
-    assert.equal(run2((c) => { c.files_total = 1000; c.chains_total = 100; c.chains_tainted_by_reason.ordinal_unverified = 1; }), false);
+    assert.equal(run2((c) => { c.files_total = 1000; c.families_total = 100; c.families_ordinal_unverified = 2; }), true);
+    assert.equal(run2((c) => { c.files_total = 1000; c.families_total = 100; c.families_ordinal_unverified = 1; }), false);
+    // the clause counts families: many failing chains do not count unless families_ordinal_unverified says so
+    assert.equal(run2((c) => { c.files_total = 1000; c.chains_total = 100; c.families_total = 100; c.chains_tainted_by_reason.ordinal_unverified = 70; c.families_ordinal_unverified = 1; }), false);
     // other taint reasons never feed this drift code
-    assert.equal(run2((c) => { c.files_total = 1000; c.chains_total = 100; c.chains_tainted_by_reason.request_anomaly = 50; }), false);
+    assert.equal(run2((c) => { c.files_total = 1000; c.families_total = 100; c.chains_total = 100; c.chains_tainted_by_reason.request_anomaly = 50; }), false);
   });
 
   it("a provider with no input produces no finding", () => {
@@ -236,7 +238,7 @@ describe("cachewhy/1 JSON (R14.3, R14.5, R17.1)", () => {
     const j = JSON.parse(t.out.join("\n")) as Record<string, any>;
     assert.deepEqual(Object.keys(j), [
       "schema", "generated_at", "tool_version", "spec", "table_version", "window", "headline_status", "withheld_reason",
-      "assumptions", "coverage", "totals", "events", "boundaries",
+      "withheld_by_provider", "assumptions", "coverage", "totals", "events", "boundaries",
     ]);
     assert.equal(j.schema, "cachewhy/1");
     assert.equal(j.spec, "spec-1");
@@ -246,6 +248,13 @@ describe("cachewhy/1 JSON (R14.3, R14.5, R17.1)", () => {
     assert.deepEqual(j.boundaries, []);
     for (const f of COVERAGE_TOKEN_FIELDS) assert.equal(typeof j.coverage[f], "string", f);
     for (const k of Object.keys(j.coverage.unlogged_tokens_estimate)) assert.equal(typeof j.coverage.unlogged_tokens_estimate[k], "string");
+    // R3.9 / R17.1 revision 11.1: the reason amounts are decimal strings and sum to tokens_unpriced
+    let sumReasons = 0n;
+    for (const k of Object.keys(j.coverage.tokens_unpriced_by_reason)) {
+      assert.equal(typeof j.coverage.tokens_unpriced_by_reason[k], "string", k);
+      sumReasons += BigInt(j.coverage.tokens_unpriced_by_reason[k]);
+    }
+    assert.equal(sumReasons.toString(), j.coverage.tokens_unpriced);
     for (const tot of j.totals) {
       for (const f of ["total_input", "tokens_total", "tokens_unpriced"]) assert.equal(typeof tot[f], "string");
       for (const v of Object.values(tot.tokens)) assert.equal(typeof v, "string");

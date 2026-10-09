@@ -56,7 +56,7 @@ const TABLE = {
   table_version: "pt-2026-10-09",
   verified_at: "2026-10-09",
   sources: { A1: "x", OM1: "y" },
-  modifiers: { fast_with_geo_us: { verified: true } },
+  modifiers: { geo_us: { verified: true }, fast_with_geo_us: { verified: true } }, // S8.2: geo us needs the table-level geo_us too
   models: [
     claudeEntry("claude-sonnet-5-5", row("2", "10", "0.1", "2.5", "4")),
     claudeEntry("claude-sonnet-4-5", row("3", "15", "0.3", "3.75", "6"), { geo_us: { applies: null, verified: false } }),
@@ -337,7 +337,7 @@ describe("recompute: Claude accounting", () => {
     assert.equal(rm.coverage.claude["responses_bucket_mismatch"], 1);
   });
 
-  describe("request anomalies taint the whole session (R0.9 request_anomaly)", () => {
+  describe("request anomalies taint the chains that hold a copy, not the session (R0.9 request_anomaly, revision 11.1)", () => {
     type Mut = (o: any) => void;
     const cases: Array<{
       name: string;
@@ -359,7 +359,7 @@ describe("recompute: Claude accounting", () => {
       { name: "conflict_modifier", blocks: 2, nth: 0, mutate: (o) => (o.message.usage.inference_geo = "us"), status: "counted" },
     ];
     for (const c of cases) {
-      it(`${c.name}: the chain and every chain of its session are tainted, the other session is not`, () => {
+      it(`${c.name}: only the chain of the request is tainted; its linked subagent and the other session are not`, () => {
         const p = new ClaudeProject();
         const bad = p.session({ sessionId: "synthetic-session-bad", version: SUPPORTED, model: "claude-sonnet-5-5" });
         const good = bad.main.request({ requestId: "good", usage: { input: 5, write5m: 100, output: 10 } });
@@ -368,7 +368,7 @@ describe("recompute: Claude accounting", () => {
           usage: { input: 7, write5m: 200, output: 20 },
           blocks: c.blocks === 2 ? [{ type: "text" }, { type: "text" }] : [{ type: "text" }],
         });
-        const sub = bad.spawnAgent({ spawnDepth: 1 }).agent.thread.request({ requestId: "sub", usage: { input: 3, write5m: 300, output: 30 } });
+        const sub = bad.spawnAgent({ spawnDepth: 1, model: "claude-sonnet-5-5" }).agent.thread.request({ requestId: "sub", usage: { input: 3, write5m: 300, output: 30 } });
         const ok = p.session({ sessionId: "synthetic-session-ok", version: SUPPORTED, model: "claude-sonnet-5-5" }).main.request({ requestId: "ok", usage: { input: 9, write5m: 900, output: 90 } });
         let files = p.files();
         let seen = 0;
@@ -380,7 +380,7 @@ describe("recompute: Claude accounting", () => {
           return o;
         });
         const r = run(files);
-        for (const id of [good.requestId, sub.requestId]) {
+        for (const id of [good.requestId]) {
           const x = byId(r, id);
           assert.equal(x.status, "counted");
           assert.equal(x.tainted, true, id);
@@ -389,6 +389,10 @@ describe("recompute: Claude accounting", () => {
           assert.equal(x.usd_pico, null);
           assert.equal(x.unpriced_reason, "chain_tainted");
         }
+        // revision 11.1: the linked subagent shares only the root session with the anomalous chain, so it stays clean
+        const sb = byId(r, sub.requestId);
+        assert.equal(sb.tainted, false);
+        assert.equal(sb.usd_pico, (pico(3, "2") + pico(300, "2.5") + pico(30, "10")).toString());
         const o = byId(r, ok.requestId);
         assert.equal(o.tainted, false);
         assert.equal(o.usd_pico, (pico(9, "2") + pico(900, "2.5") + pico(90, "10")).toString());
@@ -405,15 +409,15 @@ describe("recompute: Claude accounting", () => {
         }
         const cov = r.coverage.claude;
         assert.equal(cov.chains_total, 3);
-        assert.equal(cov.chains_tainted, 2);
-        assert.equal(cov.chains_tainted_by_reason.request_anomaly, 2);
+        assert.equal(cov.chains_tainted, 1);
+        assert.equal(cov.chains_tainted_by_reason.request_anomaly, 1);
         assert.equal(cov.families_total, 2);
         assert.equal(cov.families_tainted, 1);
         const counted = c.status === "counted" ? 5 : 4; // good, the spawning request of the agent, sub, ok (and the anomalous one)
-        assert.equal(cov.responses_in_tainted_chains, counted - 1);
-        assert.equal(cov.requests_unpriced_tainted, counted - 1);
+        assert.equal(cov.responses_in_tainted_chains, counted - 2); // the main chain only
+        assert.equal(cov.requests_unpriced_tainted, counted - 2);
         assert.equal(r.providers.claude.totals.responses, counted);
-        assert.equal(r.providers.claude.unpriced_by_reason["chain_tainted"]?.responses, counted - 1);
+        assert.equal(r.providers.claude.unpriced_by_reason["chain_tainted"]?.responses, counted - 2);
       });
     }
   });
@@ -1956,7 +1960,7 @@ describe("recompute: answers of the revision 11 review", () => {
     }
   });
 
-  it("Codex R2.17 (d): a turn_context without a usable model is a null member of TM(T), so model A plus null conflicts", () => {
+  it("Codex R2.17 (d), S2.3: a turn_context without a usable model is a null member of TM(T), so model A plus null conflicts", () => {
     const build = (second: "none" | "same" | "empty") => {
       let seen = 0;
       return mapLines(
@@ -2061,7 +2065,7 @@ describe("recompute: answers of the revision 11 review", () => {
     const win = run(files, { since: "2026-01-01T00:30:00Z", runStartMs: RUN });
     assert.equal(all.coverage.claude["responses_usage_range_failed"], 1);
     assert.equal(win.coverage.claude["responses_usage_range_failed"], 0, "the range failure lies before the window");
-    assert.equal(win.coverage.claude["requests_total"], 2, "requests_total is the scan-wide count of keys");
+    assert.equal(win.coverage.claude["requests_total"], 1, "S12.2: requests_total is the accounted responses in the window");
     // the chain is tainted by the out-of-window anomaly (chain counters are scan-wide) and the in-window response counts
     assert.equal(win.coverage.claude.chains_tainted, 1);
     assert.equal(win.coverage.claude.responses_in_tainted_chains, 1);

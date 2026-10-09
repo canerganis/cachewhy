@@ -27,6 +27,7 @@ import {
   UNLINKED_REASONS,
   UNLOGGED_BUCKETS,
   UNPRICED_MODIFIER_REASONS,
+  UNPRICED_TOKEN_REASONS,
 } from "../model/types.js";
 import type { CoverageCounters, DriftFinding, Provider, ProviderTotals, ReportInput } from "../model/types.js";
 import { loadDefaultPriceBook } from "../pricing/index.js";
@@ -39,11 +40,18 @@ function intRecord<K extends string>(keys: readonly K[]): Schema {
   return s.object(Object.fromEntries(keys.map((k) => [k, s.int(0)])) as Record<string, Schema>);
 }
 
+/** A record of decimal strings (token amounts, R17.1), one entry per key. */
+function decimalRecord<K extends string>(keys: readonly K[]): Schema {
+  return s.object(Object.fromEntries(keys.map((k) => [k, s.decimal()])) as Record<string, Schema>);
+}
+
 function coverageSchema(): Schema {
   const fields: Record<string, Schema> = {};
   for (const f of COVERAGE_COUNT_FIELDS) fields[f] = s.int(0);
   for (const f of COVERAGE_TOKEN_FIELDS) fields[f] = s.decimal();
   fields["requests_unpriced_modifier_by_reason"] = intRecord(UNPRICED_MODIFIER_REASONS);
+  // R3.9 revision 11.1: token amounts, so decimal strings (R17.1); the values sum to tokens_unpriced.
+  fields["tokens_unpriced_by_reason"] = decimalRecord(UNPRICED_TOKEN_REASONS);
   fields["requests_conflict_by_kind"] = intRecord(CONFLICT_KINDS);
   fields["links_unlinked_by_reason"] = intRecord(UNLINKED_REASONS);
   fields["pairs_abstained_by_code"] = intRecord(ABSTAIN_CODES);
@@ -96,6 +104,7 @@ function totalsSchema(modelId: Schema): Schema {
     tokens_total: s.decimal(),
     usd: s.nullable(s.decimal()),
     tokens_unpriced: s.decimal(),
+    tokens_unpriced_by_reason: decimalRecord(UNPRICED_TOKEN_REASONS),
     output_unknown: s.int(0),
     models: s.array(model, 512),
   });
@@ -111,6 +120,8 @@ function reportSchema(modelId: Schema): Schema {
     window: s.object({ since: s.iso(), until: s.iso() }),
     headline_status: s.enum(HEADLINE_STATUSES),
     withheld_reason: s.nullable(s.enum(DRIFT_CODES)),
+    // R17.3 revision 11.1: one entry per provider, the tripped code or null.
+    withheld_by_provider: s.object(Object.fromEntries(PROVIDERS.map((p) => [p, s.nullable(s.enum(DRIFT_CODES))])) as Record<string, Schema>),
     assumptions: s.array(s.enum(ASSUMPTIONS), 64),
     coverage: coverageSchema(),
     totals: s.array(totalsSchema(modelId), 8),
@@ -165,6 +176,7 @@ function totalsToJson(t: ProviderTotals, hideUsd: boolean): Record<string, unkno
     tokens_total: t.tokens_total,
     usd: usd(t.usd_pico),
     tokens_unpriced: t.tokens_unpriced,
+    tokens_unpriced_by_reason: t.tokens_unpriced_by_reason,
     output_unknown: t.output_unknown,
     models: t.models.map((m) => ({
       model: m.model,
@@ -183,10 +195,9 @@ function totalsToJson(t: ProviderTotals, hideUsd: boolean): Record<string, unkno
 
 /**
  * The report object in schema form. Throws a `SafeError` (code `E_SCHEMA_VIOLATION`, path only) if a value does not
- * fit its declared field. When the headline is withheld (R17.3), no dollar figure is written (R16.5).
+ * fit its declared field. A provider whose headline is withheld (R17.3, per provider since revision 11.1) has no dollar figure written (R16.5): the usd of its totals and model rows is null, while the other provider keeps its dollars.
  */
 export function reportToJson(input: ReportInput & { readonly shown_providers?: readonly Provider[] }, knownModels?: ReadonlySet<string>): unknown {
-  const hideUsd = input.headline_status === "withheld";
   // A provider hidden by `--agent` or `--project` is omitted: an all-zero entry would read as zero usage, which is
   // false (R5.9). A shown provider with no activity in the window keeps its zero entry.
   const shown = input.shown_providers ?? PROVIDERS;
@@ -199,9 +210,10 @@ export function reportToJson(input: ReportInput & { readonly shown_providers?: r
     window: { since: iso(input.window.since_ms), until: iso(input.window.until_ms) },
     headline_status: input.headline_status,
     withheld_reason: input.withheld_reason,
+    withheld_by_provider: input.withheld_by_provider,
     assumptions: input.assumptions,
     coverage: coverageToJson(input.coverage),
-    totals: input.totals.filter((t) => shown.includes(t.provider)).map((t) => totalsToJson(t, hideUsd)),
+    totals: input.totals.filter((t) => shown.includes(t.provider)).map((t) => totalsToJson(t, input.withheld_by_provider[t.provider] !== null)),
     events: [],
     boundaries: [],
   };

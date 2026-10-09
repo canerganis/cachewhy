@@ -77,6 +77,8 @@ interface Totals {
   unpriced_tainted: number;
   unknown_model: number;
   model_unverified: number;
+  /** R3.9 revision 11.1: unpriced tokens by the reason of the first refusing gate. */
+  by_reason: Record<string, bigint>;
 }
 
 interface Summary {
@@ -94,7 +96,7 @@ function summarize(a: Analysis): Summary {
   const rows = new Map<string, Row>();
   const totals = {} as Record<Provider, Totals>;
   for (const p of PROVIDERS) {
-    totals[p] = { tokens: 0n, counted: 0, priced: 0, tokens_unpriced: 0n, in_tainted: 0, tokens_in_tainted: 0n, unpriced_tainted: 0, unknown_model: 0, model_unverified: 0 };
+    totals[p] = { tokens: 0n, counted: 0, priced: 0, tokens_unpriced: 0n, in_tainted: 0, tokens_in_tainted: 0n, unpriced_tainted: 0, unknown_model: 0, model_unverified: 0, by_reason: {} };
   }
   g.responses.forEach((r, i) => {
     const node = g.nodes[i] as (typeof g.nodes)[number];
@@ -120,7 +122,11 @@ function summarize(a: Analysis): Summary {
     t.counted++;
     t.tokens += tokens;
     if (row.pico !== null) t.priced++;
-    else t.tokens_unpriced += tokens;
+    else {
+      t.tokens_unpriced += tokens;
+      const why = pr.modifier_reason ?? pr.cost.reason ?? "excluded";
+      t.by_reason[why] = (t.by_reason[why] ?? 0n) + tokens;
+    }
     if (row.tainted) {
       t.in_tainted++;
       t.tokens_in_tainted += tokens;
@@ -284,6 +290,12 @@ function assertSplitRules(base: Summary, split: Summary, label: string): void {
     assert.ok(a.tokens_unpriced >= b.tokens_unpriced, `${label}: ${p} tokens_unpriced may only increase`);
     assert.ok(a.model_unverified >= b.model_unverified, `${label}: ${p} responses_model_unverified may only increase`);
     assert.ok(a.priced <= b.priced, `${label}: ${p} requests_priced may only decrease`);
+    // R17.7 revision 11.1: the chain_tainted amount may only increase, every other reason amount may only decrease
+    assert.ok((a.by_reason["chain_tainted"] ?? 0n) >= (b.by_reason["chain_tainted"] ?? 0n), `${label}: ${p} tokens_unpriced_by_reason.chain_tainted may only increase`);
+    for (const k of new Set([...Object.keys(a.by_reason), ...Object.keys(b.by_reason)])) {
+      if (k === "chain_tainted") continue;
+      assert.ok((a.by_reason[k] ?? 0n) <= (b.by_reason[k] ?? 0n), `${label}: ${p} tokens_unpriced_by_reason.${k} may only decrease`);
+    }
     assert.ok(a.unknown_model <= b.unknown_model, `${label}: ${p} requests_unknown_model may only decrease`);
     // conservation
     assert.equal(a.tokens, b.tokens, `${label}: ${p} token total`);

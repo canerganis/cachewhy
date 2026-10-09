@@ -246,7 +246,7 @@ async function runDoctor(opts: CliOptions, io: CliIO, paint: Painter): Promise<n
           zstdSupported: zstdOk,
           unreadable,
           ...(parsed && cov
-            ? { headline_status: parsed.input.headline_status, withheld_reason: parsed.input.withheld_reason, coverage: cov.coverage, drift: cov.drift }
+            ? { headline_status: parsed.input.headline_status, withheld_reason: parsed.input.withheld_reason, withheld_by_provider: parsed.input.withheld_by_provider, coverage: cov.coverage, drift: cov.drift }
             : {}),
         },
         null,

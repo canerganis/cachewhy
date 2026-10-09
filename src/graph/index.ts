@@ -55,6 +55,7 @@ import type {
   UnlinkedReason,
   UsageBuckets,
 } from "../model/types.js";
+import { msToNs, nsToMs, windowContainsNs } from "../window.js";
 import { computeTaint, emptyIntegrityFacts } from "./taint.js";
 
 // ---------------------------------------------------------------------------
@@ -69,6 +70,42 @@ function cmp(a: string, b: string): number {
 function cmpNum(a: number, b: number): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
+
+function cmpBig(a: bigint, b: bigint): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+// Exact instants (S3.2). A parser result carries nanoseconds; a hand-built response, stream or node that carries only
+// milliseconds is read as exactly that many milliseconds. Every decision below compares these, never a truncated value.
+const evNs = (r: Response): bigint => r.time.event_ns ?? msToNs(r.time.event_ms);
+const firstNs = (r: Response): bigint => r.time.t_first_ns ?? msToNs(r.time.t_first_ms);
+const excNs = (e: ExcludedRecord): bigint => e.event_ns ?? msToNs(e.event_ms);
+function asmNs(r: Response): bigint | null {
+  if (r.time.t_asm_ns !== undefined) return r.time.t_asm_ns;
+  return r.time.t_asm_ms === null ? null : msToNs(r.time.t_asm_ms);
+}
+function streamStartNs(s: Stream): bigint | null {
+  if (s.start_ns !== undefined) return s.start_ns;
+  return s.start_ms === null ? null : msToNs(s.start_ms);
+}
+function ownerStartNs(r: Response): bigint | null {
+  if (r.ownership.owner_stream_start_ns !== undefined) return r.ownership.owner_stream_start_ns;
+  return r.ownership.owner_stream_start_ms === null ? null : msToNs(r.ownership.owner_stream_start_ms);
+}
+function nodeNs(n: ClaudeUuidNode): bigint | null {
+  if (n.ts_ns !== undefined) return n.ts_ns;
+  return n.ts_ms === null ? null : msToNs(n.ts_ms);
+}
+/** Instants ascending, an unknown one last. */
+function cmpOptBig(a: bigint | null, b: bigint | null): number {
+  if (a === b) return 0;
+  if (a === null) return 1;
+  if (b === null) return -1;
+  return cmpBig(a, b);
+}
+/** Whole milliseconds of a nanosecond difference: floor for a lower bound, ceiling for an upper bound. */
+const floorMs = (ns: bigint): number => nsToMs(ns);
+const ceilMs = (ns: bigint): number => -nsToMs(-ns);
 
 function providerRank(p: Provider): number {
   return PROVIDERS.indexOf(p);
@@ -153,7 +190,7 @@ function compareCopies(a: Response, b: Response): number {
   const rb = b.ownership.role === "owner" ? 0 : 1;
   return (
     ra - rb ||
-    cmpNum(a.time.event_ms, b.time.event_ms) ||
+    cmpBig(evNs(a), evNs(b)) ||
     cmp(a.provenance.files.join(","), b.provenance.files.join(","))
   );
 }
@@ -203,25 +240,31 @@ function tri(values: readonly (boolean | null)[]): boolean | null {
  */
 function mergeStreams(key: ChainKey, records: readonly Stream[], responses: readonly Response[]): Stream {
   let files: number[];
-  let start: number | null;
+  let start: bigint | null;
   let ordinal: boolean | null;
   let fork = null as Stream["fork"];
   let settings = false;
 
   if (records.length === 0) {
     files = sortedUnique(responses.flatMap((r) => [...r.provenance.files]));
-    const starts = responses.map((r) => r.ownership.owner_stream_start_ms).filter((x): x is EpochMs => x !== null);
-    start = starts.length > 0 ? Math.min(...starts) : null;
+    start = null;
+    for (const r of responses) {
+      const x = ownerStartNs(r);
+      if (x !== null && (start === null || x < start)) start = x;
+    }
     ordinal = key.provider === "codex" ? false : null;
   } else {
     const sorted = [...records].sort(
       (a, b) =>
         cmp(a.files.join(","), b.files.join(",")) ||
-        cmpNum(a.start_ms ?? Infinity, b.start_ms ?? Infinity),
+        cmpOptBig(streamStartNs(a), streamStartNs(b)),
     );
     files = sortedUnique(sorted.flatMap((s) => [...s.files]));
-    const starts = sorted.map((s) => s.start_ms).filter((x): x is EpochMs => x !== null);
-    start = starts.length > 0 ? Math.min(...starts) : null;
+    start = null;
+    for (const st of sorted) {
+      const x = streamStartNs(st);
+      if (x !== null && (start === null || x < start)) start = x;
+    }
     ordinal = key.provider === "claude" ? null : tri(sorted.map((s) => s.ordinal_verified));
     for (const s of sorted) {
       if (s.has_settings_marker) settings = true;
@@ -245,7 +288,8 @@ function mergeStreams(key: ChainKey, records: readonly Stream[], responses: read
     chain: key,
     provider: key.provider,
     files,
-    start_ms: start,
+    start_ms: start === null ? null : nsToMs(start),
+    start_ns: start,
     ordinal_verified: ordinal,
     fork,
     has_settings_marker: settings,
@@ -331,27 +375,32 @@ const TTL_SETS: readonly TtlSet[] = (() => {
 // timing (R6.3 to R6.6)
 // ---------------------------------------------------------------------------
 
-function startHi(r: Response): number {
-  return r.provider === "claude" ? r.time.t_first_ms : r.time.event_ms;
+function startHi(r: Response): bigint {
+  return r.provider === "claude" ? firstNs(r) : evNs(r);
 }
 
 /** R6.4 for Claude; R6.5: always unknown for Codex. */
-function startLo(r: Response, uuidIndex: ReadonlyMap<string, ClaudeUuidNode>): number | null {
+function startLo(r: Response, uuidIndex: ReadonlyMap<string, ClaudeUuidNode>, parentTainted: (r: Response) => boolean): bigint | null {
   if (r.provider !== "claude") return null;
-  let asm = r.time.t_asm_ms;
+  // R0.9 effect 4 (revision 11.1): a parent record of a tainted chain gives no time, whatever the parser read.
+  if (parentTainted(r)) return null;
+  let asm = asmNs(r);
   if (r.parent_uuid !== null) {
     const node = uuidIndex.get(r.parent_uuid);
     if (node?.unresolved === true) asm = null; // R6.3: an unresolved uuid gives no t_asm
-    else if (asm === null) asm = node?.ts_ms ?? null; // R6.3
+    else if (asm === null && node !== undefined) asm = nodeNs(node); // R6.3
   }
-  return asm !== null && asm <= r.time.t_first_ms ? asm : null;
+  // R6.4 (S3.3): the guard `t_asm <= t_first` compares exact instants.
+  return asm !== null && asm <= firstNs(r) ? asm : null;
 }
 
-function gapBounds(p: Response, c: Response, uuidIndex: ReadonlyMap<string, ClaudeUuidNode>): GapBounds {
-  const loC = startLo(c, uuidIndex);
-  const loP = startLo(p, uuidIndex);
-  const min = loC === null ? null : Math.max(0, loC - startHi(p)); // clamped (R6.6)
-  const max = loP === null ? null : startHi(c) - loP;
+function gapBounds(p: Response, c: Response, uuidIndex: ReadonlyMap<string, ClaudeUuidNode>, parentTainted: (r: Response) => boolean): GapBounds {
+  const loC = startLo(c, uuidIndex, parentTainted);
+  const loP = startLo(p, uuidIndex, parentTainted);
+  // R6.6 on exact instants; the bounds are reported in whole milliseconds, rounded outward (the lower bound down, the
+  // upper bound up), so a bound never claims more than the instants show.
+  const min = loC === null ? null : Math.max(0, floorMs(loC - startHi(p))); // clamped (R6.6)
+  const max = loP === null ? null : ceilMs(startHi(c) - loP);
   return { min_ms: min, max_ms: max, basis: min !== null || max !== null ? "parent_record" : "none" };
 }
 
@@ -368,7 +417,7 @@ interface ChainBuild {
   links: Link[];
 }
 
-type Item = { t: number; r: Response; e: null } | { t: number; r: null; e: ExcludedRecord };
+type Item = { t: bigint; r: Response; e: null } | { t: bigint; r: null; e: ExcludedRecord };
 
 function compareItems(a: Item, b: Item): number {
   if (a.t !== b.t) return a.t < b.t ? -1 : 1;
@@ -400,6 +449,7 @@ function mergeIntegrity(
   const base = emptyIntegrityFacts(provider);
   const chains = new Set<ChainId>(chainIds);
   const family_groups: (readonly ChainId[])[] = [];
+  const key_groups: (readonly ChainId[])[] = [];
   const triggers: IntegrityFacts["triggers"][number][] = [];
   const files: FileFacts[] = [];
   for (const t of extraTriggers) triggers.push(t);
@@ -410,10 +460,11 @@ function mergeIntegrity(
     const off = offsets[k] as number;
     for (const c of f.chains) chains.add(c);
     for (const g of f.family_groups) family_groups.push(g);
+    for (const g of f.key_groups ?? []) key_groups.push(g);
     for (const t of f.triggers) triggers.push(t);
     for (const ff of f.files) files.push({ ...ff, index: ff.index + off });
   });
-  return { facts: { provider, chains: [...chains].sort(cmp), family_groups, triggers, files }, files };
+  return { facts: { provider, chains: [...chains].sort(cmp), family_groups, key_groups, triggers, files }, files };
 }
 
 export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: GraphOptions): Graph => {
@@ -556,11 +607,11 @@ export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: G
     }
     // R4.6: the owner is the stream with the earliest stream_start; ties make ownership ambiguous and the
     // smaller sessionId owns.
-    const startOf = (o: { ks: string }): number => (resolved.get(o.ks) as { stream: Stream }).stream.start_ms ?? Infinity;
+    const startOf = (o: { ks: string }): bigint | null => streamStartNs((resolved.get(o.ks) as { stream: Stream }).stream);
     const ranked = [...owners].sort((a, b) => {
       const ra = lookup(a);
       const rb = lookup(b);
-      return cmpNum(startOf(a), startOf(b)) || cmp(ra.chain.root_session, rb.chain.root_session) || cmp(ra.chain.thread, rb.chain.thread);
+      return cmpOptBig(startOf(a), startOf(b)) || cmp(ra.chain.root_session, rb.chain.root_session) || cmp(ra.chain.thread, rb.chain.thread);
     });
     const winner = ranked[0] as { ks: string; key: string };
     const winStart = startOf(winner);
@@ -576,7 +627,8 @@ export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: G
         ownership: {
           role: o === winner ? "owner" : "replayed",
           ambiguous: r.ownership.ambiguous || isTied,
-          owner_stream_start_ms: Number.isFinite(winStart) ? winStart : r.ownership.owner_stream_start_ms,
+          owner_stream_start_ms: winStart !== null ? nsToMs(winStart) : r.ownership.owner_stream_start_ms,
+          owner_stream_start_ns: winStart !== null ? winStart : ownerStartNs(r),
         },
       });
     }
@@ -585,6 +637,15 @@ export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: G
   // ---- chains, kinds, links ---------------------------------------------------------------------------------
   const chainKnown = new Map<string, true>();
   for (const b of chainKeysSorted) chainKnown.set(b.ks, true);
+
+  /** R0.9 effect 4: the parent uuid of an untainted chain's request resolves to a record of a tainted chain. */
+  const parentInTaintedChain = (r: Response): boolean => {
+    if (r.provider !== "claude" || r.parent_uuid === null) return false;
+    const node = uuidIndex.get(r.parent_uuid);
+    if (node === undefined || node.chain === null) return false;
+    if (chainKeyString(node.chain) === chainKeyString(r.chain)) return false;
+    return taintOfChain(node.chain).tainted && !taintOfChain(r.chain).tainted;
+  };
 
   const graphResponses: Response[] = [];
   const nodes: GraphNode[] = [];
@@ -602,7 +663,7 @@ export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: G
     if (ct.live) {
       // R0.9 live family: removed from the analysis entirely. Counted over the totals set (owner, kept, in window).
       for (const r of entry.responses.values()) {
-        const inW = r.time.event_ms >= window.since_ms && r.time.event_ms < window.until_ms;
+        const inW = windowContainsNs(window, evNs(r));
         if (inW && countsInTotals(r) && r.usage !== null) {
           const acc = liveSkipped[b.key.provider];
           acc.responses++;
@@ -613,9 +674,9 @@ export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: G
     }
 
     const items: Item[] = [];
-    for (const r of entry.responses.values()) items.push({ t: r.time.event_ms, r, e: null });
-    const sortedExcluded = [...b.excluded].sort((x, y) => cmpNum(x.event_ms, y.event_ms));
-    for (const e of sortedExcluded) items.push({ t: e.event_ms, r: null, e });
+    for (const r of entry.responses.values()) items.push({ t: evNs(r), r, e: null });
+    const sortedExcluded = [...b.excluded].sort((x, y) => cmpBig(excNs(x), excNs(y)));
+    for (const e of sortedExcluded) items.push({ t: excNs(e), r: null, e });
     items.sort(compareItems);
 
     // kind: a property of the chain (R5.2).
@@ -663,10 +724,15 @@ export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: G
         continue;
       }
       // R0.9 effect 1 and 2: a tainted chain keeps its tokens and has no verified model.
-      const r: Response = ct.tainted ? { ...it.r, model: taintedModel(it.r) } : it.r;
+      let r: Response = ct.tainted ? { ...it.r, model: taintedModel(it.r) } : it.r;
+      if (!ct.tainted && parentInTaintedChain(it.r)) {
+        // R0.9 effect 4 (revision 11.1): t_asm and start_lo are unknown when the parent uuid resolves to a record of a
+        // tainted chain (a clean subagent under the anomalous main chain). Accounting and dollars are unchanged.
+        r = { ...it.r, time: { ...it.r.time, t_asm_ms: null, start_lo_ms: null, t_asm_ns: null, start_lo_ns: null, gap_basis: "none" } };
+      }
       const tie = (i > 0 && (items[i - 1] as Item).t === it.t) || (i < n - 1 && (items[i + 1] as Item).t === it.t);
       const idx = base + seq;
-      const inWindow = r.time.event_ms >= window.since_ms && r.time.event_ms < window.until_ms;
+      const inWindow = windowContainsNs(window, evNs(r)); // S7.1: since * 10^6 <= t < until * 10^6, BigInt
       graphResponses.push(r);
       order.push(idx);
 
@@ -702,7 +768,7 @@ export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: G
         order_tie: tie,
         in_window: inWindow,
         ttl_set: isClaude && p !== null ? snap : null,
-        gap: p === null ? null : gapBounds(p.resp, r, uuidIndex),
+        gap: p === null ? null : gapBounds(p.resp, r, uuidIndex, parentInTaintedChain),
       });
 
       // Fold C into the running set (it becomes P for the next request). Claude only (R9.6).
@@ -720,14 +786,28 @@ export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: G
       seq++;
     }
 
-    chains.push({ key: b.key, kind, link, stream, order, family: ct.family, tainted: ct.tainted, taint_reasons: ct.reasons });
+    // R0.9 effect 4 (link guard): a verified link decides a boundary only when the child and its parent are both
+    // untainted. Under a chain scoped reason a child can be clean while its parent is not.
+    const linkDecides =
+      link !== null && link.state === "verified" && link.parent !== null && !ct.tainted && !taintOfChain(link.parent).tainted;
+    chains.push({
+      key: b.key,
+      kind,
+      link,
+      stream,
+      order,
+      family: ct.family,
+      tainted: ct.tainted,
+      taint_reasons: ct.reasons,
+      link_decides_boundary: linkDecides,
+    });
   }
 
   // The graph keeps R6.2's "removed" records in one list in chain order.
   excludedOut.sort(
     (a, c) =>
       compareChainKeys(a.chain, c.chain) ||
-      cmpNum(a.event_ms, c.event_ms) ||
+      cmpBig(excNs(a), excNs(c)) ||
       cmpNum(a.ordinal ?? -1, c.ordinal ?? -1) ||
       cmp(a.reason, c.reason) ||
       cmp(a.files.join(","), c.files.join(",")),
@@ -769,6 +849,7 @@ export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: G
     c.chains_tainted_by_reason = { ...t.chains_tainted_by_reason };
     c.families_total = t.families_total;
     c.families_tainted = t.families_tainted;
+    c.families_ordinal_unverified = t.families_ordinal_unverified;
     c.families_live_skipped = t.families_live;
     c.responses_live_skipped = (liveSkipped[prov] as { responses: number }).responses;
     c.tokens_live_skipped = (liveSkipped[prov] as { tokens: bigint }).tokens;

@@ -425,3 +425,83 @@ Verification after the fixes: `npm run typecheck`, `npm run build` and `npm run 
 Open observations, not changed: (a) range-failing members of the Codex cumulative counters are still not counted in `coverage.fields_range_failed`; only `thread_token_usage.total_tokens` is. (b) The timestamp-parse observation of round 1 is still open. Both are P2 material for the gate owner.
 
 Next: a fourth Sol G1 audit of the changed files, since PASS requires zero P0 and zero P1.
+
+## G1 round 4
+
+Auditor: Sol through `codex exec`, scope G1. Target: spec revision 11, table `pt-2026-10-09.2`, commit `f051e34` (825 tests passing). Verdict: FAIL, with 1 P0 and 4 P1. The findings were handed to the gate owner as a list. Every round from 1 to 4 had found a new P0 or P1 of the same shape: `src/` and `scripts/recompute` each picked a slightly different normal form for a quantity the spec names but does not normalize. So the resolution of this round treats the findings as symptoms. It does not patch them one by one.
+
+| # | Sev | Rules | Finding (short) | Re-check | Resolution |
+|---|---|---|---|---|---|
+| 1 | P0 | R4.4, R4.12 | Timestamps were truncated to milliseconds in the equality projection (`src/sources/codex.ts` `parseInstant`, `draftOf`; recompute `codexInstant`), so two occurrences that differ below a millisecond were one record | Correct: R4.12 compares every retained field, and a timestamp is an ISO instant, not its millisecond floor | Checklist S3: an own grammar with calendar checks (no `Date.parse`, which accepts `2026-02-30` and `T24:00`), with the value in BigInt nanoseconds. Both implementations use it in every projection, the ordinal check, `t_first`, ordering, ownership and the window |
+| 2 | P1 | R3.1, R3.4 | Geo pricing ignored the table-level `modifiers.geo_us.verified` and its date (`src/pricing/index.ts` `buildBook`, recompute `geoApplies`) | Correct: R3.1 says a modifier that is not verified produces no dollars | Checklist S8.2: geo `us` needs the table-level object and the model object to be verified with an effective date. Both implementations gate on it, with tests for `verified: false` and for a placeholder date |
+| 3 | P1 | R2.12 | A Codex incomplete response did not carry its valid cached and write counters into `tokens_in_incomplete_responses` | Correct: R2.12 reports every present valid field. The two implementations also disagreed on the form (src: a scalar of `in + out`; recompute: a per-field map) | Checklist S6.3: one scalar per provider. Claude takes `i + r + W + o` from per-field maxima over usage-bearing copies. Codex takes `I + O`, so an inner counter is reported only when its outer counter is not and nothing is counted twice |
+| 4 | P1 | R13.2, R2.12 | A Claude record with full usage and a missing or invalid timestamp was `usage_incomplete` in src but priced by recompute when no window was given | Correct: the implementations disagreed, and the spec was silent (open observation since round 1) | Spec revision 11.1, R2.12: a missing or invalid event time makes the response `usage_incomplete` in both providers, with or without a window. Checklist S6.1 and S6.2 fix the exclusion order |
+| 5 | P1 | R2.16 | Counters were not converted to BigInt right after the range check, and the max over copies used Number (`src/sources/codex.ts`, recompute) | Correct as a rule violation; the results were exact, since every value was a safe integer | Checklist S4.2: BigInt right after S4.1, with every comparison, max and sum in BigInt. A static test asserts that `src/sources` has no `Math.max` or `Math.min`, and recompute's `ctr` returns a BigInt or a state |
+
+Structural resolution:
+
+1. `docs/accounting-semantics.md` (new, normative, binding with the spec) fixes every normalization decision: ids and null, enums, models (normalized once, `<synthetic>` reserved, a null context model is a member of `TM(T)`), instants, counter states, the record equality projection, the exclusion order, incomplete and invalid token amounts, the window, modifier verification and gate order, taint scope, kinds, describing metadata, and the definitions of the coverage counters that the two implementations had read differently. A read-only inventory (src against recompute, item by item) found 30 disagreements before any change. Each was decided in the checklist, and the side that differed was changed.
+2. Two workers brought `src/` and `scripts/recompute` to the checklist independently. Neither read the other's code. 58 and 42 focused tests were added (`test/semantics-src.test.ts`, `test/semantics-recompute.test.ts`); most of them fail against the old files.
+3. `test/differential-fuzz.test.ts` with `test/fuzz/` generates random synthetic scans from a seed: Claude sessions, subagents and workflows, Codex threads, forks and subagents, and about 60 knobs of features and malformations (timestamp formats and invalid calendars, sub-millisecond differences, bad and out-of-range counters, model suffixes, conflicting copies, replays, duplicate response ids, ordinal defects, unsupported versions). It asserts exact equality of per-response rows, provider and model totals, picodollars, unpriced reasons, taint and every coverage counter present in both outputs, with and without windows and under the test tier parameter. A failure prints the seed and the first differing path. `test/fuzz/repros.ts` keeps the minimized reproducers of every divergence found as regression cases.
+
+## Spec revision 11.1
+
+Trigger: a real-data review during G1. The CLI was run on the gate owner's own logs (30 days); only aggregate counts were printed to the terminal, and no log, path, id or per-session detail was copied or stored. The orchestrator approved items B, C and D and rejected E (below) before the text was written.
+
+Aggregates (scan-wide counters are per provider; the first report had read the combined counters as Claude ones):
+
+| Provider | Families (tainted) | Chains (tainted) | Dominant taint reason | Tokens in tainted chains | Priced share of tokens |
+|---|---|---|---|---|---|
+| Claude | 51 (1) | 1735 (304) | `request_anomaly`, 1 family | 50.2 percent | 17.2 percent |
+| Codex | 581 (247) | 1751 (1203) | `version_unverified` (205 families, alpha CLI builds), `unlogged_usage` (39), `ordinal_unverified` (1 family, 70 chains) | 42.2 percent | 0 percent (R3.4, by design) |
+
+Findings behind the amendment:
+
+1. The one tainted Claude family held 2 resume-linked sessions and 304 chains (2 main, 244 subagent, 58 workflow agent). Its only trigger was a single `conflict_input` request: 9 final copies across the two main files, 6 with all-zero usage and 3 with real usage, one message id. This is a real anomaly, and it was the only conflicted request in the scan. Family propagation spread it to 302 subagent and workflow chains whose numbers do not read that request.
+2. Claude unpriced tokens: `chain_tainted` 50.2 percent, `modifier_unverified` 32.6 percent, priced 17.2 percent. `modifier_unverified` is the partial-only subagent and workflow requests: every copy has `stop_reason` null and no `usage.speed`, while `inference_geo` and `service_tier` are present. This is R3.12 and Q13 by design, not a defect.
+3. The headline was withheld for both providers because `drift_stream_integrity` counted 70 Codex chains with reason `ordinal_unverified` (4 percent, above `C10`). Only 1 of 644 Codex streams fails R4.12 itself: one thread over two files whose ordinals restart per file (Q21). The other 69 chains carried the reason only through their family. Because headline status was global, one Codex stream hid every Claude dollar.
+4. Neither the parser nor the graph had a defect here: both implemented revision 11 literally.
+
+Amendment (each changed paragraph of `docs/methodology.md` says "revision 11.1"):
+
+| Item | Rules | Change |
+|---|---|---|
+| B | R17.3, R17.1, R17.7, R4.10 | The ordinal clause of `drift_stream_integrity` counts Codex families that hold a chain tainted `ordinal_unverified` (`families_ordinal_unverified`) against `families_total`, not chains. The counter and the three reason counts of the new reason-move case (`ordinal_unverified`, `fork_prefix_unresolved`, `copy_exposed`) are exempt from split invariance, and fixtures state their exact values. |
+| C | R0.9 (taint scope, effect 4, fixture 7) | A Claude `request_anomaly` taints the chains that hold a copy and their link (iii) component (shared request keys, transitive, so replay ownership never reads a tainted stream), never over link (i). A link decides a boundary only when child and parent are both untainted. A uuid that resolves into a tainted chain gives no `t_asm`, no `start_lo` and no lineage. Codex keeps family scope. |
+| D | R17.3, R16.5, R14.5, R4.10 | Drift is decided per provider and withholds only that provider's dollars (`headline_status` `ok`, `partial`, `withheld`; `withheld_by_provider`). Each withheld provider gets a first line saying so. Withholding is presentation only: computed prices, counters and picodollars do not change. |
+| R3.9 | R3.9, R17.1, R17.7 | Every report prints the priced share of tokens per provider and `tokens_unpriced_by_reason`, a partition of `tokens_unpriced` with a fixed single-reason gate order. This makes the honest ceiling visible instead of relaxing R3.12. |
+| R2.12 | R2.12 | A missing or invalid event timestamp (any Claude copy, a Codex `token_usage_record`) makes the response `usage_incomplete`, with or without a window. This settles the open observation of G1 rounds 1 to 3 and the G1 round 4 finding R13.2 conservatively. |
+| E (rejected) | R3.12 | Pricing partial-only Claude requests would need evidence of their speed (fast is 2x the standard row). Q13 stays open, and they stay `modifier_unverified`. |
+
+Expected effect on the real-data aggregates, simulated before implementation: Claude tokens in tainted chains go from 50.2 to 9.35 percent (the two main chains that hold copies); the Claude priced share goes from 17.2 to about 30.9 percent. The rest is `modifier_unverified`, which is the ceiling under current evidence. The Codex drift no longer trips (1 of 581 families), so Claude dollars print.
+
+G0 re-check of the 11.1 diff (Sol, `gpt-6.1-sol`, medium, read-only, spec text only): six passes.
+
+| Pass | Verdict | Findings and resolution |
+|---|---|---|
+| 1 | FAIL, 2 P1 | (a) a stream count of R4.12 failures can drop under a split: replaced by a family count; (b) no single-reason order for `tokens_unpriced_by_reason`: R3.9 gate order added |
+| 2 | FAIL, 3 P1 | (a) the family count can also drop (a copied prefix split turns `ordinal_unverified` into `copy_exposed`): counter declared split-sensitive; (b) replay ownership reads `stream_start` of the tainted stream: Claude scope extended to the link (iii) component; (c) withholding by a physical file count conflicts with split invariance: declared presentation only, with a 99 to 100 file fixture |
+| 3 | FAIL, 1 P1, 1 P2 | the split-sensitive counter was still under the R17.7 and R4.10 invariance: exempted, monotone claim removed; tie order of the reason list fixed |
+| 4 | FAIL, 2 P1, 1 P2 | (a) the fixture's "every other counter equal" contradicted the reason move: reason-move bullet added; (b) a clean child's `t_asm` could read a record of a tainted parent: uuid guard added to effect 4; (c) R16.1 warning wording now says "untainted chains" |
+| 5 | FAIL, 1 P1 | R17.7 opening sentence and R4.10 did not exempt the reason-move counts: both exempt them explicitly |
+| 6 | PASS | none |
+
+Final answer of the G0 re-check, verbatim:
+
+VERDICT: PASS
+
+P0 veya P1 bulgusu yok. Diff kapsamında yeni bir güvenlik veya tutarlılık açığı saptamadım.
+
+- **R4.10, R17.7:** Önceki bulgu çözülmüş. Üç reason count açıkça istisna; `chains_tainted` ve response düzeyindeki sonuçlar korunuyor.
+- **R0.9:** Claude taint daraltması, transitif link (iii) yayılımı ve tainted parent için boundary, zaman ve lineage guardlarıyla korunmuş.
+- **R2.12:** Geçersiz veya eksik timestamp fiyatlamayı kapatıyor; geçerli başka bir kopya bu kusuru örtmüyor.
+- **R3.9, R17.1:** Unpriced breakdown tek neden seçimiyle partition oluşturuyor; toplam ve BigInt string koşulları test edilebilir.
+- **R17.3, R16.5:** Provider bazlı withholding diğer providerın dolarlarını koruyor; kapatılan provider için dolar yasağı sürüyor.
+
+Somut düzeltme gerekmiyor.
+
+`docs/accounting-semantics.md` was added in the same step: a normative checklist of every normalization decision (ids, models, instants at nanosecond precision with a calendar-checked grammar, counter states and BigInt conversion, record equality projection, exclusion order, incomplete token amounts, window, modifiers and verification, taint scope, kinds). Both implementations follow it independently.
+
+Verification after round 4 and revision 11.1: `npm run typecheck`, `npm run build`, `npm run lint:privacy` and `npm pack --dry-run` clean; `npm test` 973 pass, 0 fail, 0 todo (825 before). The differential fuzz test passes 1000 seeds per suite (bare, valid, all) with exact agreement. On the real logs the CLI now prints an open headline: Claude priced share 30.7 percent of tokens, unpriced `modifier_unverified` 60.0 percent and `chain_tainted` 9.3 percent; Codex 0 percent priced (R3.4).
+
+Next: G1 audit round 5.

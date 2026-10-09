@@ -476,14 +476,14 @@ describe("more copy-selection edge cases", () => {
     assert.deepEqual(res.integrity.family_groups, [[cid("synthetic-session-a"), cid("synthetic-session-b")]]);
   });
 
-  test("a stop_reason of null on the final copy is reported as null, an unknown one as other (R1.2)", async () => {
+  test("a stop_reason of JSON null is the state missing like an absent one, an unknown one is other (R1.2, S1.2, S1.3)", async () => {
     const res = await run(
       sessionProject((s) => {
         s.main.request({ requestId: "a", stopReason: null });
         s.main.request({ requestId: "b", stopReason: "max_tokens" });
       }),
     );
-    assert.equal(one(res, "a").stop_reason, "null");
+    assert.equal(one(res, "a").stop_reason, null);
     assert.equal(one(res, "b").stop_reason, "other");
   });
 });
