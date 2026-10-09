@@ -1036,7 +1036,7 @@ function claudeProjection(rec) {
   // an unlisted type keeps only the fields R1.2 reads on all record types (ids, instants, session keys), under the type `other`
   const m = isObj(rec.message) ? rec.message : null;
   const version = rec.version === undefined || rec.version === null ? null : typeof rec.version === "string" && VERSION_RE.test(rec.version) ? rec.version : "unlisted";
-  const common = [
+  const ids = [
     type === null || CLAUDE_GRAPH_TYPES.includes(type) ? type : "other",
     idP(rec.uuid),
     idP(rec.parentUuid),
@@ -1045,6 +1045,11 @@ function claudeProjection(rec) {
     idP(rec.agentId),
     instP(rec.timestamp),
     version,
+  ];
+  // S5.1: a record of an unlisted type projects to `other` and exactly these seven common fields
+  if (type !== null && !CLAUDE_GRAPH_TYPES.includes(type)) return ids;
+  const common = [
+    ...ids,
     boolP(rec.isCompactSummary),
     boolP(rec.isSidechain),
     boolP(rec.isApiErrorMessage),
@@ -1241,8 +1246,9 @@ function scanClaude(entries, cov, window) {
         continue;
       }
       if (!supported) unverifiedKeys.add(rid); // R15.7: one unverified copy makes the key unverified
-      if (chain === null) continue;
-      addTo(holders, rid, chain);
+      // S6.0: a supported copy without a valid sessionId is still a copy of its key for every check. It holds no chain,
+      // so it names no chain and is never an owner candidate.
+      if (chain !== null) addTo(holders, rid, chain);
       if (!supported) continue;
       const copy = readClaudeCopy(rec);
       copy.ts = ts;
@@ -1301,6 +1307,7 @@ function scanClaude(entries, cov, window) {
   for (const rid of [...requests.keys()].sort()) {
     if (unverifiedKeys.has(rid)) continue; // R15.7: no accounting is derived from an unverified key
     const copies = requests.get(rid);
+    if (copies.every((cp) => cp.chain === null)) continue; // S6.0: no chain holds the key, so there is nothing to own or account
     const heldBy = [...(holders.get(rid) ?? [])];
     // R4.1: requestId and message.id are 1 to 1.
     let keyConflict = false;
@@ -1315,8 +1322,8 @@ function scanClaude(entries, cov, window) {
     const res = resolveClaude(copies, keyConflict);
     // R4.6, S10.5: ownership is decided for every key held by two or more logical streams, excluded keys included. The
     // owner is the stream with the earliest stream_start; a tie is ownership_ambiguous (counter and taint).
-    const sids = [...new Set(copies.map((cp) => cp.chain))];
-    let owner = sids[0];
+    const sids = [...new Set(copies.map((cp) => cp.chain).filter((x) => x !== null))]; // S6.0: chainless copies own nothing
+    let owner = sids[0] ?? null;
     let ambiguous = false;
     if (sids.length > 1) {
       const startOf = (st) => streams.get(st).start; // BigInt nanoseconds or null (null sorts last)
@@ -1643,6 +1650,7 @@ function parseCodexFile(buf, c, fc, dup) {
         total: ctr(u.total_tokens),
         ord,
         tsNs,
+        threadTotalRange: ctr(tu.total_tokens) === RANGE, // R2.15, S12.0: the one non-counter integer of the record
       };
       const rawUsage = [tur.in, tur.c, tur.cw, tur.out, tur.rs, tur.total].map(stateOf);
       tur.usageKey = pjson(rawUsage);
@@ -1960,6 +1968,11 @@ function scanCodex(entries, cov, window) {
         const inc = { records_usage_bearing: 1 };
         if (vals.some((x) => !isBig(x))) inc.records_usage_unmappable = 1;
         ledger.push({ t: t.tsNs, chain: t.threadId === null ? null : codexChainId(t.threadId), inc, kinds: [], tok: {}, tokInc: 0n, tokInvalid: 0n });
+      }
+      // S12.0, R2.15: thread_token_usage.total_tokens out of range, once per logical record (R2.15 removes nothing)
+      if (t.threadTotalRange && t.threadId !== null && supportedThread(t.threadId) && !usageSeen.has("frf" + t.proj)) {
+        usageSeen.add("frf" + t.proj);
+        ledger.push({ t: t.tsNs, chain: codexChainId(t.threadId), inc: { fields_range_failed: 1 }, kinds: [], tok: {}, tokInc: 0n, tokInvalid: 0n });
       }
       if (t.threadId === null) {
         // No chain key: unkeyed for accounting (R2.13, logical: equal records count once) and unattributed for R0.9

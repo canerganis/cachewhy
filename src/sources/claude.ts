@@ -591,7 +591,7 @@ function makeRec(v: unknown, ctx: FileCtx): Rec {
     const rc = resolveChain(v);
     return {
       // S1.2: an absent record type is `missing`, an unlisted one is `other`, and the two differ.
-      d: sha(JSON.stringify([v["type"] === undefined || v["type"] === null ? "missing" : "other", idProj(v["uuid"]), tsP, idProj(v["sessionId"]), idProj(v["agentId"])])),
+      d: sha(JSON.stringify([v["type"] === undefined || v["type"] === null ? "missing" : "other", idProj(v["uuid"]), idProj(v["parentUuid"]), idProj(v["logicalParentUuid"]), idProj(v["sessionId"]), idProj(v["agentId"]), tsP, typeof v["version"] === "string" && VERSION_RE.test(v["version"]) ? v["version"] : "unlisted"])),
       type,
       graph: false,
       ver: "unlisted",
@@ -1491,6 +1491,21 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
       n.records_usage_unmappable = 1;
     }
   };
+  // S6.0: the copies of a key are grouped globally by requestId, a chainless copy included. The maps below are the single
+  // place a copy of a key is registered.
+  const registerCopy = (r: Rec, a: Asst, key: string): void => {
+    let l = byKey.get(key);
+    if (!l) byKey.set(key, (l = []));
+    l.push(r);
+    if (a.msgId !== null) {
+      let s = reqToMsg.get(key);
+      if (!s) reqToMsg.set(key, (s = new Set()));
+      s.add(a.msgId);
+      let t = msgToReq.get(a.msgId);
+      if (!t) msgToReq.set(a.msgId, (t = new Set()));
+      t.add(key);
+    }
+  };
   for (const r of recs) {
     if (r.type === "cost-state") {
       cov.fields_range_failed += r.sideRangeFailed;
@@ -1523,6 +1538,8 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
             cov.records_unkeyed += 1;
             recC.records_unkeyed = 1;
           }
+          // S6.0: a keyed chainless copy is still a copy of its key for every check, but holds no chain
+          if (sa.key !== null) registerCopy(r, sa, sa.key);
         }
       }
       if (Object.keys(recC).length > 0) ledger.push({ ...at(r.tn), chain: null, n: recC });
@@ -1575,18 +1592,8 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
       continue;
     }
     if (a.hasUsage) ledger.push({ ...at(r.tn), chain: cidOf(r.S, r.T), n: recN });
-    let l = byKey.get(a.key);
-    if (!l) byKey.set(a.key, (l = []));
-    l.push(r);
+    registerCopy(r, a, a.key);
     noteCopy(a.key, ck, r.tn);
-    if (a.msgId !== null) {
-      let s = reqToMsg.get(a.key);
-      if (!s) reqToMsg.set(a.key, (s = new Set()));
-      s.add(a.msgId);
-      let t = msgToReq.get(a.msgId);
-      if (!t) msgToReq.set(a.msgId, (t = new Set()));
-      t.add(a.key);
-    }
   }
   // R4.1: a requestId with two message ids, or a message id with two requestIds
   const conflictedKeys = new Set<string>();
@@ -1604,6 +1611,9 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
 
   for (const key of keyList) {
     const copies = byKey.get(key) as Rec[];
+    // S6.0: a chainless copy is never an owner candidate and names no chain; a key held by no chain has no response.
+    const held = copies.filter((c) => c.hasSid);
+    if (held.length === 0) continue;
     const sh = analyzeKey(copies, conflictedKeys.has(key));
     cov.responses_total += 1;
     cov.requests_total += 1;
@@ -1615,7 +1625,7 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     }
 
     // ownership (R4.6)
-    const chainSet = [...new Set(copies.map(recChain))].sort(cmpStr);
+    const chainSet = [...new Set(held.map(recChain))].sort(cmpStr);
     const own = pickOwner(chainSet);
     const allFiles = [...new Set(copies.flatMap((c) => c.files))].sort((a, b) => a - b);
     if (chainSet.length > 1) {
@@ -1689,7 +1699,7 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
 
     for (const cs of chainSet) {
       const agg = chains.get(cs) as ChainAgg;
-      const mine = copies.filter((c) => recChain(c) === cs).sort(earliestOrder);
+      const mine = held.filter((c) => recChain(c) === cs).sort(earliestOrder);
       const earliest = mine[0] as Rec;
       const tFirst = reqFirst;
       const tLast = reqLast;

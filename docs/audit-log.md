@@ -505,3 +505,52 @@ Somut düzeltme gerekmiyor.
 Verification after round 4 and revision 11.1: `npm run typecheck`, `npm run build`, `npm run lint:privacy` and `npm pack --dry-run` clean; `npm test` 973 pass, 0 fail, 0 todo (825 before). The differential fuzz test passes 1000 seeds per suite (bare, valid, all) with exact agreement. On the real logs the CLI now prints an open headline: Claude priced share 30.7 percent of tokens, unpriced `modifier_unverified` 60.0 percent and `chain_tainted` 9.3 percent; Codex 0 percent priced (R3.4).
 
 Next: G1 audit round 5.
+
+## Gate owner review pass before G1 round 5
+
+Before the external audit, the gate owner ran an internal review of the same class of drift: a read-only reviewer with probes and a scale-2 fuzz of 7500 seeds, plus an extended fuzz compare. It confirmed these items, all resolved before round 5:
+
+| Sev | Item | Resolution |
+|---|---|---|
+| P1 | recompute priced a table whose price was a JSON number or a malformed string on an unused model, where src refused the table | S8.5a: the whole table is validated at load in both implementations (string grammar with at most 6 decimals, every row of every entry, duplicate normalized ids, provider per entry) |
+| P1 | recompute skipped blank lines, so a file that src tainted for `unparsed_line` was priced | S12.6: a blank or whitespace-only terminated line is a parse error in both |
+| P1 | the describing `session_meta` of a Codex stream depended on a tie order that the two sides broke differently, so kinds differed | S10.3: kind, link parent and `source.subagent.other` are decided over the set of own records, with no ordering |
+| P1 | recompute did not know `cost-state` records, so `known_type_count` and `fields_range_failed` differed on real logs | S12.6a and S12.0: `cost-state` is a known type in both; `fields_range_failed` is implemented in recompute |
+| P1 | drift inputs (`records_usage_bearing`, `records_usage_unmappable`, `requests_with_final_marker`, `fields_range_failed`, duplicate counters, priced counts) existed in src only, so nothing compared them | recompute emits them, and the fuzz compare now fails on any coverage key that only one side emits, apart from an allowlist with a reason per key |
+| P2 | projection details (`message.role` on assistant records, non-boolean booleans, non-array `iterations`), the literal `agentId` `main`, stray sidecars, the 8 MiB sidecar limit, window comparisons in milliseconds in the report layer, a capped unpriced reason list, headline counts in a partial report | S1.3a, S5.1, S10.1, S12.6a fixed and implemented on both sides; the report windows on nanoseconds; R3.9 lists every reason; R16.5 headline figures use open providers only |
+
+Verification: `npm test` 1006 pass, 0 fail. The fuzz run of 1000 seeds per suite gave 0 divergences. Commit `26df62a`.
+
+## G1 round 5
+
+Auditor: `gpt-6.1-sol` through `codex exec`, medium effort, read-only sandbox. Embedded: the spec, `docs/accounting-semantics.md`, `src/sources`, `src/graph`, `src/pricing` (index and table), `src/model`, `src/window.ts`, `src/analyze.ts`, `scripts/recompute` and the test summary. Target: revision 11.1, commit `26df62a`. Verdict: FAIL, with 1 P0, 2 P1 and 0 P2. The analysis was static.
+
+Each finding was re-checked with a synthetic reproducer before any change. All three are correct; none was rejected. The fuzz had not generated any of the three input shapes, so the generator gained the knobs `c_stray_copy`, `c_mystery_dups` and `x_total_range`.
+
+| # | Sev | Rules | Finding (short) | Resolution |
+|---|---|---|---|---|
+| 1 | P0 | R4.2, S6.1, S7.2 | A supported Claude copy without a `sessionId` was dropped before the copy checks. A valid response with a second, chainless copy lacking a timestamp stayed in the totals in both implementations, where it must be `usage_incomplete` | New S6.0: copies are grouped by `requestId` globally, whatever their chain, and every check of S6.1 plus `t_first`/`t_last` reads them. A chainless copy is never an owner candidate and names no chain, and a key held only by chainless copies is not accounted. Tests cover each check type in both implementations |
+| 2 | P1 | S5.1, S5.2, R17.6 | The unlisted-type Claude projection differed: src dropped `parentUuid`, `logicalParentUuid` and `version` | S5.1 now names the exact common fields (`uuid`, `parentUuid`, `logicalParentUuid`, `sessionId`, `agentId`, `timestamp`, `version`). Both sides implement exactly that set, with a test that changes each field on its own |
+| 3 | P1 | R2.15, S12.0 | recompute did not add an out-of-range Codex `thread_token_usage.total_tokens` to `fields_range_failed` | recompute counts it once per logical record of a stream, windowed and live-filtered. S12.0 names the field |
+
+Final answer of round 5, verbatim:
+
+VERDICT: FAIL
+
+1. **P0 | `src/sources/claude.ts`, `scripts/recompute/index.mjs` | R4.2, S6.1, S7.2**
+   `sessionId` olmayan desteklenen Claude kopyası, global anahtarın kopya kontrolüne alınmıyor. Örnek: geçerli bir yanıtın aynı `requestId` ile ikinci kopyasında `sessionId` ve `timestamp` eksikse, yanıt `usage_incomplete` olarak dışlanmalı; iki uygulama da geçerli kopyayı toplamda tutuyor. Provider taint dolarları engellese de token toplamı yanlış.
+   **Düzeltme:** Anahtarlı bütün kopyaları zincir atamasından bağımsız grupla; zaman, sürüm, model ve kullanım kontrollerini tüm kopyalara uygula. Zincirsiz kopyayı sahiplik adayı yapma.
+
+2. **P1 | `src/sources/claude.ts: makeRec`, `scripts/recompute/index.mjs: claudeProjection` | S5.1, S5.2, R17.6**
+   Bilinmeyen Claude kayıtlarının eşitlik izdüşümleri farklı. `src` bunlarda `parentUuid`, `logicalParentUuid` ve `version` alanlarını düşürüyor; recompute tutuyor. Yalnız `parentUuid` değerleri farklı iki kayıt, `src` tarafında birleştirilirken recompute tarafında ayrı kalıyor. Duplicate coverage sayaçları yanlış ve bağımsız uygulamalar eşleşmiyor.
+   **Düzeltme:** S5.1 ortak alanlarını iki okuyucuda bağımsız ve eksiksiz uygula; her ortak alanı tek başına değiştiren eşitlik testleri ekle.
+
+3. **P1 | `scripts/recompute/index.mjs: parseCodexFile / scanCodex` | R2.15, S12.0**
+   Codex `thread_token_usage.total_tokens` range hatası izdüşüme giriyor fakat `fields_range_failed` ledger kaydı üretilmiyor. Geçerli kullanım sayaçlarıyla birlikte `thread_token_usage.total_tokens = -1` içeren desteklenen bir kayıtta `src` sayacı 1, recompute 0 oluyor.
+   **Düzeltme:** Bu alanın range durumunu ayrı tut; mantıksal kayıt başına bir ledger artışı üret ve pencere ile live-family filtrelerini uygula.
+
+Doğrulama statik olarak gömülü içerik üzerinden yapıldı. Verilen 1006 test ve fuzz özeti bu karşı örnekleri kapatmıyor; testler burada yeniden çalıştırılmadı.
+
+Verification after the fixes: `npm run typecheck`, `npm run build`, `npm run lint:privacy` and `npm pack --dry-run` clean. `npm test`: 1026 pass, 0 fail, 0 todo. A 1000-seed run of every fuzz suite (bare, valid, all, dense) gave 0 divergences, and the 37 minimized reproducers in `test/fuzz/repros.ts` all agree.
+
+Next: G1 audit round 6.

@@ -1661,3 +1661,141 @@ describe("S12.0: Codex records without a response_id, API errors and bare timest
     assert.equal(res.responses[0]?.exclusion, "usage_incomplete");
   });
 });
+
+// ---------------------------------------------------------------------------
+// G1 round 5: S6.0 (chainless copies) and S5.1 (unlisted-type projection)
+// ---------------------------------------------------------------------------
+
+describe("S6.0: a Claude copy without a sessionId is still a copy of its requestId for every check", () => {
+  const A = "synthetic-session-a";
+  const good = (over: Partial<AOpts> = {}): any => arec({ uuid: "u-good", req: "k", msg: "m", ...over });
+  /** The copy without a sessionId (an unattributed_record). */
+  const loose = (over: Partial<AOpts> = {}): any =>
+    arec({ uuid: "u-loose", req: "k", msg: "m", ...over, patch: (r) => { delete r.sessionId; over.patch?.(r); } });
+  const run = (...recs: any[]) => parseC([cfile(A, recs)]);
+
+  it("the valid response plus a chainless copy that lacks the timestamp: usage_incomplete (the audit example)", async () => {
+    const res = await run(good(), loose({ patch: (r) => { delete r.timestamp; } }));
+    assert.equal(res.responses.length, 1);
+    assert.equal(res.responses[0]?.exclusion, "usage_incomplete");
+    assert.ok(res.integrity.triggers.some((x) => x.reason === "unattributed_record" && x.names === "provider"));
+  });
+
+  it("a chainless copy with a bad timestamp or a missing counter makes the key incomplete; a bad counter makes it range failed", async () => {
+    assert.equal((await run(good(), loose({ ts: "2026-02-30T00:00:00Z" }))).responses[0]?.exclusion, "usage_incomplete");
+    assert.equal((await run(good(), loose({ usage: ausage({ output_tokens: undefined }) }))).responses[0]?.exclusion, "usage_incomplete");
+    assert.equal((await run(good(), loose({ usage: ausage({ input_tokens: -1 }) }))).responses[0]?.exclusion, "usage_range_failed");
+    // range comes before incomplete also across chains
+    assert.equal((await run(good(), loose({ usage: ausage({ input_tokens: -1 }), ts: null }))).responses[0]?.exclusion, "usage_range_failed");
+  });
+
+  it("a chainless copy of an unsupported version makes the key unverified: no response", async () => {
+    const res = await run(good(), loose({ patch: (r) => { r.version = "2.1.290"; } }));
+    assert.equal(res.responses.length, 0);
+    assert.equal(res.coverage.requests_unverified_version, 1);
+  });
+
+  it("a chainless copy with another message id is key_conflict (R4.1)", async () => {
+    const res = await run(good(), loose({ msg: "m-other" }));
+    assert.equal(res.responses[0]?.exclusion, "key_conflict");
+    assert.equal(res.coverage.requests_conflict_by_kind.key_conflict, 1);
+  });
+
+  it("a chainless copy with other input counters or another model is conflict_input and conflict_model", async () => {
+    const input = await run(good(), loose({ usage: ausage({ input_tokens: 99 }) }));
+    assert.equal(input.responses[0]?.exclusion, "conflict_input");
+    const model = await run(good(), loose({ model: "claude-sonnet-5-5" }));
+    assert.equal(model.responses[0]?.exclusion, "conflict_model");
+  });
+
+  it("a chainless final copy with another output, iterations or modifier is conflict_output, conflict_iterations and conflict_modifier", async () => {
+    const out = await run(good(), loose({ usage: ausage({ output_tokens: 9 }) }));
+    assert.equal(out.responses[0]?.exclusion, null);
+    assert.ok(out.conflicts.some((c) => c.kind === "conflict_output"));
+    assert.equal(out.responses[0]?.usage?.output, null);
+    const it = await run(good(), loose({ usage: ausage({ iterations: [{ input_tokens: 99 }] }) }));
+    assert.ok(it.conflicts.some((c) => c.kind === "conflict_iterations"));
+    const mod = await run(good(), loose({ usage: ausage({ inference_geo: "us" }) }));
+    assert.ok(mod.conflicts.some((c) => c.kind === "conflict_modifier"));
+    assert.equal(mod.responses[0]?.modifiers.inference_geo, null);
+  });
+
+  it("a chainless copy without the final marker does not hide a modifier it carries: a non-final copy must agree with the final one", async () => {
+    const res = await run(good(), loose({ usage: ausage({ speed: undefined, inference_geo: "us" }) }));
+    assert.ok(res.conflicts.some((c) => c.kind === "conflict_modifier"));
+  });
+
+  it("t_first and t_last read the chainless copy", async () => {
+    const res = await run(good({ ts: t(10) }), loose({ ts: t(5), usage: ausage({ speed: undefined }) }), loose({ ts: t(20), usage: ausage({ speed: undefined }) }));
+    const r = res.responses[0] as ClaudeResponse;
+    assert.equal(r.time.t_first_ns, parseInstantNs(t(5)));
+    assert.equal(r.time.t_last_ns, parseInstantNs(t(20)));
+    assert.equal(r.copies, 1); // the copies of the chain, the chainless ones belong to none
+  });
+
+  it("a chainless copy names no chain and is never an owner candidate", async () => {
+    const B = "synthetic-session-b";
+    const res = await parseC([
+      cfile(A, [good({ ts: t(10) })]),
+      cfile(B, [arec({ sid: B, uuid: "u-b", req: "k", msg: "m", ts: t(10) })]),
+      cfile("synthetic-loose", [loose({ ts: t(1) })]),
+    ]);
+    assert.equal(res.responses.length, 2);
+    // the chainless copy starts earliest but owns nothing: the owners are decided between A and B (a tie)
+    assert.ok(res.responses.every((r) => r.ownership.ambiguous));
+    assert.equal(res.integrity.chains.length, 2);
+    const names = res.integrity.triggers.filter((x) => x.reason === "request_anomaly").flatMap((x) => (x.names === "provider" ? ["*"] : x.names));
+    assert.deepEqual(names, []);
+  });
+
+  it("a key held by chainless copies only has no response", async () => {
+    const res = await run(loose());
+    assert.equal(res.responses.length, 0);
+    assert.equal(res.coverage.responses_total, 0);
+  });
+
+  it("an excluded key taints the chains that hold a copy, not the chainless one", async () => {
+    const res = await run(good(), loose({ msg: "m-other" }));
+    const names = res.integrity.triggers.filter((x) => x.reason === "request_anomaly").flatMap((x) => (x.names === "provider" ? ["*"] : x.names));
+    assert.deepEqual(names, [chainIdOf({ provider: "claude", root_session: A, thread: "main" })]);
+  });
+});
+
+describe("S5.1: a record of an unlisted type projects to `other` and exactly seven common fields", () => {
+  const rec = (over: Record<string, unknown> = {}): any => ({
+    type: "zzz",
+    uuid: "u1",
+    parentUuid: "p1",
+    logicalParentUuid: "l1",
+    sessionId: SESS,
+    agentId: "ag",
+    timestamp: t(2),
+    version: V,
+    ...over,
+  });
+  const collapsed = async (a: any, b: any): Promise<number> => (await parseC([cfile(SESS, [a, b])])).coverage.lines_duplicate_collapsed;
+
+  it("equal records collapse; a field outside the seven does not matter", async () => {
+    assert.equal(await collapsed(rec(), rec()), 1);
+    assert.equal(await collapsed(rec(), rec({ extra: 5, message: { content: "x" }, isSidechain: true, requestId: "r" })), 1);
+  });
+
+  it("each common field changed on its own makes two records", async () => {
+    assert.equal(await collapsed(rec(), rec({ uuid: "u2" })), 0);
+    assert.equal(await collapsed(rec(), rec({ parentUuid: "p2" })), 0);
+    assert.equal(await collapsed(rec(), rec({ logicalParentUuid: "l2" })), 0);
+    assert.equal(await collapsed(rec(), rec({ sessionId: "synthetic-other" })), 0);
+    assert.equal(await collapsed(rec(), rec({ agentId: "ag2" })), 0);
+    assert.equal(await collapsed(rec(), rec({ timestamp: t(3) })), 0);
+    assert.equal(await collapsed(rec(), rec({ version: "2.1.286" })), 0);
+  });
+
+  it("each field has the states missing and bad (null is absent)", async () => {
+    for (const f of ["parentUuid", "logicalParentUuid", "agentId", "uuid", "version"]) {
+      assert.equal(await collapsed(rec({ [f]: null }), rec({ [f]: undefined })), 1, `${f} null = absent`);
+      assert.equal(await collapsed(rec({ [f]: 5 }), rec({ [f]: undefined })), f === "version" ? 1 : 0, `${f} bad differs from missing`);
+    }
+    // an unlisted version is `unlisted` whether absent or off the pattern
+    assert.equal(await collapsed(rec({ version: "x" }), rec({ version: undefined })), 1);
+  });
+});

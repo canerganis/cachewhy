@@ -1382,3 +1382,110 @@ describe("S12.6a: discovery layout and sidecar size", () => {
     assert.equal(cov(fit, "claude").lines_total, 2);
   });
 });
+
+// ---------------------------------------------------------------------------
+// S6.0 chainless copies, R2.15 Codex thread total, S5.1 unlisted projection
+// ---------------------------------------------------------------------------
+
+describe("S6.0: a supported Claude copy without a sessionId is still a copy of its key", () => {
+  /** A valid response in session s1 plus a second copy with the same requestId and no sessionId. */
+  const withChainless = (over: CopyOpts, mutate: (r: Obj) => void = () => {}, good: CopyOpts = {}) => {
+    const a = copy({ sess: "s1", req: "k", mid: "mk", ts: T(5), ...good });
+    const b = copy({ sess: "s1", req: "k", mid: "mk", ts: T(6), ...over });
+    delete b.sessionId;
+    mutate(b);
+    return run([mainFile("s1", [a]), { path: "projects/p/orphan.jsonl", content: jsonl([b]) }]);
+  };
+  const status = (r: RecomputeResult) => rowOf(r, "claude:k").status;
+  const conflicts = (r: RecomputeResult) => (rowOf(r, "claude:k").flags as string[]).filter((f) => f.startsWith("conflict"));
+
+  it("a missing timestamp, a range or incomplete counter make the response excluded", () => {
+    assert.equal(status(withChainless({}, (b) => delete b.timestamp)), "excluded:usage_incomplete");
+    assert.equal(status(withChainless({ ts: "2026-02-30T00:00:00Z" })), "excluded:usage_incomplete");
+    assert.equal(status(withChainless({ usage: usage({ output_tokens: undefined }) })), "excluded:usage_incomplete");
+    assert.equal(status(withChainless({ usage: usage({ input_tokens: -1 }) })), "excluded:usage_range_failed");
+    // a copy without usage and without a timestamp (the audit example)
+    assert.equal(status(withChainless({ usage: null }, (b) => delete b.timestamp)), "excluded:usage_incomplete");
+    const r = withChainless({}, (b) => delete b.timestamp);
+    assert.equal(r.providers.claude.totals.responses, 0);
+    assert.equal(cov(r, "claude").responses_usage_incomplete, 1);
+    assert.equal(cov(r, "claude").chains_tainted_by_reason.request_anomaly, 1, "the chain that holds the other copy");
+  });
+
+  it("key_conflict, conflict_input and conflict_model exclude the response", () => {
+    assert.equal(status(withChainless({ mid: "other-message" })), "excluded:key_conflict");
+    assert.equal(status(withChainless({ usage: usage({ input_tokens: 11 }) })), "excluded:conflict_input");
+    assert.equal(status(withChainless({ model: "claude-opus-5-5" })), "excluded:conflict_model");
+    const r = withChainless({ usage: usage({ input_tokens: 11 }) });
+    assert.deepEqual(cov(r, "claude").requests_conflict_by_kind, { conflict_input: 1 });
+  });
+
+  it("conflict_output, conflict_iterations, conflict_modifier and conflict_diagnostics read a chainless copy", () => {
+    assert.deepEqual(conflicts(withChainless({ usage: usage({ output_tokens: 6 }) })), ["conflict_output"]);
+    assert.deepEqual(conflicts(withChainless({ usage: usage({ iterations: [{ input_tokens: 99 }] }) })), ["conflict_iterations"]);
+    assert.deepEqual(conflicts(withChainless({ usage: usage({ inference_geo: "us" }) })), ["conflict_modifier"]);
+    // a chainless non-final copy that carries a modifier the final copy does not
+    assert.deepEqual(conflicts(withChainless({ usage: usage({ service_tier: "priority" }, false) })), ["conflict_modifier"]);
+    const dg = (type: string) => ({ diagnostics: { cache_miss_reason: { type } } });
+    const d = withChainless({ msg: dg("tools_changed") }, () => {}, { msg: dg("messages_changed") });
+    assert.deepEqual(cov(d, "claude").requests_conflict_by_kind, { conflict_diagnostics: 1 });
+  });
+
+  it("t_first reads the chainless copy; an unverified chainless copy makes the key unverified; the copy is never an owner and names no chain", () => {
+    // the chainless copy is the earliest: t_first is T(1)
+    const w = withChainless({ ts: T(1) }, () => {}, { ts: T(30) });
+    assert.equal(rowOf(w, "claude:k").event, "2026-01-01T00:00:01.000Z");
+    const inWin = recomputeFiles([mainFile("s1", [copy({ sess: "s1", req: "k", mid: "mk", ts: T(30) })])], { table: TABLE, runStartMs: RUN, since: Date.UTC(2026, 0, 1, 0, 0, 10) });
+    assert.equal(inWin.providers.claude.totals.responses, 1);
+    // with the earlier chainless copy, the key lies before the window
+    const a = copy({ sess: "s1", req: "k", mid: "mk", ts: T(30) });
+    const b = copy({ sess: "s1", req: "k", mid: "mk", ts: T(1) });
+    delete b.sessionId;
+    const before = recomputeFiles([mainFile("s1", [a]), { path: "projects/p/orphan.jsonl", content: jsonl([b]) }], { table: TABLE, runStartMs: RUN, since: Date.UTC(2026, 0, 1, 0, 0, 10) });
+    assert.equal(before.providers.claude.totals.responses, 0);
+    assert.equal(cov(before, "claude").baseline_requests_loaded, 1);
+    // unverified version on the chainless copy
+    const u = withChainless({ version: "1.0.0" });
+    assert.equal(cov(u, "claude").requests_unverified_version, 1);
+    assert.equal(u.providers.claude.totals.responses, 0);
+    // a key whose copies are all chainless is owned by nobody: not accounted, and no chain is named
+    const only = copy({ req: "k2", mid: "m2" });
+    delete only.sessionId;
+    const r = run([{ path: "projects/p/orphan.jsonl", content: jsonl([only]) }]);
+    assert.equal(r.providers.claude.totals.responses, 0);
+    assert.equal(cov(r, "claude").chains_total, 0);
+  });
+});
+
+describe("R2.15, S12.0: Codex thread_token_usage.total_tokens out of range", () => {
+  it("adds 1 to fields_range_failed once per logical record, windowed and outside live families; the response is kept", () => {
+    const head = [xmeta("synthetic-tt2"), xturn("tn", "gpt-6-sol", 1, 1)];
+    const rec = (resp: string, ord: number, sec: number, total: unknown) => xtur(resp, "synthetic-tt2", "tn", ord, sec, xusage(), {}, { thread_token_usage: { total_tokens: total } });
+    const files = [xfile("tt", [...head, rec("a", 2, 2, -1), rec("a", 2, 2, -1), rec("b", 3, 30, 1.5), rec("c", 4, 31, 5), rec("d", 5, 32, MAX_SAFE + 2)])];
+    const r = run(files);
+    assert.equal(cov(r, "codex").fields_range_failed, 3);
+    assert.equal(r.providers.codex.totals.responses, 4, "R2.15 for this field removes nothing");
+    assert.equal(cov(run(files, { since: Date.UTC(2026, 0, 2, 0, 0, 10) }), "codex").fields_range_failed, 2);
+    const live = withGarbage(xfile("tt", [...head, rec("a", 2, 2, -1)]));
+    assert.equal(cov(run([live]), "codex").fields_range_failed, 0);
+    // a string total is bad, not range
+    assert.equal(cov(run([xfile("tt", [...head, rec("a", 2, 2, "x")])]), "codex").fields_range_failed, 0);
+  });
+});
+
+describe("S5.1: a record of an unlisted type projects to `other` and exactly seven common fields", () => {
+  it("only uuid, parentUuid, logicalParentUuid, sessionId, agentId, timestamp and version separate two unlisted records", () => {
+    const base = { type: "mystery", uuid: "u1", parentUuid: "p1", logicalParentUuid: "l1", sessionId: "synthetic-s1", agentId: "a1", timestamp: T(1), version: CV };
+    const dupCount = (...recs: Obj[]) => cov(run([mainFile("s1", recs)]), "claude").lines_duplicate_collapsed;
+    // fields outside the seven do not matter
+    assert.equal(dupCount(base, { ...base, isSidechain: true, entrypoint: "cli", effort: "high", advisorModel: "x", requestId: "r", message: { role: "user" }, extra: 1 }), 1);
+    assert.equal(dupCount(base, { ...base, type: "other-mystery" }), 1, "the type is `other` whatever the unlisted string");
+    // each of the seven separates
+    for (const [k, v] of [["uuid", "u2"], ["parentUuid", "p2"], ["logicalParentUuid", "l2"], ["sessionId", "synthetic-s2"], ["agentId", "a2"], ["timestamp", T(2)], ["version", "2.1.288"]] as const) {
+      assert.equal(dupCount(base, { ...base, [k]: v }), 0, k);
+    }
+    // a listed type keeps its own fields (attachment: the common fields of the graph types)
+    const att = { ...base, type: "attachment" };
+    assert.equal(dupCount(att, { ...att, isSidechain: true }), 0);
+  });
+});

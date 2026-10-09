@@ -149,6 +149,9 @@ const MALFORMATIONS = {
   c_agent_main: 0.04, // agentId set to the literal "main"
   c_nonbool_flags: 0.04, // isSidechain or isApiErrorMessage that is not a boolean
   c_iterations_nonarray: 0.05, // usage.iterations that is not an array of one object
+  c_stray_copy: 0.06, // extra copy of an existing requestId without sessionId (maybe no timestamp, other input or model)
+  c_mystery_dups: 0.08, // unlisted-type records duplicated except parentUuid, logicalParentUuid or version
+  x_total_range: 0.06, // thread_token_usage.total_tokens out of range while usage is valid
   x_dup_meta: 0.05, // second own session_meta of one thread, equal ordinal, no timestamp, other thread_source
 } as const;
 
@@ -703,6 +706,21 @@ function claudeRequest(c: Ctx, th: ClaudeThread, opts: { forceId?: string; tool?
     }
     out.push(rec);
   }
+  const strayHit = r.chance(k.c_stray_copy);
+  const strayVariant = r.int(0, 3);
+  const strayFrom = r.int(0, out.length - 1);
+  const strayModel = modelValue(r, k, r.pick(CLAUDE_MODELS));
+  if (strayHit) {
+    used(c, "c_stray_copy");
+    const src = out[strayFrom]!;
+    const extra: Obj = structuredClone(src);
+    extra.uuid = nextId(c, "uuid");
+    delete extra.sessionId;
+    if (strayVariant === 1) delete extra.timestamp;
+    else if (strayVariant === 2 && extra.message?.usage && typeof extra.message.usage.input_tokens === "number") extra.message.usage.input_tokens += 1;
+    else if (strayVariant === 3 && extra.message) extra.message.model = strayModel;
+    out.push(extra);
+  }
   for (const rec of out) th.records.push(rec);
   th.byRequest.set(requestId, out);
   return out;
@@ -723,6 +741,22 @@ function claudeOther(c: Ctx, th: ClaudeThread): void {
     rec.content = "synthetic-system";
   } else if (type === "attachment") rec.attachment = { type: "synthetic-attachment" };
   th.records.push(rec);
+  // unlisted-type records that are duplicates except for parentUuid, logicalParentUuid or version
+  const dupHit = r.chance(c.k.c_mystery_dups);
+  const dupVariant = r.int(0, 2);
+  const dupCount = r.int(1, 2);
+  if (dupHit) {
+    used(c, "c_mystery_dups");
+    const base: Obj = { type: "mystery", uuid: nextId(c, "uuid"), parentUuid: "synthetic-parent-a", logicalParentUuid: "synthetic-logical-a", sessionId: th.sessionId, timestamp: new Date(th.clock).toISOString(), version: th.version };
+    th.records.push(base);
+    for (let i = 0; i < dupCount; i++) {
+      const d: Obj = { ...base };
+      if (dupVariant === 0) d.parentUuid = `synthetic-parent-${i}`;
+      else if (dupVariant === 1) d.logicalParentUuid = `synthetic-logical-${i}`;
+      else d.version = i === 0 ? "2.1.288" : "9.9.9";
+      th.records.push(d);
+    }
+  }
 }
 
 interface ClaudeAgentFile {
@@ -1113,6 +1147,12 @@ function cxUsageRecord(c: Ctx, th: CxThread): CxLine {
       total_tokens: tt.total,
     },
   };
+  const totalHit = r.chance(k.x_total_range);
+  const totalPick = r.int(0, 3);
+  if (totalHit) {
+    used(c, "x_total_range");
+    (payload.thread_token_usage as Obj).total_tokens = [-1, 1.5, MAX_SAFE + 1, "5"][totalPick];
+  }
   const line = cxPush(c, th, "token_usage_record", payload);
   c.eventMs.push(line.ms);
   mutateCodexUsage(c, payload.usage as Obj);
