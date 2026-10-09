@@ -22,6 +22,83 @@ export interface Diff {
 
 const PROVIDERS: readonly Provider[] = ["claude", "codex"];
 
+/** Response flags both implementations can emit. The others are src-only (see SRC_ONLY_FLAGS). */
+const SHARED_FLAGS: ReadonlySet<string> = new Set(["bucket_mismatch", "w_unknown_ttl", "output_unknown", "conflict_output", "conflict_iterations", "conflict_modifier"]);
+/** Response flags that only src emits, with the reason they are not compared as flags. */
+export const SRC_ONLY_FLAGS: Readonly<Record<string, string>> = {
+  no_final_copy: "recompute counts it in coverage requests_no_final_copy; the same fact is in output_unknown plus the price reason",
+  conflict_diagnostics: "diagnostics (section 10) are outside the R13.1 accounting scope",
+  classifier_attached: "R5.5 linkage, outside R13.1 scope",
+  ownership_ambiguous: "compared through taint reasons and coverage replay_ownership_ambiguous",
+  fork_first_own: "R4.8 boundary marker, outside R13.1 scope",
+};
+
+/**
+ * Coverage keys that only one side emits. A key on neither list that only one side emits FAILS the compare, so a counter
+ * added to one implementation is noticed until it is added to the other or listed here with a reason.
+ */
+export const REC_ONLY_COVERAGE: Readonly<Record<string, string>> = {
+  requests_no_final_copy: "diagnostic of recompute; src carries the fact as flag no_final_copy",
+  sidecar_files: "diagnostic of recompute: sidecar files are not in files_total there",
+  sidecar_files_unparsed: "diagnostic of recompute for unparseable sidecars",
+  geo_rounded_responses: "diagnostic of recompute for the geo rounding of S8.7",
+  tokens_in_incomplete_by_field: "diagnostic breakdown of recompute; the sum is tokens_in_incomplete_responses",
+  model_source_counts: "diagnostic breakdown of recompute; src has the per-response model_source (compared)",
+  taint_warn: "report matter (R16.1), src computes it in the report builder",
+  responses_usage_incomplete: "recompute-only count; the tokens are compared through tokens_in_incomplete_responses",
+  requests_no_event_time: "retired diagnostic of recompute",
+};
+export const SRC_ONLY_COVERAGE: Readonly<Record<string, string>> = {
+  links_verified: "graph linkage (R5.3 to R5.6), outside R13.1 scope",
+  links_directory_only: "graph linkage, outside R13.1 scope",
+  links_unlinked: "graph linkage, outside R13.1 scope",
+  links_unlinked_by_reason: "graph linkage, outside R13.1 scope",
+  pairs_total: "pair detection (sections 7 to 9), outside R13.1 scope",
+  pairs_eligible: "pair detection, outside R13.1 scope",
+  pairs_abstained: "pair detection, outside R13.1 scope",
+  pairs_abstained_by_code: "pair detection, outside R13.1 scope",
+  pairs_gap_unknown: "pair detection, outside R13.1 scope",
+  pairs_no_event: "pair detection, outside R13.1 scope",
+  pairs_event: "pair detection, outside R13.1 scope",
+  pairs_boundary: "pair detection, outside R13.1 scope",
+  requests_gate_abstained: "gate E0 of section 7, outside R13.1 scope",
+  requests_gate_abstained_by_code: "gate E0 of section 7, outside R13.1 scope",
+  unlogged_tokens_estimate: "R17.5 estimate, never added to totals",
+  versions: "bounded version histogram (R15.7 print), not an accounting counter",
+  requests_unpriced_modifier: "equals the sum of the modifier reasons of unpriced_by_reason, compared there",
+  requests_unpriced_modifier_by_reason: "compared through unpriced_by_reason per response reason",
+  files_assigned_by_stream: "physical stream-file counter; recompute does not expose it",
+  files_stream_conflict: "physical stream-file counter; recompute does not expose it",
+  files_unassigned_stream: "physical stream-file counter; recompute does not expose it",
+  files_copy_exposed: "physical stream-file counter; recompute does not expose it",
+  files_without_response_id: "physical R2.9 counter; recompute does not expose it",
+  token_count_events_without_response_id: "physical R2.9 counter; recompute does not expose it",
+  tokens_in_invalid_responses: "Claude has none; Codex is compared when recompute emits it",
+  responses_usage_invariant_failed: "Codex-only counter; compared when recompute emits it",
+  tokens_unpriced: "compared against recompute providers.<p>.totals.tokens_unpriced (cross-check below)",
+};
+
+/** Claude-only counters: src emits them for Codex too, where they must be zero (recompute omits them there). */
+const CLAUDE_ONLY_ZERO_FOR_CODEX: ReadonlySet<string> = new Set(["api_error_records", "requests_conflict_modifier", "responses_bucket_mismatch", "requests_with_final_marker", "output_unknown_requests", "replay_requests_excluded", "replay_ownership_ambiguous"]);
+
+/** One-sided top-level keys of two coverage objects that are on no list. */
+export function unlistedCoverageKeys(src: object, rec: object, path: string, out: Diff[], provider: Provider): void {
+  const s = src as Record<string, unknown>;
+  const r = rec as Record<string, unknown>;
+  for (const k of new Set([...Object.keys(s), ...Object.keys(r)])) {
+    const inS = k in s;
+    const inR = k in r;
+    if (inS && inR) continue;
+    if (inS && provider === "codex" && CLAUDE_ONLY_ZERO_FOR_CODEX.has(k)) {
+      if (!isZeroLike(s[k])) out.push({ path: `${path}.${k}`, src: norm(s[k]), rec: "<key absent, Claude-only counter must be zero>" });
+      continue;
+    }
+    if (inS && k in SRC_ONLY_COVERAGE) continue;
+    if (inR && k in REC_ONLY_COVERAGE) continue;
+    out.push({ path: `${path}.${k}`, src: inS ? norm(s[k]) : "<key absent>", rec: inR ? norm(r[k]) : "<key absent>" });
+  }
+}
+
 function show(v: unknown): string {
   if (v === undefined) return "undefined";
   if (typeof v === "bigint") return `${v}n`;
@@ -158,6 +235,10 @@ function compare(analysis: Awaited<ReturnType<typeof analyze>>, view: ReturnType
       reason,
       tokens_unpriced: p.cost.pico === null ? p.tokens_unpriced : 0n,
       kind: r.kind,
+      event_ns: r.time.event_ns ?? "<absent>",
+      chain: chainIdOf(r.chain),
+      role: r.ownership.role,
+      flags: r.flags.filter((f) => SHARED_FLAGS.has(f)).sort(),
       model_source: r.model.source,
       model: r.model.verified ? r.model.model : null,
       tainted: g.taint[r.provider].chains.get(chainIdOf(r.chain))?.tainted ?? null,
@@ -169,6 +250,10 @@ function compare(analysis: Awaited<ReturnType<typeof analyze>>, view: ReturnType
       reason: x.price!.priced ? null : x.price!.reason,
       tokens_unpriced: x.price!.tokens_unpriced,
       kind: x.kind,
+      event_ns: x.event_ns ?? "<absent>",
+      chain: x.chain ?? "<absent>",
+      role: "owner",
+      flags: (x.flags ?? []).filter((f) => SHARED_FLAGS.has(f)).sort(),
       model_source: x.model_source,
       model: ["own_turn", "carried_verified", "claude_explicit"].includes(String(x.model_source)) ? (x.model ?? null) : null,
       tainted: x.tainted,
@@ -231,6 +316,8 @@ function compare(analysis: Awaited<ReturnType<typeof analyze>>, view: ReturnType
   // ---- coverage: every field present in both ----------------------------------------------------------------------
   for (const p of PROVIDERS) {
     deepDiff(view.coverage_by_provider[p], rec.coverage[p], `coverage.${p}`, out, true);
+    unlistedCoverageKeys(view.coverage_by_provider[p], rec.coverage[p], `coverage.${p}`, out, p);
+    deepDiff(view.coverage_by_provider[p].tokens_unpriced, rec.providers[p].totals.tokens_unpriced, `coverage.${p}.tokens_unpriced(vs totals)`, out);
   }
 }
 

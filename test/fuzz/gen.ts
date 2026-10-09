@@ -96,6 +96,8 @@ const FEATURES = {
   x_unknown_model: 0.08,
   x_two_models: 0.2, // different models in different turns
   io_crlf_bom: 0.06, // CRLF line endings and a UTF-8 BOM at the start of a log file (R1.3)
+  c_cost_state: 0.15, // cost-state records with modelUsage members (R17.5)
+  c_compact: 0.15, // compact_boundary system records with preTokens and postTokens
 } as const;
 
 /** Injected defects. */
@@ -140,6 +142,14 @@ const MALFORMATIONS = {
   x_stream_conflict: 0.04, // a record of another thread in a file, a second own session_meta
   x_bad_fork: 0.2, // a fork with a missing, wrong or non-integer subagent_history_start_ordinal
   x_garbage_line: 0.03,
+  io_blank_lines: 0.08, // blank and whitespace-only lines inside a JSONL file
+  c_cost_range: 0.3, // out-of-range modelUsage members (only with c_cost_state)
+  c_compact_range: 0.3, // out-of-range preTokens or postTokens (only with c_compact)
+  c_stray_sidecar: 0.06, // sidecars in the wrong directories
+  c_agent_main: 0.04, // agentId set to the literal "main"
+  c_nonbool_flags: 0.04, // isSidechain or isApiErrorMessage that is not a boolean
+  c_iterations_nonarray: 0.05, // usage.iterations that is not an array of one object
+  x_dup_meta: 0.05, // second own session_meta of one thread, equal ordinal, no timestamp, other thread_source
 } as const;
 
 export type FeatureName = keyof typeof FEATURES;
@@ -378,6 +388,19 @@ function ioVariant(c: Ctx, body: string): string {
   return bom ? `﻿${t}` : t;
 }
 
+/** Blank and whitespace-only lines inside a JSONL body. Constant draws (five per call). */
+function blankLines(c: Ctx, lines: string[]): void {
+  const hit = c.r.chance(c.k.io_blank_lines);
+  const n = c.r.int(1, 3);
+  const p1 = c.r.f();
+  const p2 = c.r.f();
+  const p3 = c.r.f();
+  if (!hit) return;
+  used(c, "io_blank_lines");
+  const fills = ["", "   ", "\t", "\t  \t", "\r"];
+  for (const pp of [p1, p2, p3].slice(0, n)) lines.splice(Math.floor(pp * (lines.length + 1)), 0, fills[Math.floor(pp * 1000) % fills.length]!);
+}
+
 function setOrDelete(o: Obj, key: string, v: unknown): void {
   if (v === undefined) delete o[key];
   else o[key] = v;
@@ -410,9 +433,20 @@ function claudeBase(c: Ctx, th: ClaudeThread, type: string, ms: number): Obj {
   const t = tsValue(c.r, k, ms);
   if (t !== undefined) rec.timestamp = t;
   rec.isSidechain = th.agentId !== null;
+  const nonBool = c.r.chance(k.c_nonbool_flags);
+  const nonBoolVal = c.r.pick<unknown>(["true", "false", 1, 0, null, "yes", {}]);
+  const agentMain = c.r.chance(k.c_agent_main);
+  if (nonBool) {
+    used(c, "c_nonbool_flags");
+    rec.isSidechain = nonBoolVal;
+  }
   rec.version = th.version;
   rec.entrypoint = "cli";
   if (th.agentId !== null) rec.agentId = th.agentId;
+  if (agentMain) {
+    used(c, "c_agent_main");
+    rec.agentId = "main";
+  }
   return rec;
 }
 
@@ -488,6 +522,10 @@ function claudeRequest(c: Ctx, th: ClaudeThread, opts: { forceId?: string; tool?
   const partialCreation = r.chance(k.c_partial_cache_creation);
   const iterations = r.chance(k.c_iterations);
   const thinking = r.chance(k.c_thinking);
+  const iterNonArray = r.chance(k.c_iterations_nonarray);
+  const iterPick = r.f();
+  const apiNonBool = r.chance(k.c_nonbool_flags);
+  const apiNonBoolVal = r.pick<unknown>(["true", "false", 1, 0, null, "yes", {}]);
   const fast = r.chance(k.c_fast_geo_tier);
   const oddMod = r.chance(k.c_modifier_odd);
   const modPick = [r.f(), r.f(), r.f()];
@@ -551,6 +589,12 @@ function claudeRequest(c: Ctx, th: ClaudeThread, opts: { forceId?: string; tool?
         usage.iterations = [it];
       }
       if (thinking) usage.output_tokens_details = { thinking_tokens: Math.min(out, r.int(0, 100)) };
+      if (iterNonArray) {
+        used(c, "c_iterations_nonarray");
+        const one = { input_tokens: usage.input_tokens, output_tokens: usage.output_tokens };
+        const odd: unknown[] = [one, "x", 5, null, [], [5], [null], [one, one], { 0: one }];
+        usage.iterations = odd[Math.floor(iterPick * odd.length)];
+      }
     }
     copies.push(usage);
   }
@@ -653,6 +697,10 @@ function claudeRequest(c: Ctx, th: ClaudeThread, opts: { forceId?: string; tool?
       rec.isApiErrorMessage = true;
       if (r.chance(0.5)) delete msg.usage;
     }
+    if (apiNonBool) {
+      used(c, "c_nonbool_flags");
+      rec.isApiErrorMessage = apiNonBoolVal;
+    }
     out.push(rec);
   }
   for (const rec of out) th.records.push(rec);
@@ -693,6 +741,65 @@ interface ClaudeSessionOut {
   runs: Array<{ runId: string; json: string | null; journal: string | null }>;
 }
 
+const RANGE_BAD: readonly unknown[] = [-1, 1.5, MAX_SAFE + 1, 1e300, "5", null, S_BIG];
+
+/** cost-state record (R17.5): modelUsage members, some out of range with c_cost_range. Constant draws. */
+function claudeCostState(c: Ctx, th: ClaudeThread): void {
+  const r = c.r;
+  const has = r.chance(c.k.c_cost_state);
+  const bad = r.chance(c.k.c_cost_range);
+  const badPick = r.f();
+  const badSlot = r.int(0, 3);
+  const nModels = r.int(1, 2);
+  const names = ["inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"];
+  const body: Obj = {};
+  for (let i = 0; i < nModels; i++) {
+    const m = r.pick(CLAUDE_MODELS);
+    const u: Obj = {};
+    for (const n of names) u[n] = r.int(0, 50000);
+    if (bad && i === 0) {
+      used(c, "c_cost_range");
+      u[names[badSlot]!] = RANGE_BAD[Math.floor(badPick * RANGE_BAD.length)];
+    }
+    body[m] = u;
+  }
+  const t = r.int(1, 30) * 1000;
+  if (!has) return;
+  used(c, "c_cost_state");
+  th.clock += t;
+  const rec = claudeBase(c, th, "cost-state", th.clock);
+  rec.modelUsage = body;
+  th.records.push(rec);
+}
+
+/** compact_boundary system record with preTokens and postTokens, some out of range with c_compact_range. */
+function claudeCompact(c: Ctx, th: ClaudeThread): void {
+  const r = c.r;
+  const has = r.chance(c.k.c_compact);
+  const bad = r.chance(c.k.c_compact_range);
+  const badPick = r.f();
+  const which = r.chance(0.5);
+  const pre = r.int(1000, 200000);
+  const post = r.int(100, 20000);
+  const t = r.int(1, 30) * 1000;
+  if (!has) return;
+  used(c, "c_compact");
+  th.clock += t;
+  const last = th.records[th.records.length - 1];
+  const rec = claudeBase(c, th, "system", th.clock);
+  rec.subtype = "compact_boundary";
+  rec.parentUuid = null;
+  rec.logicalParentUuid = last ? last.uuid : null;
+  rec.content = "synthetic-compact";
+  const meta: Obj = { trigger: "auto", preTokens: pre, postTokens: post };
+  if (bad) {
+    used(c, "c_compact_range");
+    meta[which ? "preTokens" : "postTokens"] = RANGE_BAD[Math.floor(badPick * RANGE_BAD.length)];
+  }
+  rec.compactMetadata = meta;
+  th.records.push(rec);
+}
+
 function newThread(c: Ctx, sessionId: string, agentId: string | null, startMs: number, version: string): ClaudeThread {
   return { sessionId, agentId, records: [], clock: startMs, version, byRequest: new Map() };
 }
@@ -722,6 +829,8 @@ function genClaudeSession(c: Ctx, idx: number): ClaudeSessionOut {
     if (r.chance(k.c_other_records)) claudeOther(c, main);
   }
   while (nextTool < agentToolIds.length) nextTool++;
+  claudeCostState(c, main);
+  claudeCompact(c, main);
   // subagents
   for (let a = 0; a < wantAgent; a++) {
     const agentId = nextId(c, "agent");
@@ -802,6 +911,7 @@ function claudeFiles(c: Ctx, sessions: readonly ClaudeSessionOut[]): void {
       garbage = true;
       lines.splice(r.int(0, lines.length), 0, r.pick(["not json at all", '{"type":"assistant","message":', "}{", "\u0000"]));
     }
+    blankLines(c, lines);
     let body = lines.join("\n") + "\n";
     if (r.chance(k.c_truncated_tail)) {
       used(c, "c_truncated_tail");
@@ -833,6 +943,32 @@ function claudeFiles(c: Ctx, sessions: readonly ClaudeSessionOut[]): void {
       if (run.journal !== null) c.files.push({ path: `${base}/subagents/workflows/wf_${run.runId}/journal.jsonl`, content: run.journal, mtimeMs: OLD_MTIME_MS });
     }
   }
+  strayClaudeSidecars(c, sessions);
+}
+
+/** Sidecars in places no reader looks at. Constant draws. */
+function strayClaudeSidecars(c: Ctx, sessions: readonly ClaudeSessionOut[]): void {
+  const r = c.r;
+  const hit = c.r.chance(c.k.c_stray_sidecar);
+  const pick = r.int(0, 5);
+  const s = sessions[r.int(0, sessions.length - 1)];
+  if (!hit || !s) return;
+  used(c, "c_stray_sidecar");
+  const base = `projects/${s.proj}/${s.sessionId}`;
+  const nl = "\n";
+  const meta = JSON.stringify({ toolUseId: "synthetic-toolu-stray", agentType: "general-purpose" }) + nl;
+  const run = JSON.stringify({ runId: "stray", status: "completed" }) + nl;
+  const row = JSON.stringify({ type: "agent_started", agentId: "synthetic-agent-stray" }) + nl;
+  const files: Array<[string, string]> = [
+    [`projects/${s.proj}/agent-synthetic-agent-stray.meta.json`, meta],
+    [`${base}/subagents/extra/agent-synthetic-agent-stray.meta.json`, meta],
+    [`${base}/workflows/wf_stray/wf_stray.json`, run],
+    [`${base}/journal.jsonl`, row],
+    [`${base}/subagents/agent-synthetic-agent-stray.prefix.json`, JSON.stringify({ state: { model: "claude-opus-5-5" } }) + nl],
+    [`${base}/subagents/workflows/journal.jsonl`, row],
+  ];
+  const [path, content] = files[pick]!;
+  c.files.push({ path, content, mtimeMs: OLD_MTIME_MS });
 }
 
 function genClaude(c: Ctx): void {
@@ -1227,6 +1363,19 @@ function mutateCodex(c: Ctx, threads: CxThread[]): void {
   for (const [th, arr] of extraByThread) th.lines.push(...arr);
   // 3. unknown record type, stream conflicts
   for (const th of threads) {
+    const dupMeta = r.chance(k.x_dup_meta);
+    const dupMetaSrc = r.chance(0.5);
+    if (dupMeta) {
+      const first = th.lines.find((l) => l.type === "session_meta");
+      if (first) {
+        used(c, "x_dup_meta");
+        const p2: Obj = structuredClone(first.payload);
+        p2.thread_source = dupMetaSrc ? "automation" : "user";
+        if (p2.thread_source === first.payload.thread_source) delete p2.thread_source;
+        const dup: CxLine = { type: "session_meta", ordinal: first.ordinal, ms: first.ms, payload: p2 };
+        th.lines.push(dup);
+      }
+    }
     if (r.chance(0.05)) th.lines.push({ type: "mystery", ordinal: th.ordinal++, timestamp: new Date(th.clock).toISOString(), payload: { model: "synthetic", cli_version: "synthetic" }, ms: th.clock });
     if (r.chance(k.x_stream_conflict)) {
       used(c, "x_stream_conflict");
@@ -1260,6 +1409,7 @@ function codexFiles(c: Ctx, threads: CxThread[]): void {
       garbage = true;
       lines.splice(r.int(0, lines.length), 0, r.pick(["not json at all", '{"type":"token_usage_record","payload":', "}{"]));
     }
+    blankLines(c, lines);
     let splits: number[] = [];
     if (r.chance(k.x_split_file) && lines.length > 2) {
       used(c, "x_split_file");

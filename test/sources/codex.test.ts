@@ -552,7 +552,7 @@ describe("accounting (R2.6 to R2.9)", () => {
     ]);
     const r = await run([f]);
     assert.equal(byKey(r, "r1").exclusion, "usage_incomplete");
-    assert.equal(r.coverage.records_usage_unmappable, 1);
+    assert.equal(r.coverage.records_usage_unmappable, 0); // S12.0: a bad timestamp alone is usage_incomplete (R2.12), not unmappable
     assert.equal(r.streams[0]!.ordinal_verified, false);
     assert.deepEqual(reasonList(r, "th-bt"), ["ordinal_unverified", "request_anomaly"]); // R4.12, R2.12
   });
@@ -2314,7 +2314,7 @@ describe("revision 11 decisions", () => {
     assert.ok(!clean.assumptions.includes("unverified_version"));
   });
 
-  it("R2.13: a usage record without a thread_id counts as usage-bearing and unkeyed, not unmappable, and taints every Codex chain", async () => {
+  it("R2.13: a usage record without a thread_id counts as usage-bearing, unkeyed and (S12.0, incomplete) unmappable, and taints every Codex chain", async () => {
     const f = raw("nothr", [
       ln("session_meta", 0, 0, metaP("th-k")),
       ln("token_usage_record", 1, 1, turP("rk", "th-k", "T", usageP(10, 0, 0, 1, 0))),
@@ -2324,7 +2324,7 @@ describe("revision 11 decisions", () => {
     const r = await run([f]);
     assert.equal(r.coverage.records_usage_bearing, 2);
     assert.equal(r.coverage.records_unkeyed, 1);
-    assert.equal(r.coverage.records_usage_unmappable, 0);
+    assert.equal(r.coverage.records_usage_unmappable, 1); // S12.0: chainless records are counted too
     assert.deepEqual(namesOf(r, "unattributed_record"), ["provider"]);
     assert.deepEqual(reasonList(r, "th-k"), ["unattributed_record"]);
     assert.deepEqual(r.excluded, []);

@@ -145,7 +145,9 @@ describe("R17.3 drift and the coverage counters follow the window", () => {
   it("anomalies before the window do not close the headline of a clean window", async () => {
     const all = await report(rangeThenGood());
     assert.equal(all.view.headline_status, "withheld");
-    assert.equal(all.view.withheld_reason, "drift_invariant");
+    // S12.0: a range-failed record is unmappable too, so drift_unmappable (first in code order) closes it next to drift_invariant
+    assert.equal(all.view.withheld_reason, "drift_unmappable");
+    assert.ok(all.view.drift.some((x) => x.provider === "claude" && x.code === "drift_invariant" && x.tripped));
     const win = await report(rangeThenGood(), "2026-01-05");
     assert.equal(win.view.headline_status, "ok");
     const c = win.view.coverage_by_provider.claude;
@@ -169,7 +171,8 @@ describe("R17.3 drift and the coverage counters follow the window", () => {
     s.main.request({ requestId: "ok", usage: { input: 5, output: 10 }, dtMs: 10 * DAY });
     const win = await report(p.files(), "2026-01-05");
     assert.equal(win.view.coverage_by_provider.claude.responses_total, 2);
-    assert.equal(win.view.coverage_by_provider.claude.records_usage_unmappable, 1);
+    assert.equal(win.view.coverage_by_provider.claude.records_usage_unmappable, 0); // S12.0: a bad timestamp alone is usage_incomplete (R2.12), not unmappable
+    assert.ok(win.view.coverage_by_provider.claude.tokens_in_incomplete_responses > 0n); // the request is usage_incomplete
   });
 });
 

@@ -677,17 +677,18 @@ describe("R3.9 revision 11.1: tokens_unpriced_by_reason", () => {
     );
   });
 
-  it("the reason list is limited to four, drops zero reasons and orders equal amounts by the enum order", () => {
+  it("the reason list has every non-zero reason, largest first, equal amounts in the enum order (R3.9)", () => {
     const zero = Object.fromEntries(UNPRICED_TOKEN_REASONS.map((k) => [k, 0n])) as Record<(typeof UNPRICED_TOKEN_REASONS)[number], bigint>;
     const totals = (by: Partial<typeof zero>, unpriced: bigint, total: bigint): ProviderTotals =>
       ({ tokens_total: total, tokens_unpriced: unpriced, tokens_unpriced_by_reason: { ...zero, ...by } }) as unknown as ProviderTotals;
     const line = pricedShareLine(
       totals({ modifier_unverified: 100n, speed_other: 100n, unknown_model: 100n, chain_tainted: 50n, geo_other: 10n, tier_unverified: 5n }, 365n, 1000n),
     );
-    // equal amounts (100) in enum order: unknown_model, speed_other, modifier_unverified; then chain_tainted 50; geo_other is cut
+    // equal amounts (100) in enum order: unknown_model, speed_other, modifier_unverified; then chain_tainted 50, geo_other 10,
+    // tier_unverified 5: no cap
     assert.equal(
       line,
-      "  Priced share: 63.5% of tokens (635 of 1,000); unpriced by reason: unknown_model 10.0% (100), speed_other 10.0% (100), modifier_unverified 10.0% (100), chain_tainted 5.0% (50).",
+      "  Priced share: 63.5% of tokens (635 of 1,000); unpriced by reason: unknown_model 10.0% (100), speed_other 10.0% (100), modifier_unverified 10.0% (100), chain_tainted 5.0% (50), geo_other 1.0% (10), tier_unverified 0.5% (5).",
     );
     assert.equal(pricedShareLine(totals({}, 0n, 1000n)), "  Priced share: 100.0% of tokens (1,000 of 1,000); no unpriced tokens.");
     assert.equal(pricedShareLine(totals({}, 0n, 0n)), "  Priced share: n/a of tokens (0 of 0); no unpriced tokens.");

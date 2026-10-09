@@ -139,6 +139,15 @@ export interface RecomputeTaintCoverage {
   tokens_in_incomplete_by_field: Record<string, string>;
   /** S6.1: every conflict code of a request counted once per code, conflict_diagnostics included. */
   requests_conflict_by_kind: Record<string, number>;
+  /** S12.0 and R17.6 counters (ledger counters are windowed, S12.1). */
+  records_usage_bearing: number;
+  records_usage_unmappable: number;
+  fields_range_failed: number;
+  requests_total: number;
+  requests_priced: number;
+  requests_unknown_model: number;
+  lines_duplicate_collapsed: number;
+  duplicate_records_collapsed: number;
 }
 
 export interface RecomputeResult {

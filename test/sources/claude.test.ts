@@ -439,7 +439,7 @@ describe("more copy-selection edge cases", () => {
     (a.records[0] as ClaudeRecord).timestamp = "yesterday";
     const res = await parseClaude(await load(p.files()));
     assert.equal(one(res, "r1").exclusion, "usage_incomplete");
-    assert.equal(res.coverage.records_usage_unmappable, 1);
+    assert.equal(res.coverage.records_usage_unmappable, 0); // S12.0: a bad timestamp alone is usage_incomplete (R2.12), not unmappable
   });
 
   test("copies of one key in a supported and an unverified version: the key is unverified and not accounted (R15.7, R0.9)", async () => {
@@ -511,7 +511,7 @@ describe("retries, errors, unkeyed (R2.13, R2.14, R4.5)", () => {
     assert.deepEqual(res.responses.map((r) => r.key), ["ok"]);
     assert.equal(res.coverage.api_error_records, 1);
     assert.deepEqual(res.excluded.map((e) => e.reason), ["api_error"]);
-    assert.equal(res.coverage.records_usage_bearing, 1, "an error record is not usage bearing");
+    assert.equal(res.coverage.records_usage_bearing, 1, "an error record is not usage bearing (S12.0)");
   });
 
   test("a record without requestId is unkeyed: counted, excluded, never in totals (R2.13)", async () => {

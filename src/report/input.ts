@@ -5,6 +5,7 @@
 // Scan-wide versus printed (R5.9): coverage, taint counters, drift and the taint warning are computed over every
 // counted response of the scan. `--agent` and `--project` (the `ReportFilter`) narrow only `totals` and the headline
 // figures, so a filter never changes a share or hides a tainted chain.
+import { msToNs, windowContainsNs } from "../window.js";
 import { countedResponseIndices } from "../graph/index.js";
 import {
   ASSUMPTIONS,
@@ -251,7 +252,8 @@ export const buildReportInput = (args: ReportBuildArgs, filter: ReportFilter = A
     // Baseline: owner responses before the window (R5.10).
     for (let i = 0; i < graph.responses.length; i++) {
       const r = graph.responses[i] as Response;
-      if (r.exclusion === null && r.ownership.role === "owner" && r.time.event_ms < win.since_ms && keep(r)) prov[r.provider].baseline++;
+      // S7.1, S12.5: before `since`, compared on the exact instant (BigInt)
+      if (r.exclusion === null && r.ownership.role === "owner" && (r.time.event_ns ?? msToNs(r.time.event_ms)) < msToNs(win.since_ms) && keep(r)) prov[r.provider].baseline++;
     }
     for (const i of counted) {
       const r = graph.responses[i] as Response;
@@ -326,7 +328,9 @@ export const buildReportInput = (args: ReportBuildArgs, filter: ReportFilter = A
     for (const x of parsed) {
       if (x.provider !== p) continue;
       for (const e of x.ledger) {
-        if (e.t_ms !== null && (e.t_ms < win.since_ms || e.t_ms >= win.until_ms)) continue;
+        // S7.1: an entry with a known instant is in the window iff since * 10^6 <= t < until * 10^6 (BigInt)
+        const tNs = e.t_ns !== undefined ? e.t_ns : e.t_ms === null ? null : msToNs(e.t_ms);
+        if (tNs !== null && !windowContainsNs(win, tNs)) continue;
         if (e.chain !== null && chainsOf.get(e.chain)?.live === true) continue;
         for (const f of LEDGER_COUNT_FIELDS) c[f] += e.n[f] ?? 0;
         if (e.conflict_kinds !== undefined) for (const k of e.conflict_kinds) c.requests_conflict_by_kind[k] += 1;
@@ -421,7 +425,15 @@ export const buildReportInput = (args: ReportBuildArgs, filter: ReportFilter = A
   const cx = shown.codex;
   const zeroBoundaries = {} as Record<BoundaryType, number>;
   for (const b of ["model_switch", "context_reset", "subagent_cold_start", "fork_inherit", "first_observation"] as const) zeroBoundaries[b] = 0;
-  const tokensTotalAll = tokensTotal(cl.all) + tokensTotal(cx.all);
+  // R16.5 revision 11.1: with one provider closed (`partial`), the headline lines carry the figures of the open provider
+  // only; the closed provider's tokens stay in its own totals block.
+  const inHead = (p: Provider): boolean => headlineStatus !== "partial" || withheldBy[p] === null;
+  const hc = inHead("claude");
+  const hx = inHead("codex");
+  const zeroAcc = newAcc();
+  const hcl = hc ? cl.all : zeroAcc;
+  const hcx = hx ? cx.all : zeroAcc;
+  const tokensTotalAll = tokensTotal(hcl) + tokensTotal(hcx);
   // The headline dollar figure sums the open providers only (R17.3 revision 11.1); a closed provider adds none.
   const openPriced = (p: Provider): number => (withheldBy[p] === null ? shown[p].all.priced : 0);
   const usdAll = openPriced("claude") + openPriced("codex") > 0 ? (withheldBy.claude === null ? cl.all.usd : 0n) + (withheldBy.codex === null ? cx.all.usd : 0n) : null;
@@ -445,27 +457,27 @@ export const buildReportInput = (args: ReportBuildArgs, filter: ReportFilter = A
   const taintBy: HeadlineFigures["taint_by_provider"] = { claude: taintFor("claude"), codex: taintFor("codex") };
 
   const headline: HeadlineFigures = {
-    n_total: cl.all.responses + cx.all.responses,
-    n_main: cl.byKind.main,
-    n_sub: cl.byKind.subagent,
-    n_wf: cl.byKind.workflow_agent,
-    n_cx: cx.all.responses,
-    cache_read: cl.all.tokens.cache_read + cx.all.tokens.cache_read,
-    total_input: cl.all.total_input + cx.all.total_input,
+    n_total: hcl.responses + hcx.responses,
+    n_main: hc ? cl.byKind.main : 0,
+    n_sub: hc ? cl.byKind.subagent : 0,
+    n_wf: hc ? cl.byKind.workflow_agent : 0,
+    n_cx: hcx.responses,
+    cache_read: hcl.tokens.cache_read + hcx.tokens.cache_read,
+    total_input: hcl.total_input + hcx.total_input,
     by_provider: {
       claude: { cache_read: cl.all.tokens.cache_read, total_input: cl.all.total_input },
       codex: { cache_read: cx.all.tokens.cache_read, total_input: cx.all.total_input },
     },
     usd_pico: usdAll,
-    n_priced: cl.all.priced + cx.all.priced,
-    tokens_unpriced: cl.all.tokens_unpriced + cx.all.tokens_unpriced,
+    n_priced: hcl.priced + hcx.priced,
+    tokens_unpriced: hcl.tokens_unpriced + hcx.tokens_unpriced,
     tokens_total: tokensTotalAll,
     // R3.9 with C24 = 1/10: tokens_unpriced > C24 * total_tokens  <=>  10 * unpriced > total
     partial_by_provider: {
       claude: 10n * cl.all.tokens_unpriced > tokensTotal(cl.all),
       codex: 10n * cx.all.tokens_unpriced > tokensTotal(cx.all),
     },
-    output_unknown: cl.all.output_unknown + cx.all.output_unknown,
+    output_unknown: hcl.output_unknown + hcx.output_unknown,
     taint_by_provider: taintBy,
     // Sections 7 to 11 are not computed in G1: the event fields stay at zero.
     boundaries: zeroBoundaries,

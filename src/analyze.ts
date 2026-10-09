@@ -22,7 +22,7 @@ import { loadDefaultPriceBook, priceResponse } from "./pricing/index.js";
 import type { ReportFilter } from "./report/input.js";
 import { parseClaude } from "./sources/claude.js";
 import { parseCodex } from "./sources/codex.js";
-import { resolveWindow } from "./window.js";
+import { msToNs, nsToMs, resolveWindow } from "./window.js";
 
 export interface AnalyzeOptions {
   /** `--since` / `--until` texts (R5.9). Without `since` the window starts at the first event of the scan. */
@@ -89,9 +89,15 @@ export async function analyze(files: readonly DiscoveredFile[], opts: AnalyzeOpt
   if (window === null) {
     // R5.9: the first event of the scan. A record or response without a parsed timestamp has no event time (the
     // placeholder 0 of an excluded response is not one), so only entries with a known time count.
-    let earliest: number | null = null;
-    for (const p of parsed) for (const e of p.ledger) if (e.t_ms !== null && (earliest === null || e.t_ms < earliest)) earliest = e.t_ms;
-    window = resolveWindow({ until: opts.until }, opts.now_ms, earliest);
+    let earliestNs: bigint | null = null;
+    for (const p of parsed) {
+      for (const e of p.ledger) {
+        const t = e.t_ns !== undefined ? e.t_ns : e.t_ms === null ? null : msToNs(e.t_ms);
+        if (t !== null && (earliestNs === null || t < earliestNs)) earliestNs = t;
+      }
+    }
+    // the window bounds are milliseconds: the floor of the first instant keeps it inside [since, until)
+    window = resolveWindow({ until: opts.until }, opts.now_ms, earliestNs === null ? null : nsToMs(earliestNs));
     if (window === null) throw new WindowError("E_BAD_WINDOW");
   }
 

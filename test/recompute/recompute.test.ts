@@ -1536,7 +1536,7 @@ const PHYSICAL = new Set([
   "files_total", "files_assigned_by_stream", "files_unassigned_stream", "files_stream_conflict", "files_copy_exposed",
   "files_unreadable", "files_without_response_id", "token_count_events_without_response_id", "lines_total",
   "lines_parse_error", "lines_truncated_tail", "known_type_count", "unlisted_type_count", "lines_unverified_version",
-  "sidecar_files", "sidecar_files_unparsed",
+  "sidecar_files", "sidecar_files_unparsed", "lines_duplicate_collapsed", "duplicate_records_collapsed",
 ]);
 
 /** The semantic output (R4.10): totals, responses and the logical coverage counters. */
@@ -2130,7 +2130,7 @@ describe("recompute: structure, robustness, privacy", () => {
     assert.equal(c.by_kind["workflow_agent"]?.responses, 2);
   });
 
-  it("tolerates BOM, CRLF, blank lines, garbage lines and a truncated tail without keeping error text (R1.3)", () => {
+  it("tolerates BOM, CRLF, counts blank lines as parse errors, garbage lines and a truncated tail without keeping error text (R1.3)", () => {
     const { p, m } = claudeSession();
     m.request({ usage: { input: 5, write5m: 100, output: 10 } });
     const f = p.files()[0]!;
@@ -2138,7 +2138,7 @@ describe("recompute: structure, robustness, privacy", () => {
     const content = "﻿" + text + "\r\n\r\nnot json at all\r\n" + '{"type":"assistant","message":{"usage":{"input_tok';
     const r = run([{ ...f, content }]);
     assert.equal(r.providers.claude.totals.responses, 1);
-    assert.equal(r.coverage.claude["lines_parse_error"], 1);
+    assert.equal(r.coverage.claude["lines_parse_error"], 3, "S12.6: two blank terminated lines and the garbage line");
     assert.equal(r.coverage.claude["lines_truncated_tail"], 1);
     assert.equal(JSON.stringify(toJson(r, { perResponse: true })).includes("not json"), false);
   });

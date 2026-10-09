@@ -1081,3 +1081,304 @@ describe("S12.7: model rows of the totals", () => {
     assert.deepEqual(Object.keys(x.providers.codex.by_model), ["model_unknown"]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Checklist revision 3: S8.5a (table at load), R1.3 blank lines, S10.3 set, S12.0, S12.6a, S5.1, S10.1
+// ---------------------------------------------------------------------------
+
+describe("S8.5a: the whole table is validated at load time", () => {
+  const entryWith = (over: Obj): Obj => claudeEntry("claude-sonnet-5-5", SONNET, over);
+  const unused = (e: Obj): Obj => makeTable({}, [claudeEntry("claude-sonnet-5-5", SONNET), { ...claudeEntry("claude-unused-9", row("1", "2", "3", "4", "5")), ...e }]);
+  const load = (table: Obj) => () => recomputeFiles([], { table, runStartMs: RUN });
+
+  it("a number, an array or a string of another form in any price row of any entry makes the table malformed", () => {
+    const bad: Array<[string, Obj]> = [
+      ["number input", { prices_usd_per_mtok: { ...row("1", "2", "3", "4", "5"), input: 3 } }],
+      ["array price", { prices_usd_per_mtok: { ...row("1", "2", "3", "4", "5"), output: ["1"] } }],
+      ["leading zero", { prices_usd_per_mtok: { ...row("1", "2", "3", "4", "5"), cache_read: "05" } }],
+      ["7 fraction digits", { prices_usd_per_mtok: { ...row("1", "2", "3", "4", "5"), cache_read: "0.1234567" } }],
+      ["empty", { prices_usd_per_mtok: { ...row("1", "2", "3", "4", "5"), input: "" } }],
+      ["negative", { prices_usd_per_mtok: { ...row("1", "2", "3", "4", "5"), input: "-1" } }],
+      ["fast row", { fast: { prices_usd_per_mtok: { ...row("1", "2", "3", "4", "5"), output: 2 }, verified: false } }],
+      ["tiers.high", { tiers: { split_tokens: 1, high: { ...row("1", "2", "3", "4", "5"), input: 1 }, verified: false } }],
+      ["long_context", { long_context: { prices_usd_per_mtok: { input: "1", output: 2 }, verified: false } }],
+      ["service_tier row", { service_tier: { batch: { prices_usd_per_mtok: { ...row("1", "2", "3", "4", "5"), input: 1 }, verified: false } } }],
+    ];
+    for (const [name, e] of bad) assert.throws(load(unused(e)), /table_malformed/, name);
+    // the entry is not used by any response and not verified: it still fails the load
+    assert.doesNotThrow(load(unused({})), "control");
+    assert.doesNotThrow(load(unused({ prices_usd_per_mtok: { input: "1", output: "2", cache_read: "0", cache_write_5m: "0.5", cache_write_1h: null } })), "null is n/a");
+  });
+
+  it("two entries with the same normalized model id make the table malformed", () => {
+    const dup = makeTable({}, [claudeEntry("claude-sonnet-5-5", SONNET), claudeEntry("claude-sonnet-5-5-20260101", SONNET)]);
+    assert.throws(load(dup), /table_malformed/);
+    const same = makeTable({}, [{ ...claudeEntry("claude-sonnet-5-5", SONNET), model_ids: ["claude-sonnet-5-5", "claude-sonnet-5-5-20260101"] }]);
+    assert.doesNotThrow(load(same), "one entry, two spellings of one id");
+  });
+
+  it("an entry is used only for its own provider", () => {
+    const table = makeTable({}, [
+      { ...claudeEntry("claude-sonnet-5-5", SONNET), provider: "openai" },
+      { ...gptEntry("gpt-6-sol", { input: "2", cached_input: "0.2", cache_write: "2.5", output: "10" }, null), provider: "anthropic" },
+    ]);
+    const c = recomputeFiles([mainFile("s1", [copy({})])], { table, runStartMs: RUN });
+    assert.equal(rowOf(c, "claude:synthetic-r1").unpriced_reason, "unknown_model");
+    const x = recomputeFiles([xfile("pv", [xmeta("synthetic-tp"), xturn("tn", "gpt-6-sol", 1, 1), xtur("x", "synthetic-tp", "tn", 2, 2)])], { table, runStartMs: RUN, codexTierForTest: "standard" });
+    assert.equal(rowOf(x, "codex:x").unpriced_reason, "unknown_model");
+  });
+});
+
+describe("R1.3, S12.6: blank lines", () => {
+  const ok = () => jsonl([copy({})]);
+  const run1 = (content: string) => run([{ path: "projects/p/s.jsonl", content }]);
+
+  it("a blank or whitespace-only terminated line is a parse error and taints the chains of the file", () => {
+    const r = run1(ok() + "\n   \n\t\n");
+    const c = cov(r, "claude");
+    assert.equal(c.lines_parse_error, 3);
+    assert.equal(c.lines_total, 4);
+    assert.ok(c.chains_tainted_by_reason.unparsed_line >= 1);
+    assert.equal(cov(run1(ok()), "claude").lines_parse_error, 0);
+    // CRLF terminated blank line
+    assert.equal(cov(run1(ok().replace(/\n/g, "\r\n") + "\r\n"), "claude").lines_parse_error, 1);
+  });
+
+  it("only an unterminated last line that is empty after removing a BOM and a CR is not a line", () => {
+    assert.equal(cov(run1(ok() + "\r"), "claude").lines_total, 1, "a lone CR at the end");
+    assert.equal(cov(run1("﻿" + ok()), "claude").lines_total, 1, "BOM");
+    assert.equal(cov(run1("﻿"), "claude").lines_total, 0, "a file of a BOM");
+    const sp = cov(run1(ok() + "  "), "claude");
+    assert.equal(sp.lines_total, 2, "spaces are a line");
+    assert.equal(sp.lines_truncated_tail, 1);
+    assert.equal(cov(run1(""), "claude").lines_total, 0);
+  });
+
+  it("the same rule holds for Codex logs and journals", () => {
+    const x = jsonl([xmeta("synthetic-tb"), xturn("tn", "gpt-6-sol", 1, 1), xtur("x", "synthetic-tb", "tn", 2, 2)]);
+    const r = run([{ path: "sessions/2026/01/02/rollout-b.jsonl", content: x + "\n \n" }]);
+    assert.equal(cov(r, "codex").lines_parse_error, 2);
+    assert.ok(cov(r, "codex").chains_tainted_by_reason.unparsed_line >= 1);
+    const j = run([mainFile("ss", [copy({ sess: "ss" })]), { path: "projects/p/ss/subagents/workflows/wf_r/journal.jsonl", content: '{"type":"started"}\n\n' }]);
+    assert.equal(cov(j, "claude").lines_parse_error, 1);
+  });
+});
+
+describe("S10.3: kind is decided over the set of own session_meta records", () => {
+  it("subagent beats helper beats classifier beats main, whatever the order of records and files", () => {
+    const m = (src: string, ord: number, extra: Obj = {}) => xmeta("t-set", { thread_source: src, ...extra }, { ordinal: ord });
+    const sets: Array<[string, Obj[]]> = [
+      ["subagent", [m("automation", 0), m("subagent", 1), m("guardian_review", 2)]],
+      ["subagent", [m("automation", 0), m("user", 1, { source: { subagent: { thread_spawn: { parent_thread_id: "p", depth: 1 } } } })]],
+      ["helper", [m("guardian_review", 0), m("automation", 1), m("user", 2)]],
+      ["classifier", [m("user", 0), m("guardian_review", 1)]],
+      ["main", [m("user", 0), m("surprise", 1)]],
+    ];
+    for (const [want, metas] of sets) {
+      for (const order of [metas, [...metas].reverse()]) {
+        const r = run([xfile("set", [...order, xturn("tn", "gpt-6-sol", 9, 9), xtur("r-set", "t-set", "tn", 10, 10)])]);
+        assert.equal(rowOf(r, "codex:r-set").kind, want);
+      }
+      // the metas in two files
+      const r2 = run([xfile("seta", [metas[0]!]), xfile("setb", [...metas.slice(1), xturn("tn", "gpt-6-sol", 9, 9), xtur("r-set", "t-set", "tn", 10, 10)])]);
+      assert.equal(rowOf(r2, "codex:r-set").kind, want, "two files");
+    }
+  });
+});
+
+describe("S12.6a, S12.0: cost-state is a known record type; fields_range_failed", () => {
+  const sys = (over: Obj = {}, ts = T(1)) => ({ type: "system", uuid: "sy" + JSON.stringify(over).length, sessionId: "synthetic-s1", timestamp: ts, version: CV, subtype: "compact_boundary", compactMetadata: { trigger: "auto", preTokens: 100, postTokens: 10, ...over } });
+  const cost = (mu: Obj, ts: unknown = T(1)): Obj => ({ type: "cost-state", timestamp: ts, modelUsage: mu });
+
+  it("cost-state counts as a known type and names no chain (no unattributed_record)", () => {
+    const r = run([mainFile("s1", [copy({}), cost({ "claude-sonnet-5-5": { inputTokens: 5 } })])]);
+    const c = cov(r, "claude");
+    assert.equal(c.known_type_count, 2);
+    assert.equal(c.unlisted_type_count, 0);
+    assert.equal(c.chains_tainted_by_reason.unattributed_record, 0);
+  });
+
+  it("R2.15 non-counter integers that fail the range count once per logical record and field", () => {
+    const diag = (n: unknown) => ({ diagnostics: { cache_miss_reason: { type: "messages_changed", cache_missed_input_tokens: n } } });
+    const a = copy({ req: "ra", mid: "ma", ts: T(1), msg: diag(MAX_SAFE + 2) });
+    const files = [
+      mainFile("s1", [
+        a,
+        a, // the same record again: one logical record
+        sys({ preTokens: -1, postTokens: 1.5 }),
+        sys({ preTokens: "x", postTokens: 5 }, T(2)), // bad is not range
+        cost({ "claude-sonnet-5-5": { inputTokens: 1e300, outputTokens: 5, cacheReadInputTokens: -3, cacheCreationInputTokens: 1.5 }, "claude-opus-5-5": { inputTokens: MAX_SAFE + 1 } }),
+        cost({ "claude-sonnet-5-5": { inputTokens: 1e300, outputTokens: 5, cacheReadInputTokens: -3, cacheCreationInputTokens: 1.5 }, "claude-opus-5-5": { inputTokens: MAX_SAFE + 1 } }),
+      ]),
+    ];
+    const c = cov(run(files), "claude");
+    assert.equal(c.fields_range_failed, 1 + 2 + 4, "a fractional member is range too");
+    // windowed by the record's timestamp; a cost-state without a time is in every window
+    const w = cov(run([mainFile("s1", [sys({ preTokens: -1 }, T(5)), sys({ preTokens: -1, postTokens: -1 }, T(40)), cost({ m: { a: -1 } }, null)])], { since: Date.UTC(2026, 0, 1, 0, 0, 10) }), "claude");
+    assert.equal(w.fields_range_failed, 2 + 1);
+    // a failing value does not fail a response
+    const ok = run([mainFile("s1", [a])]);
+    assert.equal(ok.providers.claude.totals.responses, 1);
+    assert.equal(cov(run([xfile("cx", [xmeta("synthetic-tq")])]), "codex").fields_range_failed, 0);
+  });
+});
+
+describe("S12.0, R17.6: record, duplicate and priced counters", () => {
+  it("records_usage_bearing and records_usage_unmappable count logical records, chainless ones included, by event time", () => {
+    const okRec = copy({ req: "ra", mid: "ma", ts: T(1) });
+    const noOut = copy({ req: "rb", mid: "mb", ts: T(2), usage: usage({ output_tokens: undefined }) });
+    const range = copy({ req: "rc", mid: "mc", ts: T(3), usage: usage({ input_tokens: -1 }) });
+    const noUsage = copy({ req: "rd", mid: "md", ts: T(4), usage: null });
+    const chainless = copy({ req: "re", mid: "me", ts: T(5) });
+    delete chainless.sessionId;
+    const files = [mainFile("s1", [okRec, okRec, noOut, range, noUsage, chainless])];
+    const c = cov(run(files), "claude");
+    assert.equal(c.records_usage_bearing, 4);
+    assert.equal(c.records_usage_unmappable, 2);
+    assert.equal(cov(run(files, { since: Date.UTC(2026, 0, 1, 0, 0, 3) }), "claude").records_usage_bearing, 2);
+    // Codex: the six usage integers
+    const head = [xmeta("synthetic-tu"), xturn("tn", "gpt-6-sol", 1, 1)];
+    const good = xtur("g", "synthetic-tu", "tn", 2, 2);
+    const miss = xtur("m", "synthetic-tu", "tn", 3, 3, xusage({ output_tokens: undefined }));
+    const rng = xtur("r", "synthetic-tu", "tn", 4, 4, xusage({ input_tokens: 1.5 }));
+    const none = xtur("n", "synthetic-tu", "tn", 5, 5, null);
+    const orphan = xtur("o", "x", "tn", 6, 6);
+    delete orphan.payload.thread_id;
+    const cx = cov(run([xfile("u", [...head, good, good, miss, rng, none, orphan])]), "codex");
+    assert.equal(cx.records_usage_bearing, 5, "every token_usage_record is usage-bearing; one without a usage object is incomplete (S4.3)");
+    assert.equal(cx.records_usage_unmappable, 3);
+  });
+
+  it("S12.0: API error records (isApiErrorMessage true or model <synthetic>) are not usage-bearing records; a Codex record with a bad timestamp is not unmappable", () => {
+    const err = (uuid: string, extra: Obj) => copy({ uuid, req: null, mid: "me-" + uuid, ts: T(1), usage: usage({ input_tokens: -1 }), extra });
+    const synth = err("e2", {});
+    synth.message.model = "<synthetic>";
+    const files = [mainFile("s1", [err("e1", { isApiErrorMessage: true }), synth, copy({ req: "ok", mid: "m-ok" })])];
+    const c = cov(run(files), "claude");
+    assert.equal(c.api_error_records, 2);
+    assert.equal(c.records_usage_bearing, 1, "only the real request");
+    assert.equal(c.records_usage_unmappable, 0);
+    const x = [xmeta("synthetic-tz"), xturn("tn", "gpt-6-sol", 1, 1), xtur("r1", "synthetic-tz", "tn", 2, 2, xusage(), { timestamp: "bad" })];
+    const cx = cov(run([xfile("z", x)]), "codex");
+    assert.equal(cx.records_usage_bearing, 1);
+    assert.equal(cx.records_usage_unmappable, 0, "R2.12 revision 11.1 makes the response incomplete, not the record unmappable");
+  });
+
+  it("lines_duplicate_collapsed and duplicate_records_collapsed follow the record projection (physical counters)", () => {
+    const a = copy({ req: "ra", mid: "ma" });
+    const sameButRole = JSON.parse(JSON.stringify(a));
+    sameButRole.message.role = "user"; // message.role is not part of an assistant projection (S5.1)
+    const user = (role: string) => ({ type: "user", uuid: "uu", sessionId: "synthetic-s1", timestamp: T(1), version: CV, message: { role, content: "x" } });
+    const other = (extra: Obj) => ({ type: "mystery", ...extra }); // an unlisted type projects to its type alone
+    const files = [mainFile("s1", [a, a, sameButRole, user("user"), user("user"), user("assistant"), other({ x: 1 }), other({ y: 2 }), [1], [2]])];
+    const c = cov(run(files), "claude");
+    assert.equal(c.lines_duplicate_collapsed, 2 + 1 + 1 + 1);
+    assert.equal(c.duplicate_records_collapsed, 1 + 1 + 1 + 1);
+    // Codex
+    const x = [xmeta("synthetic-tv"), xmeta("synthetic-tv"), xturn("tn", "gpt-6-sol", 1, 1), { timestamp: CTS(2), type: "response_item", ordinal: 2, payload: { a: 1 } }, { timestamp: CTS(2), type: "response_item", ordinal: 2, payload: { b: 2 } }];
+    const cx = cov(run([xfile("v", x)]), "codex");
+    assert.equal(cx.lines_duplicate_collapsed, 2);
+    assert.equal(cx.duplicate_records_collapsed, 2);
+  });
+
+  it("requests_with_final_marker, requests_priced and requests_unknown_model are taken over the accounted responses", () => {
+    const fin = copy({ sess: "s1", req: "fin", mid: "m1", ts: T(20) });
+    const noFin = copy({ sess: "s2", req: "nofin", mid: "m2", ts: T(21), usage: usage({}, false) });
+    const unk = copy({ sess: "s3", req: "unk", mid: "m3", ts: T(22), model: "claude-unheard-1" });
+    const early = copy({ sess: "s4", req: "early", mid: "m4", ts: T(1) });
+    const files = [mainFile("s1", [fin]), mainFile("s2", [noFin]), mainFile("s3", [unk]), mainFile("s4", [early])];
+    const c = cov(run(files), "claude");
+    assert.equal(c.requests_with_final_marker, 3);
+    assert.equal(c.requests_priced, 2);
+    assert.equal(c.requests_unknown_model, 1);
+    assert.equal(cov(run(files, { since: Date.UTC(2026, 0, 1, 0, 0, 10) }), "claude").requests_priced, 1);
+    const cx = cov(run([xfile("w", [xmeta("synthetic-tw"), xturn("tn", "gpt-6-sol", 1, 1), xtur("x", "synthetic-tw", "tn", 2, 2)])], { codexTierForTest: "standard" }), "codex");
+    assert.equal(cx.requests_priced, 1);
+    assert.equal(cx.requests_unknown_model, 0);
+  });
+});
+
+describe("S5.1: own-type fields only", () => {
+  it("message.role is not part of an assistant projection; a non-boolean boolean field is `bad`", () => {
+    const mk = (role: unknown, flag: unknown) => {
+      const r = copy({ req: null, mid: "mk", uuid: "uk", usage: usage() });
+      r.message.role = role;
+      if (flag !== undefined) r.isSidechain = flag;
+      return r;
+    };
+    assert.equal(cov(run([mainFile("s1", [mk("assistant", undefined), mk("user", undefined), mk(5, undefined)])]), "claude").records_unkeyed, 1);
+    // bad versus missing versus a boolean
+    assert.equal(cov(run([mainFile("s1", [mk("a", undefined), mk("a", "yes"), mk("a", 1), mk("a", false), mk("a", null)])]), "claude").records_unkeyed, 3);
+    // a non-array iterations is bad; so is iterations[0] that is not an object
+    const it = (v: unknown) => {
+      const r = copy({ req: null, mid: "mk", uuid: "uk", usage: usage({ iterations: v }) });
+      return r;
+    };
+    assert.equal(cov(run([mainFile("s1", [it("x"), it(5), it([5]), it(["y"]), it([{}]), it([]), it(undefined)])]), "claude").records_unkeyed, 3, "bad, an empty member list, missing");
+  });
+});
+
+describe("S10.1: the string `main`, a missing and a bad agentId are all the main chain", () => {
+  it("one chain and kind main, whatever file holds the records", () => {
+    const rec = (agent: unknown, req: string, sec: number) => copy({ sess: "ks", req, mid: "m-" + req, ts: T(sec), agent: agent as string });
+    const files: F[] = [
+      { path: "projects/p/ks.jsonl", content: jsonl([rec(undefined, "r1", 1), rec("main", "r2", 2), rec(5, "r3", 3), rec(null, "r4", 4), rec("", "r5", 5)]) },
+      { path: "projects/p/ks/subagents/agent-a.jsonl", content: jsonl([rec("main", "r6", 6)]) },
+      { path: "projects/p/ks/subagents/workflows/wf_r/agent-w.jsonl", content: jsonl([rec("main", "r7", 7)]) },
+    ];
+    const r = run(files);
+    assert.equal(cov(r, "claude").chains_total, 1);
+    for (const id of ["r1", "r2", "r3", "r4", "r5", "r6", "r7"]) assert.equal(rowOf(r, `claude:${id}`).kind, "main", id);
+    // a real agent id is another chain
+    const r2 = run([...files, { path: "projects/p/ks/subagents/agent-b.jsonl", content: jsonl([rec("b", "r8", 8)]) }]);
+    assert.equal(cov(r2, "claude").chains_total, 2);
+    assert.equal(rowOf(r2, "claude:r8").kind, "subagent");
+  });
+});
+
+describe("S12.6a: discovery layout and sidecar size", () => {
+  const base = [mainFile("ss", [copy({ sess: "ss", req: "r1", mid: "m1" })])];
+  const side = (path: string, content: string): F => ({ path, content });
+
+  it("only the exact layout is discovered; a stray file anywhere else is not", () => {
+    const stray = [
+      side("projects/p/ss/other/agent-a.meta.json", "{}"),
+      side("projects/p/ss/subagents/extra/agent-a.meta.json", "{}"),
+      side("projects/p/ss/subagents/agent-a.txt", "{}"),
+      side("projects/p/ss/workflows/sub/wf_r.json", "{}"),
+      side("projects/p/ss/workflows/run.json", "{}"),
+      side("projects/p/ss/subagents/workflows/wf_r/other.json", "{}"),
+      side("projects/p/ss/subagents/workflows/wf_r/extra/journal.jsonl", "{}\n"),
+      side("projects/p/ss/journal.jsonl", "{}\n"),
+      side("projects/p/ss/subagents/workflows/agent-x.jsonl", jsonl([copy({ sess: "ss", req: "stray", mid: "ms" })])),
+      side("projects/p/ss/extra/agent-x.jsonl", jsonl([copy({ sess: "ss", req: "stray2", mid: "ms2" })])),
+      side("projects/top.jsonl", jsonl([copy({ sess: "top", req: "stray3", mid: "ms3" })])),
+    ];
+    const r = run([...base, ...stray]);
+    assert.equal(cov(r, "claude").files_total, 1);
+    assert.equal(r.providers.claude.totals.responses, 1);
+    // the listed layout is discovered
+    const good = [
+      side("projects/p/ss/subagents/agent-a.meta.json", "{}"),
+      side("projects/p/ss/subagents/agent-a.prefix.json", "{}"),
+      side("projects/p/ss/subagents/workflows/wf_r/agent-w.meta.json", "{}"),
+      side("projects/p/ss/subagents/workflows/wf_r/agent-w.prefix.json", "{}"),
+      side("projects/p/ss/workflows/wf_r.json", "{}"),
+      side("projects/p/ss/subagents/workflows/wf_r/journal.jsonl", "{}\n"),
+    ];
+    assert.equal(cov(run([...base, ...good]), "claude").files_total, 7);
+  });
+
+  it("a JSON sidecar over 8 MiB is unreadable and taints the provider; a smaller one is read", () => {
+    const pad = (n: number) => '{"k":"' + "x".repeat(n) + '"}';
+    const MiB8 = 8 * 1024 * 1024;
+    const big = run([...base, side("projects/p/ss/subagents/agent-a.meta.json", pad(MiB8))]);
+    const c = cov(big, "claude");
+    assert.equal(c.files_unreadable, 1);
+    assert.equal(c.lines_total, 1, "an unreadable file adds no line");
+    assert.ok(c.chains_tainted_by_reason.file_unreadable >= 1);
+    const fit = run([...base, side("projects/p/ss/subagents/agent-a.meta.json", pad(MiB8 - 20))]);
+    assert.equal(cov(fit, "claude").files_unreadable, 0);
+    assert.equal(cov(fit, "claude").lines_total, 2);
+  });
+});

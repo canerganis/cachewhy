@@ -54,7 +54,7 @@ function warningLines(h: HeadlineFigures): string[] {
 
 /**
  * R3.9 revision 11.1: the priced share of tokens and the unpriced tokens by reason, largest first (equal amounts in the
- * fixed enum order of `tokens_unpriced_by_reason`), all non-zero reasons, at most four, each with its share of the
+ * fixed enum order of `tokens_unpriced_by_reason`), every non-zero reason, each with its share of the
  * total tokens. Token facts, not dollars, so a withheld provider prints them too.
  */
 export function pricedShareLine(t: ProviderTotals): string {
@@ -62,8 +62,7 @@ export function pricedShareLine(t: ProviderTotals): string {
   const head = `  Priced share: ${formatPercentBig(priced, t.tokens_total)} of tokens (${formatBig(priced)} of ${formatBig(t.tokens_total)})`;
   const top = UNPRICED_TOKEN_REASONS.map((k, i) => ({ k, i, n: t.tokens_unpriced_by_reason[k] }))
     .filter((x) => x.n > 0n)
-    .sort((a, b) => (a.n === b.n ? a.i - b.i : a.n > b.n ? -1 : 1))
-    .slice(0, 4);
+    .sort((a, b) => (a.n === b.n ? a.i - b.i : a.n > b.n ? -1 : 1));
   if (top.length === 0) return `${head}; no unpriced tokens.`;
   return `${head}; unpriced by reason: ${top.map((x) => `${x.k} ${formatPercentBig(x.n, t.tokens_total)} (${formatBig(x.n)})`).join(", ")}.`;
 }

@@ -178,9 +178,12 @@ describe("summary on the committed synthetic trees", () => {
     const h = input.headline;
     assert.equal(h.n_total, h.n_main + h.n_sub + h.n_wf + h.n_cx);
     assert.equal(input.coverage.requests_priced, input.totals.reduce((a, t) => a + t.requests_priced, 0));
-    // priced + unpriced outcomes partition the counted responses
-    const unpriced = input.coverage.requests_unknown_model + input.coverage.requests_unpriced_modifier;
-    assert.ok(input.coverage.requests_priced + unpriced <= h.n_total);
+    // priced + unpriced outcomes partition the counted responses; the headline counts the open providers only when the
+    // headline is partial (R16.5)
+    const headProviders = (["claude", "codex"] as const).filter((p) => input.headline_status !== "partial" || input.withheld_by_provider[p] === null);
+    const hc = headProviders.map((p) => input.coverage_by_provider[p]);
+    const unpriced = hc.reduce((a, c) => a + c.requests_unknown_model + c.requests_unpriced_modifier, 0);
+    assert.ok(hc.reduce((a, c) => a + c.requests_priced, 0) + unpriced <= h.n_total);
     assert.equal(
       Object.values(input.coverage.requests_unpriced_modifier_by_reason).reduce((a, b) => a + b, 0),
       input.coverage.requests_unpriced_modifier,

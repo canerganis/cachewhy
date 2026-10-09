@@ -493,7 +493,8 @@ interface StreamB {
   tur: Rec[];
   root: string;
   /** The session_meta that describes the thread: an own one, else a copied one (the id is in V(S), so one exists). */
-  pm: MetaF;
+  /** S10.3: the session_metas the described fields are decided over (the own ones, else the copied ones), as a set. */
+  metaSet: MetaF[];
   /** S10.4: the first own session_meta of the id (anywhere in the scan, whatever its file) with a forked_from_id. */
   forkMeta: MetaF | null;
   label: string;
@@ -815,10 +816,9 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
     own.sort(cmpMetaOrder);
     const copies = (metasById.get(id) ?? []).slice().sort(cmpMetaOrder);
     const pool = own.length > 0 ? own : copies;
-    const primary = pool[0] as Rec;
     builds.set(id, {
       id, files: filesOfStream, assigned, own_metas: own, tur: turByThread.get(id) ?? [], root: id,
-      pm: primary.meta as MetaF,
+      metaSet: pool.map((m) => m.meta as MetaF),
       forkMeta: (own.find((m) => (m.meta as MetaF).forked_from_id !== null)?.meta as MetaF | undefined) ?? null,
       label: "unlisted", ord_verified: false, fork: null, tcs: [], tcs_by_turn: new Map(),
       markers: [], single_model: null, start: null, chain: { provider: "codex", root_session: id, thread: id },
@@ -828,7 +828,6 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
   const streamById = builds;
 
   for (const s of streams) {
-    const pm = s.pm;
     const sessionIds = sortedUnique((s.own_metas.length > 0 ? s.own_metas : (metasById.get(s.id) ?? [])).map((m) => (m.meta as MetaF).session_id).filter((x): x is string => x !== null));
     let root = sessionIds[0];
     if (root === undefined) {
@@ -978,7 +977,10 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
       triggers.provider("unattributed_record");
       cov.records_usage_bearing++;
       cov.records_unkeyed++;
-      ledger.push({ ...at(rec.ts), chain: null, n: { records_usage_bearing: 1, records_unkeyed: 1 } });
+      // S12.0: unmappable counts the records that are incomplete or range, chainless ones included
+      const unmapC = tur.u.some(goneCnt) || tur.u.some((x) => x === "range");
+      if (unmapC) cov.records_usage_unmappable++;
+      ledger.push({ ...at(rec.ts), chain: null, n: unmapC ? { records_usage_bearing: 1, records_unkeyed: 1, records_usage_unmappable: 1 } : { records_usage_bearing: 1, records_unkeyed: 1 } });
       continue;
     }
     const stream = streamById.get(tur.thread_id);
@@ -996,7 +998,9 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
     }
     if (tur.response_id === null) {
       cov.records_unkeyed++; // R2.13
-      ledger.push({ ...at(rec.ts), chain: streamChainId, n: { records_usage_bearing: 1, records_unkeyed: 1 } });
+      const unmapK = tur.u.some(goneCnt) || tur.u.some((x) => x === "range"); // S12.0: an unkeyed record can be unmappable too
+      if (unmapK) cov.records_usage_unmappable++;
+      ledger.push({ ...at(rec.ts), chain: streamChainId, n: unmapK ? { records_usage_bearing: 1, records_unkeyed: 1, records_usage_unmappable: 1 } : { records_usage_bearing: 1, records_unkeyed: 1 } });
       triggers.threads("request_anomaly", [tur.thread_id]); // unkeyed with a known chain
       // A record without a valid instant has no place in the chain order (S3.4: never the epoch), so it is not listed.
       if (rec.ts !== null) {
@@ -1004,7 +1008,7 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
       }
       continue;
     }
-    const unmappable = tur.u.some(goneCnt) || rec.ts === null; // R2.12, R17.3 drift_unmappable
+    const unmappable = tur.u.some(goneCnt) || tur.u.some((x) => x === "range"); // S12.0, R17.3 drift_unmappable
     if (unmappable) cov.records_usage_unmappable++;
     ledger.push({ ...at(rec.ts), chain: streamChainId, n: unmappable ? { records_usage_bearing: 1, records_usage_unmappable: 1 } : { records_usage_bearing: 1 } });
     const arr = verifiedKeyed.get(tur.response_id);
@@ -1236,15 +1240,17 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
   const links: Link[] = [];
   for (const s of streams) {
     const kind = kindOf(s);
-    const pm = s.pm;
-    if (kind !== "subagent" && !pm.has_subagent) continue; // R5.6: a source.subagent.other thread is checked for linkage too
+    const d = describe(s.metaSet);
+    if (kind !== "subagent" && !d.hasSubagent) continue; // R5.6: a source.subagent.other thread is checked for linkage too
     let reason: UnlinkedReason | null = null;
     let parent: ChainKey | null = null;
-    if (pm.subagent_other && !pm.has_spawn) reason = "other_source";
-    else if (pm.spawn_parent === null) reason = "no_parent_id"; // R5.6: also thread_source subagent without thread_spawn
-    else if (s.fork !== null && s.fork.from !== pm.spawn_parent) reason = "fork_parent_mismatch";
+    // S10.3: the parent and `other` count only when every record of the set carries the same value.
+    if (d.ptConflict || d.otherConflict) reason = "no_parent_id";
+    else if (d.other && !d.hasSpawn) reason = "other_source";
+    else if (d.pt === null) reason = "no_parent_id"; // R5.6: also thread_source subagent without thread_spawn
+    else if (s.fork !== null && s.fork.from !== d.pt) reason = "fork_parent_mismatch";
     else {
-      const ps = streamById.get(pm.spawn_parent);
+      const ps = streamById.get(d.pt);
       if (ps === undefined) reason = "parent_file_missing";
       else if (ps.root !== s.root) reason = "root_mismatch";
       else parent = ps.chain;
@@ -1255,7 +1261,7 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
       state: reason === null ? "verified" : "unlinked",
       reason,
       parent,
-      depth: pm.spawn_depth,
+      depth: d.depth,
       is_fork: s.fork !== null,
     });
     if (reason === null) cov.links_verified++;
@@ -1472,15 +1478,42 @@ function chainStr(s: StreamB): string {
   return chainKeyOf(s.chain);
 }
 
-/** R5.2 request kind of a Codex chain, from the stream's own session_meta. */
+/** The fields of S10.3, decided over the set of session_metas of a stream (no record, file or line order can matter). */
+function describe(set: readonly MetaF[]): {
+  kind: RequestKind;
+  hasSubagent: boolean;
+  hasSpawn: boolean;
+  pt: string | null;
+  ptConflict: boolean;
+  other: boolean;
+  otherConflict: boolean;
+  depth: number | null;
+} {
+  // R5.2 precedence: subagent (thread_spawn present, or thread_source subagent / agent_created_thread), then helper
+  // (automation), then classifier (guardian_review), then main. `source.subagent.other` alone does not make a subagent
+  // (it only gives the link reason other_source, R5.6), so a guardian_review thread stays a classifier.
+  let kind: RequestKind = "main";
+  if (set.some((m) => m.thread_source === "automation")) kind = "helper";
+  if (set.some((m) => m.thread_source === "guardian_review") && kind === "main") kind = "classifier";
+  if (set.some((m) => m.has_spawn || m.thread_source === "subagent" || m.thread_source === "agent_created_thread")) kind = "subagent";
+  const pts = new Set(set.map((m) => m.spawn_parent));
+  const others = new Set(set.map((m) => m.subagent_other));
+  const depths = new Set(set.map((m) => m.spawn_depth));
+  return {
+    kind,
+    hasSubagent: set.some((m) => m.has_subagent),
+    hasSpawn: set.some((m) => m.has_spawn),
+    pt: pts.size === 1 ? ([...pts][0] as string | null) : null,
+    ptConflict: pts.size > 1,
+    other: others.size === 1 && [...others][0] === true,
+    otherConflict: others.size > 1,
+    depth: depths.size === 1 ? ([...depths][0] as number | null) : null,
+  };
+}
+
+/** R5.2 request kind of a Codex chain (S10.3). */
 function kindOf(s: StreamB): RequestKind {
-  const m = s.pm;
-  // R5.2: thread_spawn present, or thread_source subagent / agent_created_thread. `source.subagent.other` alone does not
-  // make a subagent (it only gives the link reason other_source, R5.6), so a guardian_review thread stays a classifier.
-  if (m.has_spawn || m.thread_source === "subagent" || m.thread_source === "agent_created_thread") return "subagent";
-  if (m.thread_source === "automation") return "helper";
-  if (m.thread_source === "guardian_review") return "classifier";
-  return "main";
+  return describe(s.metaSet).kind;
 }
 
 // Compile-time check that the exported function has the shared interface (src/model/types.ts).

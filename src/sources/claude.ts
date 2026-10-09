@@ -117,9 +117,10 @@ function idProj(v: unknown): string {
   return typeof v === "string" && v.length > 0 ? `s${v}` : "~bad";
 }
 
-/** S5.1: a boolean field is its value or `missing` (absent, null or not a boolean). */
+/** S1.3a: a boolean field is `true` or `false`; absent or null is `missing`; any other value is `bad`. */
 function boolProj(v: unknown): string {
-  return typeof v === "boolean" ? (v ? "t" : "f") : "~missing";
+  if (typeof v === "boolean") return v ? "t" : "f";
+  return v === undefined || v === null ? "~missing" : "~bad";
 }
 
 /**
@@ -295,6 +296,8 @@ function parseAsst(o: Obj, ctx: FileCtx): { a: Asst; proj: unknown[] } {
   const blocks: Array<[string | null, string | null, string | null, string | null]> = [];
   const tools: Array<[string, ToolName]> = [];
   const content = m?.["content"];
+  // S1.3a: `message.content` present and not an array is `bad` (a leading marker; an absent one adds nothing).
+  if (content !== undefined && content !== null && !Array.isArray(content)) blocks.push(["~bad", null, null, null]);
   if (Array.isArray(content)) {
     for (const b of content) {
       if (!isObj(b)) {
@@ -353,8 +356,9 @@ function parseAsst(o: Obj, ctx: FileCtx): { a: Asst; proj: unknown[] } {
     const det = u["output_tokens_details"];
     if (isObj(det)) think = cnt(det["thinking_tokens"]);
     const its = u["iterations"];
+    // S1.3a: `iterations` present and not an array, or `iterations[0]` present and not an object, is `bad`.
     const it0Raw: unknown = Array.isArray(its) ? its[0] : undefined;
-    if (it0Raw !== undefined && it0Raw !== null && !isObj(it0Raw)) iterMembers = "bad";
+    if ((its !== undefined && its !== null && !Array.isArray(its)) || (it0Raw !== undefined && it0Raw !== null && !isObj(it0Raw))) iterMembers = "bad";
     if (isObj(it0Raw)) {
       const it0 = it0Raw;
       iter = {};
@@ -663,6 +667,7 @@ function makeRec(v: unknown, ctx: FileCtx): Rec {
     const role = pick(msg?.["role"], ["user", "assistant"] as const);
     const blocks: unknown[] = [];
     const content = msg?.["content"];
+    if (content !== undefined && content !== null && !Array.isArray(content)) blocks.push(["~bad", null]);
     if (Array.isArray(content)) {
       for (const b of content) {
         if (!isObj(b)) {
@@ -1175,14 +1180,15 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
   sideRes.forEach((res, n) => {
     const i = sidecarIdx[n] as number;
     const f = files[i] as DiscoveredFile;
-    cov.lines_total += 1;
-    fileLines[i] = 1;
     const val = res.ok ? res.value : undefined;
     if (val === undefined || val.state === "unreadable") {
+      // S12.6, S12.6a: an unreadable file (a sidecar over 8 MiB included) counts in files_unreadable and adds no line
       fileUnreadable[i] = true;
       cov.files_unreadable += 1;
       return;
     }
+    cov.lines_total += 1;
+    fileLines[i] = 1;
     if (val.state === "parse_error") {
       cov.lines_parse_error += 1;
       fileUnparsed[i] = 1; // R0.9: a sidecar that fails to parse names no chain, so its taint is provider-wide
@@ -1472,6 +1478,19 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
   };
   // Ledger entry of a record or response at the exact instant `tn`; `t_ms` is its floor (S3.3).
   const at = (tn: bigint | null): { t_ms: number | null; t_ns: bigint | null } => ({ t_ms: msOf(tn), t_ns: tn });
+  // S12.0: a usage-bearing logical record, and one of them that is `incomplete` or `range` (S4.3, and an unusable
+  // timestamp, revision 11.1) is unmappable.
+  const countUsageBearing = (r: Rec, a: Asst, n: { -readonly [K in LedgerCountField]?: number }): void => {
+    cov.records_usage_bearing += 1;
+    n.records_usage_bearing = 1;
+    const gone = (c: Cnt): boolean => c === "missing" || c === "bad";
+    const unmappable =
+      a.rangeFail || a.ccBad || gone(a.i) || gone(a.r) || gone(a.wt) || gone(a.o) || (a.hasCC && (gone(a.w5) || gone(a.w1)));
+    if (unmappable) {
+      cov.records_usage_unmappable += 1;
+      n.records_usage_unmappable = 1;
+    }
+  };
   for (const r of recs) {
     if (r.type === "cost-state") {
       cov.fields_range_failed += r.sideRangeFailed;
@@ -1482,21 +1501,31 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     // (R15.7: every copy of the key decides, whatever the chain of the copy): a copy of an unsupported version
     // makes the key unverified, so a supported peer cannot enter the totals next to it.
     if (!r.hasSid) {
+      // S12.0, S12.3, R2.14: the logical counters count a record whatever its chain key. A chainless record has no chain,
+      // so its ledger entry is never live (S12.1).
+      const recC: { -readonly [K in LedgerCountField]?: number } = {};
+      if (r.graph && r.supported && r.sideRangeFailed > 0) {
+        cov.fields_range_failed += r.sideRangeFailed;
+        recC.fields_range_failed = r.sideRangeFailed;
+      }
       if (r.type === "assistant") {
         const sa = r.a as Asst;
         if (!r.supported) {
           if (!sa.isErr && sa.key !== null) unverifiedKeySet.add(sa.key);
         } else if (sa.isErr) {
-          // R2.14: an API error record is counted whatever its chain key (no chain, so its ledger entry is never live).
           cov.api_error_records += 1;
-          ledger.push({ ...at(r.tn), chain: null, n: { api_error_records: 1 } });
-        } else if (sa.hasUsage && sa.key === null) {
-          // S12.3: a usage-bearing record without a valid key is unkeyed whatever its chain key; one that also lacks a
-          // chain key is `unattributed_record` as well (added above). No chain, so the ledger entry is never live.
-          cov.records_unkeyed += 1;
-          ledger.push({ ...at(r.tn), chain: null, n: { records_unkeyed: 1 } });
+          recC.api_error_records = 1;
+          // S12.0: an API error record is not usage-bearing (it is not a request)
+        } else {
+          if (sa.hasUsage) countUsageBearing(r, sa, recC);
+          if (sa.hasUsage && sa.key === null) {
+            // a usage-bearing record without a valid key is unkeyed; it is `unattributed_record` as well (added above)
+            cov.records_unkeyed += 1;
+            recC.records_unkeyed = 1;
+          }
         }
       }
+      if (Object.keys(recC).length > 0) ledger.push({ ...at(r.tn), chain: null, n: recC });
       continue;
     }
     if (r.type !== "assistant") {
@@ -1524,24 +1553,14 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     if (r.sideRangeFailed > 0) ledger.push({ ...at(r.tn), chain: cidOf(r.S, r.T), n: { fields_range_failed: r.sideRangeFailed } });
     if (a.isErr) {
       cov.api_error_records += 1; // R2.14
-      ledger.push({ ...at(r.tn), chain: cidOf(r.S, r.T), n: { api_error_records: 1 } });
+      ledger.push({ ...at(r.tn), chain: cidOf(r.S, r.T), n: { api_error_records: 1 } }); // S12.0: not usage-bearing
       if (r.tn !== null && chains.has(ck)) {
         excluded.push({ provider: "claude", chain: chainKeyOf(r.S, r.T), reason: "api_error", event_ms: nsToMs(r.tn), event_ns: r.tn, ordinal: null, files: r.files });
       }
       continue;
     }
     const recN: { -readonly [K in LedgerCountField]?: number } = {};
-    if (a.hasUsage) {
-      cov.records_usage_bearing += 1;
-      recN.records_usage_bearing = 1;
-      const gone = (c: Cnt): boolean => c === "missing" || c === "bad";
-      const unmappable =
-        r.tn === null || a.ccBad || gone(a.i) || gone(a.r) || gone(a.wt) || gone(a.o) || (a.hasCC && (gone(a.w5) || gone(a.w1)));
-      if (unmappable) {
-        cov.records_usage_unmappable += 1;
-        recN.records_usage_unmappable = 1;
-      }
-    }
+    if (a.hasUsage) countUsageBearing(r, a, recN);
     if (a.key === null) {
       // R2.13: unkeyed. The chain is known (string sessionId), so it is tainted (R0.9 `request_anomaly`).
       addTrigger("request_anomaly", [cidOf(r.S, r.T)], "chains");
@@ -1589,7 +1608,8 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     cov.responses_total += 1;
     cov.requests_total += 1;
     const keyN: { -readonly [K in LedgerCountField]?: number } = { responses_total: 1 };
-    if (sh.hasFinal) {
+    // S12.0: accounted responses (not excluded) with a final copy.
+    if (sh.hasFinal && sh.exclusion === null) {
       cov.requests_with_final_marker += 1;
       keyN.requests_with_final_marker = 1;
     }

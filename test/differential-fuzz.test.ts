@@ -35,8 +35,8 @@ function describeFailure(label: string, r: SeedResult): string {
   return `[${label}] seed=${r.seed} window=${JSON.stringify(r.window)} tier=${r.tier} diffs=${r.diffs.length} first: ${formatDiff(first)}`;
 }
 
-async function sweep(label: string, profile: Profile, from: number, count: number): Promise<string[]> {
-  const knobs = knobsFor(profile, overrides(), SCALE);
+async function sweep(label: string, profile: Profile, from: number, count: number, extraScale = 1): Promise<string[]> {
+  const knobs = knobsFor(profile, overrides(), SCALE * extraScale);
   const failures: string[] = [];
   let failed = 0;
   for (let seed = from; seed < from + count; seed++) {
@@ -72,6 +72,11 @@ describe("differential fuzz: src/ against scripts/recompute on random synthetic 
 
   it(`${SEEDS} malformed seeds (features and injected defects) agree exactly`, async () => {
     const failures = await sweep("all", "all", 1, SEEDS);
+    assert.equal(failures.length, 0, `\n${failures.join("\n")}`);
+  });
+
+  it(`${Math.min(SEEDS, 150)} dense seeds (all knobs at twice their probability) agree exactly`, async () => {
+    const failures = await sweep("all x2", "all", 5001, Math.min(SEEDS, 150), 2);
     assert.equal(failures.length, 0, `\n${failures.join("\n")}`);
   });
 });

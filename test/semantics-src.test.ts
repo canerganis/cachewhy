@@ -23,6 +23,7 @@ import {
   type UsageBuckets,
 } from "../src/model/types.ts";
 import { DEFAULT_TABLE, PriceTableError, loadPriceBook, priceResponse } from "../src/pricing/index.ts";
+import { CodexHome, CodexThread } from "./fixtures/builder.ts";
 import { parseClaude } from "../src/sources/claude.ts";
 import { parseCodex } from "../src/sources/codex.ts";
 import { msToNs, nsToMs, parseBound, parseInstantNs, resolveWindow, windowContainsNs } from "../src/window.ts";
@@ -1086,42 +1087,70 @@ describe("item 11: replay_requests_excluded counts accounted responses only (S7.
 // Item 12: S10.3
 // ---------------------------------------------------------------------------
 
-describe("item 12: the describing session_meta of a Codex stream (S10.3)", () => {
+describe("item 12: the fields of S10.3 are decided over the set of session_metas of a Codex stream", () => {
   const x = "synthetic-thread-x";
+  const rest = [ctc(t(2), 13, "turn-1"), ctur(t(3), 14, "resp-1", x, "turn-1", cu())];
+  const perms = <T,>(xs: readonly T[]): T[][] => (xs.length <= 1 ? [[...xs]] : xs.flatMap((a, k) => perms(xs.filter((_, m) => m !== k)).map((r) => [a, ...r])));
+  const kinds = async (metas: any[]): Promise<Set<string | undefined>> => {
+    const out = new Set<string | undefined>();
+    for (const order of perms(metas)) out.add((await parseX([xfile(x, [...order, ...rest])])).responses[0]?.kind);
+    return out;
+  };
 
-  it("several own session_metas: the one with the lowest ordinal value describes the stream, not the lowest projection key", async () => {
-    // Same instant, ordinals 5 and 12. Projection keys sort "12" before "5" as text; the ordinal value decides.
-    const m5 = cmeta(x, t(1), 5, { thread_source: "subagent", source: { subagent: { thread_spawn: { parent_thread_id: "synthetic-parent" } } } });
-    const m12 = cmeta(x, t(1), 12, { thread_source: "automation" });
-    for (const order of [[m5, m12], [m12, m5]]) {
-      const res = await parseX([xfile(x, [...order, ctc(t(2), 13, "turn-1"), ctur(t(3), 14, "resp-1", x, "turn-1", cu())])]);
-      assert.equal(res.responses[0]?.kind, "subagent");
-      assert.deepEqual(triggersOf(res, "stream_unresolved"), []); // thread_source is not compared by R4.11
-    }
-    const flipped = cmeta(x, t(1), 5, { thread_source: "automation" });
-    const other = cmeta(x, t(1), 12, { thread_source: "subagent" });
-    const res = await parseX([xfile(x, [flipped, other, ctc(t(2), 13, "turn-1"), ctur(t(3), 14, "resp-1", x, "turn-1", cu())])]);
-    assert.equal(res.responses[0]?.kind, "helper");
+  it("the kind follows the precedence subagent, helper, classifier, main whatever the order of the records", async () => {
+    const sub = cmeta(x, t(1), 5, { thread_source: "subagent" });
+    const auto = cmeta(x, t(1), 12, { thread_source: "automation" });
+    const guard = cmeta(x, t(1), 20, { thread_source: "guardian_review" });
+    const user = cmeta(x, t(1), 21, { thread_source: "user" });
+    assert.deepEqual([...(await kinds([sub, auto]))], ["subagent"]);
+    assert.deepEqual([...(await kinds([auto, guard]))], ["helper"]);
+    assert.deepEqual([...(await kinds([guard, user]))], ["classifier"]);
+    assert.deepEqual([...(await kinds([user, cmeta(x, t(1), 22, {})]))], ["main"]);
+    // a spawn record alone makes a subagent too
+    const spawn = cmeta(x, t(1), 6, { source: { subagent: { thread_spawn: { parent_thread_id: "synthetic-parent" } } } });
+    assert.deepEqual([...(await kinds([spawn, auto]))], ["subagent"]);
   });
 
-  it("equal ordinals fall back to the projection key; a missing ordinal value sorts last", async () => {
-    const withOrd = cmeta(x, t(1), 7, { thread_source: "automation" });
-    const noOrd = cmeta(x, t(1), undefined, { thread_source: "guardian_review" });
-    const res = await parseX([xfile(x, [noOrd, withOrd, ctur(t(3), 14, "resp-1", x, "turn-1", cu())])]);
-    assert.equal(res.responses[0]?.kind, "helper");
+  it("two own metas with equal ordinals, one without a timestamp, give one kind in either order", async () => {
+    const a = cmeta(x, t(1), 5, { thread_source: "automation" });
+    const b = cmeta(x, undefined, 5, { thread_source: "subagent" });
+    assert.deepEqual([...(await kinds([a, b]))], ["subagent"]);
+    const c = cmeta(x, undefined, 5, { thread_source: "guardian_review" });
+    assert.deepEqual([...(await kinds([a, c]))], ["helper"]);
   });
 
-  it("a stream with no own session_meta uses its copied ones in the same order", async () => {
+  it("the link parent counts only when every record of the set carries it: a disagreement is unlinked no_parent_id", async () => {
+    const parent = (id: string | null) => ({ source: { subagent: { thread_spawn: id === null ? {} : { parent_thread_id: id } } }, thread_source: "subagent" });
+    const link = async (a: any, b: any) => {
+      const res = await parseX([xfile(x, [a, b, ...rest])]);
+      return res.links.find((l) => l.chain.thread === x);
+    };
+    const l1 = await link(cmeta(x, t(1), 5, parent("synthetic-parent")), cmeta(x, t(1), 6, parent("synthetic-parent-2")));
+    assert.equal(l1?.reason, "no_parent_id");
+    const l2 = await link(cmeta(x, t(1), 6, parent("synthetic-parent-2")), cmeta(x, t(1), 5, parent("synthetic-parent")));
+    assert.equal(l2?.reason, "no_parent_id");
+    const l3 = await link(cmeta(x, t(1), 5, parent("synthetic-parent")), cmeta(x, t(1), 6, parent(null)));
+    assert.equal(l3?.reason, "no_parent_id");
+    const l4 = await link(cmeta(x, t(1), 5, parent("synthetic-parent")), cmeta(x, t(1), 6, parent("synthetic-parent")));
+    assert.equal(l4?.reason, "parent_file_missing"); // the same parent in both records: decided by the usual rules
+    // source.subagent.other counts only when uniform
+    const other = (o: unknown) => ({ source: { subagent: { other: o } }, thread_source: "subagent" });
+    const l5 = await link(cmeta(x, t(1), 5, other("zzz")), cmeta(x, t(1), 6, other(undefined)));
+    assert.equal(l5?.reason, "no_parent_id");
+  });
+
+  it("a stream with no own session_meta uses its copied ones as a set", async () => {
     const y1 = "synthetic-thread-y1";
     const y2 = "synthetic-thread-y2";
     // Two fork files each carry a copied meta of X (non-own: another meta of the file forks from X). X has records only
-    // as usage in its own file without a meta. Copies: ordinal 12 (automation) and ordinal 5 (subagent).
-    // Ordinals 12 and 5 sort the other way as text (the projection key), so the ordinal value must decide.
+    // as usage in its own file without a meta. Copies: automation and subagent.
     const fork = (id: string, copyOrd: number, src: string) =>
       xfile(id, [cmeta(x, t(1), copyOrd, { thread_source: src }), cmeta(id, t(2), copyOrd + 1, { forked_from_id: x, subagent_history_start_ordinal: copyOrd + 1 })]);
     const own = xfile("x", [ctc(t(3), 0, "turn-1"), ctur(t(4), 1, "resp-1", x, "turn-1", cu())]);
-    const res = await parseX([fork(y1, 12, "automation"), fork(y2, 5, "subagent"), own]);
-    assert.equal(res.responses.find((r) => r.key === "resp-1")?.kind, "subagent");
+    for (const files of [[fork(y1, 12, "automation"), fork(y2, 5, "subagent"), own], [own, fork(y2, 5, "subagent"), fork(y1, 12, "automation")]]) {
+      const res = await parseX(files);
+      assert.equal(res.responses.find((r) => r.key === "resp-1")?.kind, "subagent");
+    }
   });
 });
 
@@ -1412,5 +1441,223 @@ describe("S12.6: workflow agent sidecars are discovered, counted and link nothin
     assert.notEqual(wf?.state, "verified");
     assert.equal(wf?.parent, null);
     assert.equal(res.prefix_hints.length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pre-audit follow-up: S1.3a, S5.1, S10.1, S12.0, S12.6a, S7.1, R3.9, R16.5
+// ---------------------------------------------------------------------------
+
+describe("S1.3a: a boolean holding a non-boolean value, and a container of the wrong shape, are `bad`", () => {
+  const lines = async (...r: any[]): Promise<number> => (await parseC([cfile(SESS, r)])).coverage.lines_duplicate_collapsed;
+  const side = (v: unknown): any => arec({ uuid: "u1", patch: (r) => { if (v !== undefined) r.isSidechain = v; else delete r.isSidechain; } });
+
+  it("isSidechain: absent and null are missing; \"x\" and 5 are both bad and differ from missing and from true", async () => {
+    assert.equal(await lines(side(null), side(undefined)), 1);
+    assert.equal(await lines(side("x"), side(undefined)), 0);
+    assert.equal(await lines(side("x"), side(5)), 1);
+    assert.equal(await lines(side("x"), side(true)), 0);
+  });
+
+  it("isApiErrorMessage and isCompactSummary follow the same rule", async () => {
+    const err = (v: unknown): any => arec({ uuid: "u1", req: null, msg: null, model: "<synthetic>", patch: (r) => { if (v !== undefined) r.isApiErrorMessage = v; } });
+    assert.equal(await lines(err("yes"), err(undefined)), 0);
+    assert.equal(await lines(err("yes"), err(1)), 1);
+    const sum = (v: unknown): any => arec({ uuid: "u1", patch: (r) => { if (v !== undefined) r.isCompactSummary = v; } });
+    assert.equal(await lines(sum({}), sum(undefined)), 0);
+    assert.equal(await lines(sum({}), sum([])), 1);
+  });
+
+  it("iterations present and not an array, or iterations[0] not an object, is bad; absent, null and [] are missing", async () => {
+    const it = (v: unknown): any => arec({ uuid: "u1", usage: ausage(v === undefined ? {} : { iterations: v }) });
+    assert.equal(await lines(it("x"), it(undefined)), 0);
+    assert.equal(await lines(it("x"), it([5])), 1);
+    assert.equal(await lines(it({}), it(["y"])), 1);
+    assert.equal(await lines(it(null), it([])), 1);
+    assert.equal(await lines(it([null]), it(undefined)), 1);
+  });
+
+  it("message.content present and not an array is bad", async () => {
+    const c = (v: unknown): any => arec({ uuid: "u1", patch: (r) => { if (v !== undefined) r.message.content = v; else delete r.message.content; } });
+    assert.equal(await lines(c("x"), c(undefined)), 0);
+    assert.equal(await lines(c("x"), c(5)), 1);
+    assert.equal(await lines(c(null), c(undefined)), 1);
+  });
+});
+
+describe("S10.1: a bad, missing or `main` agentId is the main chain", () => {
+  it("agentId 5, \"\" and \"main\" all name (session, main)", async () => {
+    const rec = (n: number, agent: unknown): any => arec({ uuid: `u${n}`, req: `r${n}`, msg: `m${n}`, patch: (r) => { if (agent !== undefined) r.agentId = agent; } });
+    const res = await parseC([cfile(SESS, [rec(1, 5), rec(2, ""), rec(3, "main"), rec(4, undefined)])]);
+    assert.equal(res.responses.length, 4);
+    assert.ok(res.responses.every((r) => r.chain.thread === "main" && r.kind === "main"));
+    assert.equal(res.streams.length, 1);
+  });
+});
+
+describe("S12.0: usage-bearing logical records, chainless ones included", () => {
+  it("a chainless unkeyed record is usage-bearing too, so records_unkeyed never exceeds records_usage_bearing", async () => {
+    const orphan = arec({ uuid: "u-o", req: null, msg: null, patch: (r) => { delete r.sessionId; } });
+    const res = await parseC([cfile(SESS, [arec({ uuid: "u1" }), orphan])]);
+    assert.equal(res.coverage.records_usage_bearing, 2);
+    assert.equal(res.coverage.records_unkeyed, 1);
+    // a chainless record that carries a usage object but no valid counters is unmappable
+    const bad = arec({ uuid: "u-b", usage: ausage({ output_tokens: undefined }), patch: (r) => { delete r.sessionId; } });
+    const res2 = await parseC([cfile(SESS, [bad])]);
+    assert.equal(res2.coverage.records_usage_bearing, 1);
+    assert.equal(res2.coverage.records_usage_unmappable, 1);
+    assert.equal(res2.ledger.filter((e) => e.chain === null && e.n.records_usage_bearing === 1 && e.n.records_usage_unmappable === 1).length, 1);
+  });
+
+  it("unmappable counts incomplete and range records", async () => {
+    const res = await parseC([
+      cfile(SESS, [
+        arec({ uuid: "u1", req: "r1", msg: "m1" }),
+        arec({ uuid: "u2", req: "r2", msg: "m2", usage: ausage({ input_tokens: -1 }) }),
+        arec({ uuid: "u3", req: "r3", msg: "m3", usage: ausage({ output_tokens: undefined }) }),
+      ]),
+    ]);
+    assert.equal(res.coverage.records_usage_bearing, 3);
+    assert.equal(res.coverage.records_usage_unmappable, 2);
+    const x = "synthetic-thread-x";
+    const cx = await parseX([xfile(x, [cmeta(x, t(1), 0), ctur(t(2), 1, "ra", x, "turn-1", cu({ in: -1 })), ctur(t(3), 2, "rb", x, "turn-1", cu({ out: undefined })), ctur(t(4), 3, "rc", x, "turn-1", cu())])]);
+    assert.equal(cx.coverage.records_usage_bearing, 3);
+    assert.equal(cx.coverage.records_usage_unmappable, 2);
+  });
+
+  it("requests_with_final_marker counts accounted responses with a final copy only", async () => {
+    const res = await parseC([
+      cfile(SESS, [
+        arec({ uuid: "u1", req: "r1", msg: "m1" }),
+        arec({ uuid: "u2", req: "r2", msg: "m2", usage: ausage({ input_tokens: -1 }) }), // final copy, but range failed
+        arec({ uuid: "u3", req: "r3", msg: "m3", usage: ausage({ speed: undefined }) }), // accounted, no final copy
+      ]),
+    ]);
+    assert.equal(res.coverage.requests_with_final_marker, 1);
+    assert.equal(res.ledger.reduce((a, e) => a + (e.n.requests_with_final_marker ?? 0), 0), 1);
+  });
+
+  it("fields_range_failed counts once per logical record and field, chainless records and cost-state members included", async () => {
+    const diag = (over: Record<string, unknown> = {}): any =>
+      arec({ uuid: "u1", patch: (r) => { r.message.diagnostics = { cache_miss_reason: { type: "tools_changed", cache_missed_input_tokens: -1 } }; Object.assign(r, over); } });
+    const dup = await parseC([cfile(SESS, [diag(), diag()])]);
+    assert.equal(dup.coverage.fields_range_failed, 1); // a duplicated line is one logical record
+    const chainless = await parseC([cfile(SESS, [diag({ sessionId: undefined })])]);
+    assert.equal(chainless.coverage.fields_range_failed, 1);
+    assert.equal(chainless.ledger.filter((e) => e.chain === null && e.n.fields_range_failed === 1).length, 1);
+    const cost: any = { type: "cost-state", uuid: "u-c", sessionId: SESS, timestamp: t(3), version: V, modelUsage: { "claude-opus-5-5": { inputTokens: -1, outputTokens: 5, cacheReadInputTokens: 1.5 } } };
+    const c = await parseC([cfile(SESS, [arec({ uuid: "u2" }), cost])]);
+    assert.equal(c.coverage.fields_range_failed, 2);
+    assert.equal(c.coverage.known_type_count, 2); // cost-state is a known record type
+    assert.equal(c.coverage.unlisted_type_count, 0);
+  });
+});
+
+describe("S12.6a: a JSON sidecar over 8 MiB is unreadable", () => {
+  it("exactly 8 MiB is read, one byte more counts in files_unreadable, adds no line and taints the provider", async () => {
+    const MIB8 = 8 * 1024 * 1024;
+    const body = (size: number): string => {
+      const head = '{"toolUseId":"tu-1","pad":"';
+      const tail = '"}';
+      return head + "a".repeat(size - head.length - tail.length) + tail;
+    };
+    const meta = (size: number): TreeFile => ({ path: `projects/synthetic-project/${SESS}/subagents/agent-ag1.meta.json`, content: body(size) });
+    const main = cfile(SESS, [arec({ uuid: "u1" })]);
+    const ok = await parseC([main, meta(MIB8)]);
+    assert.equal(ok.coverage.files_unreadable, 0);
+    assert.equal(ok.coverage.lines_total, 2);
+    const big = await parseC([main, meta(MIB8 + 1)]);
+    assert.equal(big.coverage.files_total, 2);
+    assert.equal(big.coverage.files_unreadable, 1);
+    assert.equal(big.coverage.lines_total, 1);
+    assert.ok(big.integrity.triggers.some((x) => x.reason === "file_unreadable" && x.names === "provider"));
+  });
+});
+
+describe("S7.1: window membership is decided on exact instants", () => {
+  const A = "synthetic-session-a";
+  it("a request one nanosecond before since or at until is out, at since or one nanosecond before until is in", async () => {
+    const win = { since: "2026-01-01T00:00:10Z", until: "2026-01-01T00:00:30Z" };
+    const rq = (n: number, ts: string): any => arec({ uuid: `u${n}`, req: `r${n}`, msg: `m${n}`, ts });
+    const files = [
+      cfile(A, [
+        rq(1, "2026-01-01T00:00:09.999999999Z"),
+        rq(2, "2026-01-01T00:00:10.000000000Z"),
+        rq(3, "2026-01-01T00:00:29.999999999Z"),
+        rq(4, "2026-01-01T00:00:30.000000000Z"),
+        arec({ uuid: "ue1", req: null, msg: null, model: "<synthetic>", usage: null, ts: "2026-01-01T00:00:09.999999999Z" }),
+        arec({ uuid: "ue2", req: null, msg: null, model: "<synthetic>", usage: null, ts: "2026-01-01T00:00:29.999999999Z" }),
+      ]),
+    ];
+    const { view } = await analyzeTree(files, win);
+    const c = view.coverage_by_provider.claude;
+    assert.equal(c.requests_total, 2);
+    assert.equal(c.baseline_requests_loaded, 1);
+    assert.equal(c.api_error_records, 1);
+    // without --since the window starts at the first instant of the scan
+    const open = await analyzeTree(files, { until: "2026-01-01T00:00:30Z" });
+    assert.equal(open.view.coverage_by_provider.claude.requests_total, 3);
+    assert.equal(open.view.coverage_by_provider.claude.baseline_requests_loaded, 0);
+  });
+});
+
+describe("R16.5: a partial headline carries the figures of the open provider only", () => {
+  it("the closed provider's tokens stay in its own totals block", async () => {
+    const home = new CodexHome();
+    const x = new CodexThread({ threadId: "synthetic-thread-x", threadSource: "user", model: "gpt-6-sol" });
+    x.turnContext({ turnId: "Tx" });
+    x.tokenUsage({ responseId: "x1", usage: { input: 1000, output: 10 } });
+    const y = new CodexThread({ threadId: "synthetic-thread-y", threadSource: "user", model: "gpt-6-sol" });
+    y.tokenUsage({ responseId: "x2", usage: { input: 2000, output: 20 }, threadId: "synthetic-thread-x", turnId: "Tx", ordinal: 100, dtMs: 100000 });
+    home.add(x);
+    home.add(y);
+    for (let i = 0; i < 97; i++) {
+      const th = new CodexThread({ threadId: `synthetic-thread-c${String(i).padStart(3, "0")}`, threadSource: "user", model: "gpt-6-sol" });
+      th.turnContext({ turnId: `Tc${i}` });
+      th.tokenUsage({ responseId: `c${i}a`, usage: { input: 1000, output: 10 } });
+      home.add(th);
+    }
+    const codexTree: TreeFile[] = home.files().filter((f) => typeof f.content === "string").map((f) => ({ path: f.path, content: f.content as string }));
+    const { view } = await analyzeTree([cfile(SESS, [arec({ uuid: "u1" }), arec({ uuid: "u2", req: "r2", msg: "m2", ts: "2026-01-01T00:00:02Z" })]), ...codexTree], { since: "2025-01-01", until: "2027-01-01" });
+    assert.equal(view.headline_status, "partial");
+    assert.equal(view.withheld_by_provider.claude, null);
+    assert.notEqual(view.withheld_by_provider.codex, null);
+    const cl = view.totals.find((x) => x.provider === "claude")!;
+    const cx = view.totals.find((x) => x.provider === "codex")!;
+    assert.ok(cx.requests_total > 0 && cx.tokens_total > 0n);
+    const h = view.headline;
+    assert.equal(h.n_cx, 0);
+    assert.equal(h.n_total, cl.requests_total);
+    assert.equal(h.n_priced, cl.requests_priced);
+    assert.equal(h.tokens_unpriced, cl.tokens_unpriced);
+    assert.equal(h.tokens_total, cl.tokens_total);
+    assert.equal(h.cache_read, cl.tokens.cache_read);
+    assert.equal(h.total_input, cl.total_input);
+    assert.equal(h.usd_pico, cl.usd_pico);
+  });
+});
+
+describe("S12.0: Codex records without a response_id, API errors and bare timestamps", () => {
+  const x = "synthetic-thread-x";
+  it("a record without response_id is usage-bearing; incomplete or range counters make it unmappable", async () => {
+    const res = await parseX([
+      xfile(x, [
+        cmeta(x, t(1), 0),
+        ctur(t(2), 1, null, x, "turn-1", cu({ in: -1 })),
+        ctur(t(3), 2, null, x, "turn-1", cu({ out: undefined })),
+        ctur(t(4), 3, null, x, "turn-1", cu()),
+      ]),
+    ]);
+    assert.equal(res.coverage.records_usage_bearing, 3);
+    assert.equal(res.coverage.records_unkeyed, 3);
+    assert.equal(res.coverage.records_usage_unmappable, 2);
+  });
+  it("an API error record is not usage-bearing, a bad timestamp alone is not unmappable", async () => {
+    const err = arec({ uuid: "u-err", req: null, msg: null, model: "<synthetic>" });
+    const res = await parseC([cfile(SESS, [err, arec({ uuid: "u1", ts: "nope" })])]);
+    assert.equal(res.coverage.api_error_records, 1);
+    assert.equal(res.coverage.records_usage_bearing, 1);
+    assert.equal(res.coverage.records_usage_unmappable, 0);
+    assert.equal(res.responses[0]?.exclusion, "usage_incomplete");
   });
 });
