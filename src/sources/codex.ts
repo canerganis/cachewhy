@@ -175,6 +175,9 @@ interface MetaF {
   hist_start: number | null;
   /** S1.4: the full state of `subagent_history_start_ordinal` (missing, bad, range or value), compared by R4.11. */
   hist_st: Cnt;
+  /** S1.3b: the id states (raw, missing or bad) of `session_id` and `forked_from_id`, compared by R4.11. */
+  session_p: string;
+  forked_p: string;
   thread_source: string | null;
   agent_role: string | null;
 }
@@ -305,6 +308,8 @@ function draftOf(obj: unknown): Draft {
         subagent_other,
         hist_start: intOf(histC),
         hist_st: histC,
+        session_p: idProj(p["session_id"]),
+        forked_p: idProj(p["forked_from_id"]),
         thread_source: enumOf(p["thread_source"], THREAD_SOURCES),
         agent_role: enumOf(p["agent_role"], AGENT_ROLES),
       };
@@ -312,7 +317,7 @@ function draftOf(obj: unknown): Draft {
         typeof src === "string" ? enumOf(src, SOURCE_KINDS) : has_subagent ? "subagent" : src === undefined || src === null ? null : "other";
       const key = JSON.stringify([
         "session_meta", tsKey, ordKey, idProj(p["id"]), idProj(p["session_id"]), instOf(p["timestamp"]).proj,
-        meta.label, idProj(p["forked_from_id"]), idProj(p["parent_thread_id"]),
+        meta.label, p["cli_version"] === undefined || p["cli_version"] === null ? "~missing" : "set", idProj(p["forked_from_id"]), idProj(p["parent_thread_id"]),
         idProj(spawnParentRaw), cntProj(depthC), meta.has_spawn, meta.has_subagent, meta.subagent_other,
         cntProj(histC),
         enumOf(p["originator"], ORIGINATORS), srcKind, meta.thread_source, meta.agent_role,
@@ -497,6 +502,8 @@ interface StreamB {
   metaSet: MetaF[];
   /** S10.4: the first own session_meta of the id (anywhere in the scan, whatever its file) with a forked_from_id. */
   forkMeta: MetaF | null;
+  /** Every own session_meta of the id with a non-null forked_from_id (S10.4). */
+  forkMetas: MetaF[];
   label: string;
   ord_verified: boolean;
   fork: { from: string; hist: number | null; resolved: boolean } | null;
@@ -678,6 +685,8 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
   for (const sf of scanned) {
     if (!sf.readable) continue;
     const metas = [...sf.recs].filter((r) => r.kind === "meta" && r.meta && r.meta.id !== null).sort(cmpKey);
+    // S1.3b: a session_meta whose id is missing or bad is still a session_meta of the file for the non-own test below
+    const allMetas = [...sf.recs].filter((r) => r.kind === "meta" && r.meta).sort(cmpKey);
     const own_ids = new Set<string>();
     const own_metas: Rec[] = [];
     const tur_ids = new Set<string>();
@@ -685,7 +694,7 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
     // R4.11: a session_meta is non-own iff another (distinct) session_meta of the file forks from its id.
     for (const m of metas) {
       const mid = (m.meta as MetaF).id as string;
-      const nonOwn = metas.some((m2) => m2 !== m && (m2.meta as MetaF).forked_from_id === mid);
+      const nonOwn = allMetas.some((m2) => m2 !== m && (m2.meta as MetaF).forked_from_id === mid);
       if (!nonOwn) {
         own_ids.add(mid);
         own_metas.push(m);
@@ -743,8 +752,9 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
     for (const [id, ms] of ownById) {
       if (ms.length < 2) continue;
       // A missing value is a value of its own: abstaining on a doubt (R4.11).
-      const sess = new Set(ms.map((m) => (m.meta as MetaF).session_id));
-      const forks = new Set(ms.map((m) => (m.meta as MetaF).forked_from_id));
+      // S1.3b: a bad value and a missing value differ
+      const sess = new Set(ms.map((m) => (m.meta as MetaF).session_p));
+      const forks = new Set(ms.map((m) => (m.meta as MetaF).forked_p));
       // S1.4: the history start keeps its full state (missing, bad, range or value) in this comparison.
       const hists = new Set(ms.map((m) => cntProj((m.meta as MetaF).hist_st)));
       if (sess.size > 1 || forks.size > 1 || hists.size > 1) triggers.threads("stream_unresolved", [id]);
@@ -819,6 +829,7 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
     builds.set(id, {
       id, files: filesOfStream, assigned, own_metas: own, tur: turByThread.get(id) ?? [], root: id,
       metaSet: pool.map((m) => m.meta as MetaF),
+      forkMetas: own.map((m) => m.meta as MetaF).filter((m) => m.forked_from_id !== null),
       forkMeta: (own.find((m) => (m.meta as MetaF).forked_from_id !== null)?.meta as MetaF | undefined) ?? null,
       label: "unlisted", ord_verified: false, fork: null, tcs: [], tcs_by_turn: new Map(),
       markers: [], single_model: null, start: null, chain: { provider: "codex", root_session: id, thread: id },
@@ -878,9 +889,10 @@ export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseO
 
     // fork facts (R4.9): a fork whose prefix cannot be cut is fork_prefix_unresolved and tainted (R0.9)
     // S10.4: a fork iff an own session_meta of the id has a non-null forked_from_id; the prefix check reads those records.
+    // The prefix check fires when ANY own record with a forked_from_id has no valid history start (S10.4).
     const fm = s.forkMeta;
     if (fm !== null && fm.forked_from_id !== null) {
-      const resolved = s.ord_verified && fm.hist_start !== null;
+      const resolved = s.ord_verified && s.forkMetas.every((m) => m.hist_start !== null);
       s.fork = { from: fm.forked_from_id, hist: fm.hist_start, resolved };
       if (!resolved) triggers.threads("fork_prefix_unresolved", [s.id]);
     }

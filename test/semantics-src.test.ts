@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
 import { analyze } from "../src/analyze.ts";
-import { discover } from "../src/discover.ts";
+import { classifyClaude, discover } from "../src/discover.ts";
 import { buildGraph } from "../src/graph/index.ts";
 import { buildReportInput } from "../src/report/input.ts";
 import {
@@ -1793,9 +1793,234 @@ describe("S5.1: a record of an unlisted type projects to `other` and exactly sev
   it("each field has the states missing and bad (null is absent)", async () => {
     for (const f of ["parentUuid", "logicalParentUuid", "agentId", "uuid", "version"]) {
       assert.equal(await collapsed(rec({ [f]: null }), rec({ [f]: undefined })), 1, `${f} null = absent`);
-      assert.equal(await collapsed(rec({ [f]: 5 }), rec({ [f]: undefined })), f === "version" ? 1 : 0, `${f} bad differs from missing`);
+      assert.equal(await collapsed(rec({ [f]: 5 }), rec({ [f]: undefined })), f === "version" ? 0 : 0, `${f} bad differs from missing`);
     }
-    // an unlisted version is `unlisted` whether absent or off the pattern
-    assert.equal(await collapsed(rec({ version: "x" }), rec({ version: undefined })), 1);
+    // S1.3b: a version that is absent is `missing`, one off the grammar is `unlisted`, and the two differ
+    assert.equal(await collapsed(rec({ version: "x" }), rec({ version: undefined })), 0);
+    assert.equal(await collapsed(rec({ version: "x" }), rec({ version: 5 })), 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Second internal review: S1.3b, S1.3c, S10.0, S10.1, S12.0
+// ---------------------------------------------------------------------------
+
+describe("S1.3b: bad and missing differ in the R4.11 comparison of two own session_metas", () => {
+  const th = "synthetic-thread-t1";
+  const base = (): TreeFile =>
+    xfile("a", [cmeta(th, t(1), 0), ctc(t(2), 1, "tu"), ctur(t(3), 2, "r1", th, "tu", cu())]);
+  const second = (payload: Record<string, unknown>): TreeFile => xfile("b", [cmeta(th, t(4), 5, payload)]);
+
+  it("a bad forked_from_id or session_id against a missing one is stream_unresolved", async () => {
+    const withBad = await parseX([base(), second({ forked_from_id: {} })]);
+    assert.deepEqual(triggersOf(withBad, "stream_unresolved"), [[xcid(th)]]);
+    const sess = await parseX([base(), second({ session_id: 5 })]);
+    assert.deepEqual(triggersOf(sess, "stream_unresolved"), [[xcid(th)]]);
+    // and the stream is tainted for the response
+    assert.ok(withBad.integrity.triggers.some((x) => x.reason === "stream_unresolved"));
+  });
+
+  it("two bad values are one state, null is missing, an equal value agrees", async () => {
+    const a = xfile("a", [cmeta(th, t(1), 0, { forked_from_id: 5 }), ctur(t(3), 2, "r1", th, "tu", cu())]);
+    const b = xfile("b", [cmeta(th, t(4), 5, { forked_from_id: {} })]);
+    assert.deepEqual(triggersOf(await parseX([a, b]), "stream_unresolved"), []);
+    const c = xfile("c", [cmeta(th, t(4), 5, { forked_from_id: null })]);
+    assert.deepEqual(triggersOf(await parseX([base(), c]), "stream_unresolved"), []);
+  });
+});
+
+describe("S1.3b: a session_meta with a missing or bad id stays in the R4.11 analysis of its file", () => {
+  it("its forked_from_id makes the parent copy non-own; it adds no own id and is an unattributed_record", async () => {
+    const x = "synthetic-thread-x";
+    for (const badId of [undefined, 5, ""]) {
+      const idless = cmeta("ignored", t(2), 1, { forked_from_id: x });
+      if (badId === undefined) delete idless.payload.id;
+      else idless.payload.id = badId;
+      const res = await parseX([xfile("a", [cmeta(x, t(1), 0), idless])]);
+      assert.equal(res.files[0]?.stream_assignment, "unassigned", String(badId)); // X is a copied parent: no own id at all
+      assert.ok(res.integrity.triggers.some((y) => y.reason === "unattributed_record" && y.names === "provider"), String(badId));
+    }
+    // without the id-less meta the same file is assigned to X
+    const alone = await parseX([xfile("a", [cmeta(x, t(1), 0)])]);
+    assert.equal(alone.files[0]?.stream_assignment, "assigned");
+  });
+});
+
+describe("S1.3b: a version that is absent differs from one off the grammar", () => {
+  it("Claude graph records and Codex session_metas", async () => {
+    const lines = async (...r: any[]): Promise<number> => (await parseC([cfile(SESS, r)])).coverage.lines_duplicate_collapsed;
+    const v = (x: unknown): any => arec({ uuid: "u1", patch: (r) => { if (x === undefined) delete r.version; else r.version = x; } });
+    assert.equal(await lines(v("x"), v(undefined)), 0);
+    assert.equal(await lines(v("x"), v(5)), 1); // both unlisted
+    assert.equal(await lines(v(null), v(undefined)), 1);
+    const th = "synthetic-thread-x";
+    const meta = (x: unknown): any => cmeta(th, t(1), 0, { cli_version: x });
+    const cx = async (a: any, b: any) => (await parseX([xfile(th, [a, b])])).coverage.lines_duplicate_collapsed;
+    assert.equal(await cx(meta("zzz"), meta(undefined)), 0);
+    assert.equal(await cx(meta("zzz"), meta(5)), 1);
+  });
+});
+
+describe("S1.3c: journal records, non-object lines and cost-state", () => {
+  const dir = `projects/synthetic-project/${SESS}/subagents/workflows/wf_run1`;
+  const journal = (lines: unknown[]): TreeFile => ({ path: `${dir}/journal.jsonl`, content: jsonl(lines) });
+  const dups = async (lines: unknown[]): Promise<number> => (await parseC([cfile(SESS, [arec({ uuid: "u1" })]), journal(lines)])).coverage.lines_duplicate_collapsed;
+
+  it("a journal record projects to its type and agentId only", async () => {
+    assert.equal(await dups([{ type: "started", agentId: "a", key: "k1" }, { type: "started", agentId: "a", label: "other" }]), 1);
+    assert.equal(await dups([{ type: "started", agentId: "a" }, { type: "zzz", agentId: "a" }]), 0);
+    assert.equal(await dups([{ type: "zzz", agentId: "a" }, { agentId: "a" }]), 0); // other against missing
+    assert.equal(await dups([{ type: "zzz", agentId: "a" }, { type: 5, agentId: "a" }]), 1);
+    assert.equal(await dups([{ type: "started", agentId: "a" }, { type: "started", agentId: "b" }]), 0);
+    assert.equal(await dups([{ type: "started", agentId: 5 }, { type: "started" }]), 0); // bad against missing
+    assert.equal(await dups([{ type: "started", agentId: null }, { type: "started" }]), 1);
+  });
+
+  it("every line that is not a JSON object is an equal record of type missing, in logs and journals", async () => {
+    assert.equal(await dups(["5", "[1]", "null", '"s"']), 3);
+    const main = await parseC([cfile(SESS, ["5", "[1]", "null", '"s"', arec({ uuid: "u1" })])]);
+    assert.equal(main.coverage.lines_duplicate_collapsed, 3);
+    assert.equal(main.coverage.unlisted_type_count, 4);
+  });
+
+  it("cost-state reads only the top-level modelUsage: five token members, counted per raw model key and member", async () => {
+    const cost = (modelUsage: unknown, extra: Record<string, unknown> = {}): any => ({ type: "cost-state", uuid: "u-c", sessionId: SESS, timestamp: t(3), version: V, modelUsage, ...extra });
+    const n = async (c: any): Promise<number> => (await parseC([cfile(SESS, [arec({ uuid: "u1" }), c])])).coverage.fields_range_failed;
+    assert.equal(await n(cost({ "claude-opus-5-5": { inputTokens: -1, outputTokens: 1.5, cacheReadInputTokens: -2, cacheCreationInputTokens: -3, thinkingTokens: -4 } })), 5);
+    // raw keys are never normalized: the same member under two keys that normalize alike counts twice
+    assert.equal(await n(cost({ "claude-opus-5-5": { inputTokens: -1 }, "claude-opus-5-5-20260101": { inputTokens: -1 } })), 2);
+    // other members are not tokens, the snake_case spelling and the nested alias are not read
+    assert.equal(await n(cost({ m: { costUSD: -1, webSearchRequests: -1, input_tokens: -1 } })), 0);
+    assert.equal(await n(cost(undefined, { costState: { modelUsage: { m: { inputTokens: -1 } } } })), 0);
+    // a bad member (string) is not a range failure
+    assert.equal(await n(cost({ m: { inputTokens: "5" } })), 0);
+  });
+
+  it("a cost-state record projects the common fields plus its modelUsage members", async () => {
+    const cost = (over: Record<string, unknown> = {}): any => ({ type: "cost-state", uuid: "u-c", sessionId: SESS, timestamp: t(3), version: V, modelUsage: { m: { inputTokens: 1 } }, ...over });
+    const c = async (a: any, b: any): Promise<number> => (await parseC([cfile(SESS, [a, b])])).coverage.lines_duplicate_collapsed;
+    assert.equal(await c(cost(), cost()), 1);
+    assert.equal(await c(cost(), cost({ isCompactSummary: true })), 1); // not a projected field of a cost-state record
+    assert.equal(await c(cost(), cost({ modelUsage: { m: { inputTokens: 2 } } })), 0);
+    assert.equal(await c(cost(), cost({ modelUsage: { m2: { inputTokens: 1 } } })), 0);
+    assert.equal(await c(cost(), cost({ parentUuid: "p" })), 0);
+  });
+
+  it("advisorModel, serverClassifierRequest and content blocks are projected on user, system and attachment records too", async () => {
+    for (const type of ["user", "system", "attachment"]) {
+      const rec = (over: Record<string, unknown> = {}): any => ({ type, uuid: "u-x", sessionId: SESS, timestamp: t(3), version: V, ...over });
+      const c = async (a: any, b: any): Promise<number> => (await parseC([cfile(SESS, [a, b])])).coverage.lines_duplicate_collapsed;
+      assert.equal(await c(rec(), rec({ advisorModel: "claude-opus-5-5" })), 0, type);
+      assert.equal(await c(rec({ advisorModel: "claude-opus-5-5-20260101" }), rec({ advisorModel: "claude-opus-5-5" })), 1, type);
+      assert.equal(await c(rec(), rec({ serverClassifierRequest: {} })), 0, type);
+      assert.equal(await c(rec({ serverClassifierRequest: 1 }), rec({ serverClassifierRequest: "x" })), 1, type);
+      const blocks = (b: unknown[]): any => rec({ message: { content: b } });
+      assert.equal(await c(blocks([{ type: "tool_use", id: "i1", name: "Agent" }]), blocks([{ type: "tool_use", id: "i2", name: "Agent" }])), 0, type);
+      assert.equal(await c(blocks([{ type: "tool_use", id: "i1", name: "Agent" }]), blocks([{ type: "tool_use", id: "i1", name: "Zzz" }])), 0, type);
+      assert.equal(await c(blocks([{ type: "text", text: "a" }]), blocks([{ type: "text", text: "b" }])), 1, type);
+      assert.equal(await c(blocks([{ type: "tool_result", tool_use_id: "i1" }]), blocks([{ type: "tool_result", tool_use_id: "i2" }])), 0, type);
+    }
+  });
+});
+
+describe("S10.0: Claude discovery follows the layout exactly", () => {
+  it("only the listed depths and names are discovered", () => {
+    const yes = [
+      ["p", "s1.jsonl"],
+      ["p", "s1", "subagents", "agent-a1.jsonl"],
+      ["p", "s1", "subagents", "agent-a1.meta.json"],
+      ["p", "s1", "subagents", "agent-a1.prefix.json"],
+      ["p", "s1", "workflows", "wf_x.json"],
+      ["p", "s1", "subagents", "workflows", "wf_x", "agent-a1.jsonl"],
+      ["p", "s1", "subagents", "workflows", "wf_x", "agent-a1.meta.json"],
+      ["p", "s1", "subagents", "workflows", "wf_x", "journal.jsonl"],
+    ];
+    for (const s of yes) assert.notEqual(classifyClaude(s), null, s.join("/"));
+    const no = [
+      ["p", ".jsonl"], // empty stem
+      ["p", "subagents", "agent-a1.jsonl"], // a project called subagents is not a session directory
+      ["p", "s1", "x", "subagents", "agent-a1.jsonl"],
+      ["p", "q", "s1", "subagents", "workflows", "wf_x", "agent-a1.jsonl"],
+      ["p", "s1", "subagents", "x", "agent-a1.jsonl"],
+      ["p", "s1", "subagents", "workflows", "x", "agent-a1.jsonl"], // not wf_
+      ["p", "s1", "subagents", "workflows", "wf_x", "y", "agent-a1.jsonl"],
+      ["p", "s1", "subagents", "workflows", "wf_x", "y", "journal.jsonl"],
+      ["p", "s1", "subagents", "journal.jsonl"],
+      ["p", "s1", "x", "workflows", "wf_x.json"],
+      ["p", "s1", "workflows", "wf_.json"],
+      ["p", "s1", "subagents", "agent-.jsonl"],
+      ["p", "s1", "subagents", "agent-a1.other.json"],
+    ];
+    for (const s of no) assert.equal(classifyClaude(s), null, s.join("/"));
+  });
+
+  it("discover and the parser agree: a wrongly placed agent log is not a file of the scan", async () => {
+    const root = writeTree([
+      { path: `projects/p/${SESS}.jsonl`, content: jsonl([arec({ uuid: "u1" })]) },
+      { path: `projects/p/subagents/agent-a1.jsonl`, content: jsonl([arec({ uuid: "u2", req: "r2", msg: "m2" })]) },
+      { path: `projects/p/q/${SESS}/subagents/workflows/wf_x/agent-a1.jsonl`, content: jsonl([arec({ uuid: "u3", req: "r3", msg: "m3" })]) },
+      { path: `projects/p/.jsonl`, content: jsonl([arec({ uuid: "u4", req: "r4", msg: "m4" })]) },
+    ]);
+    const d = await discover({ claudeDirs: [join(root, "projects")], codexDirs: [join(root, "none")], env: {}, home: root });
+    assert.equal(d.files.length, 1);
+    assert.equal((await parseClaude(d.files)).responses.length, 1);
+  });
+});
+
+describe("S10.1: the workflow_agent kind follows any parsed record that names the chain", () => {
+  const dir = `projects/synthetic-project/${SESS}/subagents`;
+  const agent = (n: number, over: Partial<AOpts> = {}): any => arec({ uuid: `ua${n}`, req: `ra${n}`, msg: `ma${n}`, agent: "ag1", ...over });
+  const kindOfAgent = async (wfLines: unknown[]): Promise<string | undefined> => {
+    const res = await parseC([
+      { path: `${dir}/agent-ag1.jsonl`, content: jsonl([agent(1)]) },
+      { path: `${dir}/workflows/wf_run1/agent-ag1.jsonl`, content: jsonl(wfLines) },
+    ]);
+    return res.responses.find((r) => r.key === "ra1")?.kind;
+  };
+
+  it("a record of any type or version in a workflow directory names the chain", async () => {
+    assert.equal(await kindOfAgent([]), "subagent");
+    assert.equal(await kindOfAgent([{ type: "zzz", sessionId: SESS, agentId: "ag1", uuid: "m1" }]), "workflow_agent"); // mystery type
+    assert.equal(await kindOfAgent([{ type: "cost-state", sessionId: SESS, agentId: "ag1", uuid: "m2", timestamp: t(3), version: V }]), "workflow_agent");
+    assert.equal(await kindOfAgent([agent(2, { patch: (r) => { r.version = "2.1.290"; } })]), "workflow_agent"); // unsupported version
+    // another agent id or another session does not name the chain
+    assert.equal(await kindOfAgent([{ type: "zzz", sessionId: SESS, agentId: "other", uuid: "m3" }]), "subagent");
+    assert.equal(await kindOfAgent([{ type: "zzz", sessionId: "synthetic-other", agentId: "ag1", uuid: "m4" }]), "subagent");
+    // a record without a string sessionId names no chain
+    assert.equal(await kindOfAgent([{ type: "zzz", agentId: "ag1", uuid: "m5" }]), "subagent");
+  });
+
+  it("the link of such a chain follows the workflow rules", async () => {
+    const res = await parseC([
+      { path: `${dir}/agent-ag1.jsonl`, content: jsonl([agent(1)]) },
+      { path: `${dir}/workflows/wf_run1/agent-ag1.jsonl`, content: jsonl([{ type: "zzz", sessionId: SESS, agentId: "ag1", uuid: "m1" }]) },
+    ]);
+    assert.equal(res.links.find((l) => l.chain.thread === "ag1")?.kind, "workflow_agent");
+  });
+});
+
+describe("S10.4: the prefix check fires when any own fork record has no valid history start", () => {
+  const x = "synthetic-thread-x";
+  const run = (a: Record<string, unknown>, b: Record<string, unknown>) =>
+    parseX([xfile(x, [cmeta(x, t(1), 0, a), cmeta(x, t(1), 1, b), ctc(t(2), 2, "turn-1"), ctur(t(3), 3, "resp-1", x, "turn-1", cu())])]);
+
+  it("one fork record with a string history start unresolves the stream whatever the order or the other record", async () => {
+    const good = { forked_from_id: "synthetic-parent", subagent_history_start_ordinal: 4 };
+    const bad = { forked_from_id: "synthetic-parent", subagent_history_start_ordinal: "x" };
+    const pairs: Array<[Record<string, unknown>, Record<string, unknown>]> = [[good, bad], [bad, good]];
+    for (const [a, b] of pairs) {
+      const res = await run(a, b);
+      assert.deepEqual(triggersOf(res, "fork_prefix_unresolved"), [[xcid(x)]]);
+      assert.equal(res.streams[0]?.fork?.prefix_resolved, false);
+    }
+  });
+
+  it("a record without forked_from_id does not need a history start; two valid fork records resolve", async () => {
+    const fork = { forked_from_id: "synthetic-parent", subagent_history_start_ordinal: 0 };
+    const res = await run(fork, { thread_source: "user", subagent_history_start_ordinal: "x" });
+    assert.deepEqual(triggersOf(res, "fork_prefix_unresolved"), []);
+    assert.equal(res.streams[0]?.fork?.prefix_resolved, true);
+    const two = await run(fork, { ...fork, thread_source: "user" });
+    assert.deepEqual(triggersOf(two, "fork_prefix_unresolved"), []);
   });
 });

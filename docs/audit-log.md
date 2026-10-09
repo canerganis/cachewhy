@@ -554,3 +554,17 @@ Doğrulama statik olarak gömülü içerik üzerinden yapıldı. Verilen 1006 te
 Verification after the fixes: `npm run typecheck`, `npm run build`, `npm run lint:privacy` and `npm pack --dry-run` clean. `npm test`: 1026 pass, 0 fail, 0 todo. A 1000-seed run of every fuzz suite (bare, valid, all, dense) gave 0 divergences, and the 37 minimized reproducers in `test/fuzz/repros.ts` all agree.
 
 Next: G1 audit round 6.
+
+## Gate owner review pass before G1 round 6
+
+A second internal review hunted for the class of gap that round 5 found: a check scoped per chain or per file on one side and per record set on the other, a field projected on one side only, a counter fed on one side only, and input shapes the generator never produced. It ran about 150 hand-built fixtures, a field-pair projection scan of every record type, about 25000 mutated generator scans and about 50 pricing table variants. Confirmed items, all resolved:
+
+| Sev | Item | Resolution |
+|---|---|---|
+| P1 | src compared the ids of two own Codex `session_meta` records as valid-or-null, so a `bad` `forked_from_id` or `session_id` equalled a missing one and a verified dollar survived under the test tier | S1.3b: ids keep their state in every comparison, and src now gives `stream_unresolved` |
+| P1 | src discovered Claude files at wrong depths (a search for any `subagents` segment, an empty session stem), so it read responses and sidecar taints that recompute ignored | S10.0 and S12.6a: discovery follows the exact layout in both |
+| P1 | the `workflow_agent` kind read only supported graph records in src | S10.1: any parsed record that names the chain decides it |
+| P1 | `cost-state` `fields_range_failed` differed: recompute checked every numeric member (a fractional `costUSD` is in every real record), src read an alias path | S12.0: the five token members of the top-level `modelUsage`, per raw model key, in both |
+| P2 | `preTokens` and `postTokens` checked on any `system` record; id-less `session_meta` dropped before the copy test; journal, `cost-state`, non-object line and attribute-field projections; absent and off-grammar `version`; `since > until`; fork prefix check on the first own record only (found by the extended fuzz) | S12.0, S1.3b, S1.3c, S7.0 and S10.4 written and implemented on both sides |
+
+The generator gained knobs for each shape (wrong layouts, dual-directory agent chains, full `cost-state` records, compact boundary subtypes, wrong-type `session_meta` ids, journal duplicates, non-object lines, attribute fields on non-assistant records). Verification: `npm test` 1051 pass, 0 fail. 1000 seeds of every fuzz suite gave 0 divergences, at scale 1 and at scale 2.

@@ -1214,7 +1214,7 @@ describe("S12.6a, S12.0: cost-state is a known record type; fields_range_failed"
     const c = cov(run(files), "claude");
     assert.equal(c.fields_range_failed, 1 + 2 + 4, "a fractional member is range too");
     // windowed by the record's timestamp; a cost-state without a time is in every window
-    const w = cov(run([mainFile("s1", [sys({ preTokens: -1 }, T(5)), sys({ preTokens: -1, postTokens: -1 }, T(40)), cost({ m: { a: -1 } }, null)])], { since: Date.UTC(2026, 0, 1, 0, 0, 10) }), "claude");
+    const w = cov(run([mainFile("s1", [sys({ preTokens: -1 }, T(5)), sys({ preTokens: -1, postTokens: -1 }, T(40)), cost({ m: { inputTokens: -1 } }, null)])], { since: Date.UTC(2026, 0, 1, 0, 0, 10) }), "claude");
     assert.equal(w.fields_range_failed, 2 + 1);
     // a failing value does not fail a response
     const ok = run([mainFile("s1", [a])]);
@@ -1487,5 +1487,169 @@ describe("S5.1: a record of an unlisted type projects to `other` and exactly sev
     // a listed type keeps its own fields (attachment: the common fields of the graph types)
     const att = { ...base, type: "attachment" };
     assert.equal(dupCount(att, { ...att, isSidechain: true }), 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S12.0 cost-state members, S1.3b, S1.3c, S7.0
+// ---------------------------------------------------------------------------
+
+describe("S12.0: fields_range_failed reads only the listed paths", () => {
+  const cost = (mu: Obj, ts: unknown = T(1)): Obj => ({ type: "cost-state", timestamp: ts, modelUsage: mu });
+  const sys = (over: Obj, subtype: string | null = "compact_boundary"): Obj => ({ type: "system", uuid: "sy", sessionId: "synthetic-s1", timestamp: T(1), version: CV, ...(subtype === null ? {} : { subtype }), compactMetadata: { trigger: "auto", ...over } });
+  const frf = (...lines: Obj[]) => cov(run([mainFile("s1", lines)]), "claude").fields_range_failed;
+
+  it("only the five token members of each raw model key of the top-level modelUsage count; costUSD and other members do not", () => {
+    // a real cost-state record carries a fractional costUSD: it is not a token and is not checked
+    assert.equal(frf(cost({ "claude-sonnet-5-5": { inputTokens: 5, outputTokens: 6, costUSD: 0.0123, webSearchRequests: 1.5, contextWindow: -1 } })), 0);
+    const all = { inputTokens: -1, outputTokens: 1.5, cacheReadInputTokens: MAX_SAFE + 2, cacheCreationInputTokens: -2, thinkingTokens: 1e300 };
+    assert.equal(frf(cost({ k: all })), 5);
+    // a string is bad, not range
+    assert.equal(frf(cost({ k: { inputTokens: "5", outputTokens: null } })), 0);
+    // model keys are raw: two spellings of one model are two fields
+    assert.equal(frf(cost({ "claude-x-20260101": { inputTokens: -1 }, "claude-x": { inputTokens: -1 }, "Claude-X": { inputTokens: -1 } })), 3);
+    // no other path is read: a nested modelUsage or a top-level member is ignored
+    assert.equal(frf({ type: "cost-state", timestamp: T(1), inputTokens: -1, nested: { modelUsage: { k: { inputTokens: -1 } } } }), 0);
+    // once per logical record and field
+    const r = cost({ k: { inputTokens: -1, outputTokens: -1 } });
+    assert.equal(frf(r, r), 2);
+  });
+
+  it("preTokens and postTokens are range checked on a compact_boundary system record only", () => {
+    assert.equal(frf(sys({ preTokens: -1, postTokens: -1 })), 2);
+    assert.equal(frf(sys({ preTokens: -1, postTokens: -1 }, "other_subtype")), 0);
+    assert.equal(frf(sys({ preTokens: -1, postTokens: -1 }, null)), 0);
+  });
+});
+
+describe("S1.3c: projections of journal, cost-state, graph attributes and non-object lines", () => {
+  const dups = (...recs: unknown[]) => {
+    const content = recs.map((r) => JSON.stringify(r)).join("\n") + "\n";
+    return cov(run([{ path: "projects/p/s.jsonl", content }]), "claude");
+  };
+
+  it("non-object lines are all equal records of type missing", () => {
+    const c = dups(5, [1], null, "x", 5);
+    assert.equal(c.lines_duplicate_collapsed, 4);
+    assert.equal(c.duplicate_records_collapsed, 1);
+    assert.equal(dups(5, [1], null).lines_duplicate_collapsed, 2);
+  });
+
+  it("a journal record projects to its type and agentId only; equal lines collapse", () => {
+    const base = [mainFile("ss", [copy({ sess: "ss" })])];
+    const j = (lines: Obj[]): F => ({ path: "projects/p/ss/subagents/workflows/wf_r/journal.jsonl", content: jsonl(lines) });
+    const c = cov(run([...base, j([{ type: "started", agentId: "a", label: "x" }, { type: "started", agentId: "a", label: "y", result: "z" }, { type: "started", agentId: "b" }, { type: "surprise", agentId: "a" }, { type: "other-surprise", agentId: "a" }, { type: "started" }, { type: "started", agentId: null }])]), "claude");
+    // collapsed: the second line (same as the first), the fifth (an unlisted type is `other`, like the fourth), the last
+    // (a null agentId is missing, like an absent one)
+    assert.equal(c.lines_duplicate_collapsed, 3);
+    assert.equal(c.duplicate_records_collapsed, 3);
+  });
+
+  it("a cost-state record projects to the common fields plus its modelUsage token members; other members do not matter", () => {
+    const base = { type: "cost-state", uuid: "c1", sessionId: "synthetic-s1", timestamp: T(1), version: CV, modelUsage: { k: { inputTokens: 5, costUSD: 0.5 } } };
+    const n = (...recs: Obj[]) => dups(...recs).lines_duplicate_collapsed;
+    assert.equal(n(base, { ...base, modelUsage: { k: { inputTokens: 5, costUSD: 9.9, webSearchRequests: 3 } } }), 1);
+    assert.equal(n(base, { ...base, modelUsage: { k: { inputTokens: 6 } } }), 0);
+    assert.equal(n(base, { ...base, modelUsage: { K: { inputTokens: 5 } } }), 0, "raw model keys");
+    assert.equal(n(base, { ...base, uuid: "c2" }), 0);
+    assert.equal(n(base, { ...base, isSidechain: true, entrypoint: "cli" }), 1, "attribute fields are not common fields of a cost-state");
+  });
+
+  it("advisorModel, serverClassifierRequest and content block type, id and name are projected on all four graph types", () => {
+    const g = (type: string, over: Obj = {}) => ({ type, uuid: "g1", sessionId: "synthetic-s1", timestamp: T(1), version: CV, ...over });
+    const n = (...recs: Obj[]) => dups(...recs).lines_duplicate_collapsed;
+    for (const t of ["assistant", "user", "system", "attachment"]) {
+      const a = g(t);
+      assert.equal(n(a, { ...a }), 1, t + " control");
+      assert.equal(n(a, { ...a, advisorModel: "claude-opus-5-5" }), 0, t + " advisorModel");
+      assert.equal(n(a, { ...a, serverClassifierRequest: {} }), 0, t + " serverClassifierRequest");
+      const blk = (b: Obj) => ({ ...a, message: { content: [b] } });
+      assert.equal(n(blk({ type: "text" }), blk({ type: "thinking" })), 0, t + " block type");
+      assert.equal(n(blk({ type: "tool_use", id: "i1", name: "Agent" }), blk({ type: "tool_use", id: "i2", name: "Agent" })), 0, t + " block id");
+      assert.equal(n(blk({ type: "tool_use", id: "i1", name: "Agent" }), blk({ type: "tool_use", id: "i1", name: "Workflow" })), 0, t + " block name");
+      assert.equal(n(blk({ type: "tool_use", id: "i1", name: "Zzz" }), blk({ type: "tool_use", id: "i1", name: "Yyy" })), 1, t + " unlisted names are `other`");
+      assert.equal(n(blk({ type: "text", id: "i1" }), blk({ type: "text", id: "i2" })), 0, t + " id on any block type");
+    }
+  });
+});
+
+describe("S7.0: since after until is a usage error", () => {
+  it("since > until throws; since == until is an empty window", () => {
+    const files = [mainFile("s1", [copy({ ts: T(5) })])];
+    const t = (sec: number) => Date.UTC(2026, 0, 1, 0, 0, sec);
+    assert.throws(() => run(files, { since: t(10), until: t(5) }), /bad_window/);
+    assert.throws(() => run(files, { since: "2026-01-02", until: "2026-01-01" }), /bad_window/);
+    const empty = run(files, { since: t(5), until: t(5) });
+    assert.equal(empty.providers.claude.totals.responses, 0);
+    assert.equal(run(files, { since: t(5), until: t(6) }).providers.claude.totals.responses, 1);
+    assert.equal(run(files, { since: t(10) }).providers.claude.totals.responses, 0, "an open end is no error");
+  });
+});
+
+describe("S1.3b: id states in the R4.11 comparison; id-less session_meta; version states", () => {
+  const meta2 = (over: Obj, ord = 0) => xmeta("synthetic-ti", over, { ordinal: ord });
+  const stream = (...metas: Obj[]) => run([xfile("ids", [...metas, xturn("tn", "gpt-6-sol", 5, 5), xtur("x", "synthetic-ti", "tn", 6, 6)])]);
+
+  it("a bad value and a missing value of session_id, forked_from_id or the ordinal differ in the comparison of two own session_meta records", () => {
+    const miss = (f: string) => {
+      const m = meta2({});
+      delete m.payload[f];
+      return m;
+    };
+    for (const f of ["session_id", "forked_from_id", "subagent_history_start_ordinal"]) {
+      const bad = meta2({ [f]: 5 });
+      assert.equal(cov(stream(miss(f), bad), "codex").chains_tainted_by_reason.stream_unresolved, 1, f + " missing vs bad");
+      assert.equal(cov(stream(meta2({ [f]: 5 }), meta2({ [f]: { x: 1 } })), "codex").chains_tainted_by_reason.stream_unresolved, f === "subagent_history_start_ordinal" ? 1 : 0, f + " bad vs bad");
+      assert.equal(cov(stream(miss(f), meta2({ [f]: null })), "codex").chains_tainted_by_reason.stream_unresolved, 0, f + " missing vs null");
+    }
+  });
+
+  it("a session_meta without a usable id is still a session_meta of its file: it adds no id, is unattributed, and its forked_from_id makes the forked record non-own", () => {
+    const idless = (over: Obj = {}) => {
+      const m = xmeta("x", over, { ordinal: 1 });
+      delete m.payload.id;
+      return m;
+    };
+    // the id-less record forks synthetic-tp: the copied parent record of the same file is non-own
+    const parent = xmeta("synthetic-tp");
+    const child = xmeta("synthetic-tc", { forked_from_id: "synthetic-tp" }, { ordinal: 2 });
+    const r = run([xfile("a", [parent, idless({ forked_from_id: "synthetic-tp" }), xturn("tn", "gpt-6-sol", 3, 3), xtur("x1", "synthetic-tp", "tn", 4, 4)])]);
+    const c = cov(r, "codex");
+    assert.equal(c.files_stream_conflict, 0, "the parent is non-own, so the file has one identity");
+    assert.equal(c.files_assigned_by_stream, 1);
+    assert.ok(c.chains_tainted_by_reason.unattributed_record >= 1);
+    // a bad id (a number) behaves the same
+    const bad = idless({ forked_from_id: "synthetic-tp" });
+    bad.payload.id = 7;
+    assert.equal(cov(run([xfile("a", [parent, bad, xturn("tn", "gpt-6-sol", 3, 3), xtur("x1", "synthetic-tp", "tn", 4, 4)])]), "codex").files_assigned_by_stream, 1);
+    // control: without the forking record the same two metas are two own ids
+    const two = run([xfile("a", [parent, child, xtur("x1", "synthetic-tc", "tn", 4, 4)])]);
+    assert.equal(cov(two, "codex").files_assigned_by_stream, 1, "the parent copy is non-own because the child forks it");
+    // an id-less record that forks nothing is own and adds no id: the file keeps its one identity from the usage record
+    const r2 = run([xfile("b", [idless(), xturn("tn", "gpt-6-sol", 3, 3), xtur("x2", "synthetic-tp", "tn", 4, 4)])]);
+    assert.equal(cov(r2, "codex").files_assigned_by_stream, 1);
+  });
+
+  it("an absent version is `missing` and one outside the grammar is `unlisted`; the two differ (Claude and Codex)", () => {
+    const rec = (version: unknown): Obj => {
+      const r = copy({ req: null, mid: "mk", uuid: "uk", usage: usage() });
+      if (version === undefined) delete r.version;
+      else r.version = version;
+      return r;
+    };
+    const dup = (...recs: Obj[]) => cov(run([mainFile("s1", recs)]), "claude");
+    assert.equal(dup(rec(undefined), rec("not a version")).lines_duplicate_collapsed, 0);
+    assert.equal(dup(rec(undefined), rec(null)).lines_duplicate_collapsed, 1);
+    assert.equal(dup(rec("not a version"), rec(5)).lines_duplicate_collapsed, 1);
+    const cm = (v: unknown): Obj => {
+      const m = xmeta("synthetic-tv2");
+      if (v === undefined) delete m.payload.cli_version;
+      else m.payload.cli_version = v;
+      return m;
+    };
+    const cdup = (...ms: Obj[]) => cov(run([xfile("v", ms)]), "codex").lines_duplicate_collapsed;
+    assert.equal(cdup(cm(undefined), cm("garbage")), 0);
+    assert.equal(cdup(cm(undefined), cm(null)), 1);
+    assert.equal(cdup(cm("garbage"), cm(9)), 1);
   });
 });

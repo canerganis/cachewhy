@@ -933,7 +933,7 @@ function priceClaude(res, book, stats) {
 }
 
 /** A sidecar (R1.2: meta, prefix, workflow run JSON, journal). It names no chain; a parse failure is a lost line. */
-function readSidecar(ent, c, files) {
+function readSidecar(ent, c, files, dup) {
   c.files_total += 1; // S12.6: sidecars are discovered files
   let buf;
   try {
@@ -976,7 +976,11 @@ function readSidecar(ent, c, files) {
   } else {
     // S12.6, R1.3: journal.jsonl lines follow the line rules, truncated tail included
     const fc = newLineCov();
-    for (const _ of jsonLines(buf, fc)) void _;
+    for (const rec of jsonLines(buf, fc)) {
+      // S1.3c: a journal record projects to its type (enum state) and agentId (id state); equal lines collapse (R17.6)
+      const key = "journal" + pjson(isObj(rec) ? [enumOf(rec.type, ["started"]), idP(rec.agentId)] : [null]);
+      dup.set(key, (dup.get(key) ?? 0) + 1);
+    }
     unparsed = fc.lines_parse_error + fc.lines_truncated_tail;
     for (const k of ["lines_total", "lines_parse_error", "lines_truncated_tail"]) c[k] += fc[k];
   }
@@ -992,6 +996,7 @@ function readSidecar(ent, c, files) {
  */
 const CLAUDE_GRAPH_TYPES = ["assistant", "system", "user", "attachment"];
 const CLAUDE_KNOWN_TYPES = [...CLAUDE_GRAPH_TYPES, "cost-state"];
+const COST_TOKEN_MEMBERS = ["inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens", "thinkingTokens"]; // S12.0
 
 /** The content block projection of a message (R1.2: types, tool_use ids and names, tool_result ids; the content is never read). */
 function blocksP(m) {
@@ -1002,10 +1007,9 @@ function blocksP(m) {
         blocks.push(["other", null, null, null]);
         continue;
       }
+      // R1.2: type, id and name of every block (name kept only if Agent or Workflow); tool_use_id of tool_result blocks
       const t = enumOf(b.type, ["text", "tool_use", "tool_result", "thinking"]);
-      if (t === "tool_use") blocks.push([t, idP(b.id), enumOf(b.name, ["Agent", "Workflow"]), null]);
-      else if (t === "tool_result") blocks.push([t, null, null, idP(b.tool_use_id)]);
-      else blocks.push([t, null, null, null]);
+      blocks.push([t, idP(b.id), enumOf(b.name, ["Agent", "Workflow"]), t === "tool_result" ? idP(b.tool_use_id) : null]);
     }
   } else if (m !== null && m.content !== undefined && m.content !== null) {
     return [{ s: BAD }]; // S1.3a: an array container that is present and not an array is bad
@@ -1020,24 +1024,10 @@ function blocksP(m) {
 function claudeProjection(rec) {
   if (!isObj(rec)) return [null];
   const type = enumOf(rec.type, CLAUDE_KNOWN_TYPES);
-  if (type === "cost-state") {
-    // modelUsage.<model> integer members, as (model, member, value or range) triples sorted
-    const out = [];
-    const mu = rec.modelUsage;
-    if (isObj(mu)) {
-      for (const [model, members] of Object.entries(mu)) {
-        if (!isObj(members)) continue;
-        for (const [k, v] of Object.entries(members)) if (typeof v === "number") out.push([claudeModel(model), k, stateOf(ctr(v))]); // S4.1: a fractional number is `range`
-      }
-    }
-    out.sort((x, y) => (pjson(x) < pjson(y) ? -1 : pjson(x) > pjson(y) ? 1 : 0));
-    return [type, mu === undefined || mu === null ? null : isObj(mu) ? out : { s: BAD }];
-  }
-  // an unlisted type keeps only the fields R1.2 reads on all record types (ids, instants, session keys), under the type `other`
   const m = isObj(rec.message) ? rec.message : null;
   const version = rec.version === undefined || rec.version === null ? null : typeof rec.version === "string" && VERSION_RE.test(rec.version) ? rec.version : "unlisted";
   const ids = [
-    type === null || CLAUDE_GRAPH_TYPES.includes(type) ? type : "other",
+    type === null || CLAUDE_KNOWN_TYPES.includes(type) ? type : "other",
     idP(rec.uuid),
     idP(rec.parentUuid),
     idP(rec.logicalParentUuid),
@@ -1046,6 +1036,19 @@ function claudeProjection(rec) {
     instP(rec.timestamp),
     version,
   ];
+  if (type === "cost-state") {
+    // S1.3c: the common fields plus the top-level modelUsage token members as (raw model key, member, value or state) sorted
+    const out = [];
+    const mu = rec.modelUsage;
+    if (isObj(mu)) {
+      for (const [model, members] of Object.entries(mu)) {
+        if (!isObj(members)) continue;
+        for (const k of COST_TOKEN_MEMBERS) if (members[k] !== undefined && members[k] !== null) out.push([model, k, ctrP(members[k])]);
+      }
+    }
+    out.sort((x, y) => (pjson(x) < pjson(y) ? -1 : pjson(x) > pjson(y) ? 1 : 0));
+    return [...ids, mu === undefined || mu === null ? null : isObj(mu) ? out : { s: BAD }];
+  }
   // S5.1: a record of an unlisted type projects to `other` and exactly these seven common fields
   if (type !== null && !CLAUDE_GRAPH_TYPES.includes(type)) return ids;
   const common = [
@@ -1059,11 +1062,12 @@ function claudeProjection(rec) {
     claudeModel(rec.advisorModel),
     rec.serverClassifierRequest !== undefined && rec.serverClassifierRequest !== null,
   ];
-  if (type !== "user" && type !== "system" && type !== "assistant") return common;
+  // S1.3c: content block type, id and name are projected on all four graph types
+  if (type === "attachment") return [...common, blocksP(m)];
   if (type === "user") return [...common, m !== null ? enumOf(m.role, ["user", "assistant"]) : null, blocksP(m)];
   if (type === "system") {
     const cm = isObj(rec.compactMetadata) ? rec.compactMetadata : null;
-    return [...common, enumOf(rec.subtype, ["compact_boundary"]), cm !== null ? enumOf(cm.trigger, ["auto", "manual"]) : null, ctrP(cm?.preTokens), ctrP(cm?.postTokens)];
+    return [...common, enumOf(rec.subtype, ["compact_boundary"]), cm !== null ? enumOf(cm.trigger, ["auto", "manual"]) : null, ctrP(cm?.preTokens), ctrP(cm?.postTokens), blocksP(m)];
   }
   // assistant
   const u = m !== null && isObj(m.usage) ? m.usage : null;
@@ -1120,12 +1124,14 @@ function claudeRangeFields(rec) {
     const dg = m !== null && isObj(m.diagnostics) && isObj(m.diagnostics.cache_miss_reason) ? m.diagnostics.cache_miss_reason : null;
     if (dg !== null && ctr(dg.cache_missed_input_tokens) === RANGE) out.push("cache_missed_input_tokens");
   } else if (rec.type === "system") {
+    // S12.0: preTokens and postTokens are range checked on a compact_boundary system record only
     const cm = isObj(rec.compactMetadata) ? rec.compactMetadata : null;
-    if (cm !== null) for (const k of ["preTokens", "postTokens"]) if (ctr(cm[k]) === RANGE) out.push(k);
+    if (cm !== null && rec.subtype === "compact_boundary") for (const k of ["preTokens", "postTokens"]) if (ctr(cm[k]) === RANGE) out.push(k);
   } else if (rec.type === "cost-state" && isObj(rec.modelUsage)) {
+    // S12.0: the five token members of each raw model key of the top-level modelUsage; costUSD and the rest are not tokens
     for (const [model, members] of Object.entries(rec.modelUsage)) {
       if (!isObj(members)) continue;
-      for (const [k, v] of Object.entries(members)) if (typeof v === "number" && ctr(v) === RANGE) out.push(`mu:${claudeModel(model)}:${k}`);
+      for (const k of COST_TOKEN_MEMBERS) if (ctr(members[k]) === RANGE) out.push(JSON.stringify([model, k]));
     }
   }
   return out;
@@ -1158,7 +1164,7 @@ function scanClaude(entries, cov, window) {
   for (const ent of entries) {
     if (ent.provider !== "claude") continue;
     if (ent.kind === "sidecar_json" || ent.kind === "sidecar_lines") {
-      readSidecar(ent, c, files);
+      readSidecar(ent, c, files, dup);
       continue;
     }
     c.files_total += 1;
@@ -1557,7 +1563,8 @@ const CODEX_ORIGINATORS = ["codex_cli", "codex_exec", "codex_vscode", "codex_cli
 const CODEX_AGENT_ROLES = ["default", "worker", "explorer", "awaiter"];
 const CODEX_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 
-const codexVersion = (v) => (typeof v === "string" && v.length <= 40 && CODEX_VERSION_RE.test(v) ? v : "unlisted");
+// S1.3b: an absent version is `missing` (null), one that does not match the grammar is `unlisted`, and the two differ
+const codexVersion = (v) => (v === undefined || v === null ? null : typeof v === "string" && v.length <= 40 && CODEX_VERSION_RE.test(v) ? v : "unlisted");
 /** A bounded token (comp_hash, collaboration mode): the token, `missing` (null) or `bad`. */
 const tokenP = (v) => (typeof v === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(v) ? v : v === undefined || v === null ? null : { s: BAD });
 
@@ -2342,6 +2349,7 @@ function parseRunStart(v) {
 
 function run(entries, opts) {
   const window = { since: parseBound(opts.since, "since"), until: parseBound(opts.until, "until") };
+  if (window.since !== null && window.until !== null && window.since > window.until) throw new Error("bad_window"); // S7.0
   const book = loadBook(loadTableArg(opts.table));
   const runStartMs = parseRunStart(opts.runStartMs ?? opts.run_start_ms);
   const tierVerified = (opts.codexTierForTest ?? opts.codex_tier_for_test) === "standard";

@@ -124,6 +124,15 @@ export const REPROS: Repro[] = [
   { id: "C24b", title: "stray copy without sessionId, other input and no timestamp", files: [f(S, [cl({ req: "r1" }), JSON.stringify({ ...JSON.parse(cl({ req: "r1", usage: { input_tokens: 6 } })), sessionId: undefined, timestamp: undefined, uuid: "u-x" })])], opts: {} },
   { id: "C25", title: "unlisted-type records equal except parentUuid / logicalParentUuid / version", files: [f(S, [cl({ req: "r1" }), JSON.stringify({ type: "mystery", uuid: "m1", sessionId: "s1", timestamp: T("00:00:01.000"), parentUuid: "a", logicalParentUuid: "x", version: "2.1.293" }), JSON.stringify({ type: "mystery", uuid: "m1", sessionId: "s1", timestamp: T("00:00:01.000"), parentUuid: "b", logicalParentUuid: "x", version: "2.1.293" }), JSON.stringify({ type: "mystery", uuid: "m1", sessionId: "s1", timestamp: T("00:00:01.000"), parentUuid: "a", logicalParentUuid: "y", version: "2.1.293" }), JSON.stringify({ type: "mystery", uuid: "m1", sessionId: "s1", timestamp: T("00:00:01.000"), parentUuid: "a", logicalParentUuid: "x", version: "9.9.9" })])], opts: {} },
   { id: "C26", title: "Codex thread_token_usage.total_tokens out of range (-1, 1.5, 2^53) with valid usage", files: [f(X("t1"), [cxMeta("t1"), ...[-1, 1.5, 9007199254740992].map((v, i) => JSON.stringify({ ...JSON.parse(cxUse(`x${i}`, "t1", i + 1, T(`00:0${i + 1}:00.000`))), payload: { ...JSON.parse(cxUse(`x${i}`, "t1", i + 1, T("00:00:00.000"))).payload, thread_token_usage: { total_tokens: v } } }))])], opts: {} },
+  ...[
+    ["a", "projects/p/subagents/agent-a1.jsonl"],
+    ["b", "projects/p/s1/x/subagents/agent-a1.jsonl"],
+    ["c", "projects/p/s1/subagents/workflows/wf_w/deeper/agent-a1.jsonl"],
+    ["d", "projects/p/.jsonl"],
+    ["e", "projects/p/s1/subagents/agent-a1.jsonl"],
+  ].map(([k, path]): Repro => ({ id: `C27${k}`, title: `Claude request file at layout ${path}`, files: [f(S, [cl({ req: "r0" })]), f(path!, [cl({ req: "r1", agent: "a1", ts: T("00:01:00.000") })])], opts: {} })),
+  { id: "C27f", title: "deep meta.json and journal.jsonl with a broken line", files: [f(S, [cl({ req: "r0" })]), f("projects/p/s1/x/subagents/agent-a1.meta.json", ['{"type":"agent_started"}', "not json", '{"type":']), f("projects/p/s1/x/subagents/workflows/wf_w/journal.jsonl", ['{"type":"agent_started","agentId":"a1"}', "not json", '{"type":'])], opts: {} },
+  { id: "C28", title: "two own session_meta of one id with different fork fields (forked_from_id t1/x, history ordinal 4 / string)", files: [f(X("t2"), [cxMeta("t2", { ord: 3, payload: { session_id: "t1", forked_from_id: "t1", subagent_history_start_ordinal: 4 } }), cxMeta("t2", { ord: 19, payload: { session_id: "t1", forked_from_id: "x", subagent_history_start_ordinal: "x" } }, T("00:00:05.000")), cxUse("x1", "t2", 20, T("00:01:00.000"))])], opts: {} },
   { id: "C18", title: "equal-looking duplicate response_id (control: must agree)", files: [f(X("t1"), [cxMeta("t1"), cxUse("x1", "t1", 1, T("00:01:00.000")), cxUse("x1", "t1", 1, T("00:01:00.000"))])], opts: {} },
 ];
 

@@ -166,44 +166,44 @@ async function codexCandidates(
 const ROLLOUT_RE = /^rollout-.*\.jsonl$/;
 const ROLLOUT_ZST_RE = /^rollout-.*\.jsonl\.zst$/;
 
-/** Classify a Claude file given path segments relative to a projects/ root. Null for files we do not read. */
+/**
+ * Classify a Claude file given path segments relative to a projects/ root. Null for files we do not read. S10.0, S12.6a:
+ * a path is discovered only at the listed depth and names, never by searching for a `subagents` segment.
+ *   <project>/<session>.jsonl
+ *   <project>/<session>/subagents/agent-<id>.{jsonl,meta.json,prefix.json}
+ *   <project>/<session>/subagents/workflows/wf_<run>/{agent-<id>.{jsonl,meta.json,prefix.json},journal.jsonl}
+ *   <project>/<session>/workflows/wf_<run>.json
+ */
 export function classifyClaude(segments: string[]): ClassifiedClaude | null {
   const name = segments[segments.length - 1] ?? "";
-  const subIdx = segments.indexOf("subagents");
-  if (subIdx >= 1 && subIdx < segments.length - 1) {
-    const sessionId = segments[subIdx - 1];
-    if (segments[subIdx + 1] === "workflows") {
-      // Exactly subagents/workflows/wf_<runId>/<file>.
-      const wf = /^wf_(.+)$/.exec(segments[subIdx + 2] ?? "");
-      if (!wf || segments.length !== subIdx + 4) return null;
-      const runId = wf[1];
-      if (name === "journal.jsonl") return { kind: "claude-workflow-journal", sessionId, runId, workflowAgent: true } as ClassifiedClaude;
-      const a = /^agent-(.+)\.jsonl$/.exec(name);
-      if (a) return { kind: "claude-subagent", sessionId, agentId: a[1], runId, workflowAgent: true };
-      // S12.6: the JSON sidecars of a workflow agent are discovered files (one file, one line). They link nothing (R5.4).
-      const wm = /^agent-(.+)\.meta\.json$/.exec(name);
-      if (wm) return { kind: "claude-subagent-meta", sessionId, agentId: wm[1], runId, workflowAgent: true };
-      const wp = /^agent-(.+)\.prefix\.json$/.exec(name);
-      if (wp) return { kind: "claude-subagent-prefix", sessionId, agentId: wp[1], runId, workflowAgent: true };
-      return null;
-    }
-    if (segments.length !== subIdx + 2) return null;
+  const agentFile = (sessionId: string | undefined, runId: string | undefined, workflow: boolean): ClassifiedClaude | null => {
+    const extra = workflow ? { runId, workflowAgent: true } : {};
     let m = /^agent-(.+)\.jsonl$/.exec(name);
-    if (m) return { kind: "claude-subagent", sessionId, agentId: m[1] };
+    if (m) return { kind: "claude-subagent", sessionId, agentId: m[1], ...extra } as ClassifiedClaude;
     m = /^agent-(.+)\.meta\.json$/.exec(name);
-    if (m) return { kind: "claude-subagent-meta", sessionId, agentId: m[1] };
+    if (m) return { kind: "claude-subagent-meta", sessionId, agentId: m[1], ...extra } as ClassifiedClaude;
     m = /^agent-(.+)\.prefix\.json$/.exec(name);
-    if (m) return { kind: "claude-subagent-prefix", sessionId, agentId: m[1] };
+    if (m) return { kind: "claude-subagent-prefix", sessionId, agentId: m[1], ...extra } as ClassifiedClaude;
     return null;
+  };
+  // <project>/<session>.jsonl (a non-empty session stem)
+  if (segments.length === 2) {
+    return name.endsWith(".jsonl") && name.length > ".jsonl".length ? { kind: "claude-main", sessionId: name.slice(0, -".jsonl".length) } : null;
   }
-  // <project>/<session>.jsonl
-  if (segments.length === 2 && name.endsWith(".jsonl")) {
-    return { kind: "claude-main", sessionId: name.slice(0, -".jsonl".length) };
-  }
-  // <project>/<session>/workflows/wf_<runId>.json
+  // <project>/<session>/workflows/wf_<run>.json
   if (segments.length === 4 && segments[2] === "workflows") {
     const m = /^wf_(.+)\.json$/.exec(name);
-    if (m) return { kind: "claude-workflow-run", sessionId: segments[1], runId: m[1] };
+    return m ? { kind: "claude-workflow-run", sessionId: segments[1], runId: m[1] } : null;
+  }
+  if (segments[2] !== "subagents") return null;
+  // <project>/<session>/subagents/<file>
+  if (segments.length === 4) return agentFile(segments[1], undefined, false);
+  // <project>/<session>/subagents/workflows/wf_<run>/<file>
+  if (segments.length === 6 && segments[3] === "workflows") {
+    const wf = /^wf_(.+)$/.exec(segments[4] ?? "");
+    if (!wf) return null;
+    if (name === "journal.jsonl") return { kind: "claude-workflow-journal", sessionId: segments[1], runId: wf[1], workflowAgent: true } as ClassifiedClaude;
+    return agentFile(segments[1], wf[1], true);
   }
   return null;
 }

@@ -98,6 +98,7 @@ const FEATURES = {
   io_crlf_bom: 0.06, // CRLF line endings and a UTF-8 BOM at the start of a log file (R1.3)
   c_cost_state: 0.15, // cost-state records with modelUsage members (R17.5)
   c_compact: 0.15, // compact_boundary system records with preTokens and postTokens
+  c_cost_full: 0.5, // cost-state modelUsage with all 7 real members (thinkingTokens, webSearchRequests, fractional costUSD)
 } as const;
 
 /** Injected defects. */
@@ -152,6 +153,15 @@ const MALFORMATIONS = {
   c_stray_copy: 0.06, // extra copy of an existing requestId without sessionId (maybe no timestamp, other input or model)
   c_mystery_dups: 0.08, // unlisted-type records duplicated except parentUuid, logicalParentUuid or version
   x_total_range: 0.06, // thread_token_usage.total_tokens out of range while usage is valid
+  c_cost_dupkey: 0.2, // two modelUsage keys that differ only by a date suffix (only with c_cost_state)
+  c_cost_alias: 0.2, // costState.modelUsage alias record, which must be ignored (only with c_cost_state)
+  c_compact_subtype: 0.2, // system record with compactMetadata.preTokens out of range and subtype other, absent or a number
+  c_bad_layout: 0.08, // Claude files at wrong layouts (too deep, wrong parents, name .jsonl)
+  c_dual_agent: 0.08, // one agent chain in subagents/ and in subagents/workflows/wf_w/ (the second holds one odd record)
+  c_journal_dups: 0.25, // journal.jsonl rows that duplicate, or share agentId with another type
+  io_nonobject_lines: 0.06, // JSON lines that are not objects: 5, [1], null, "x"
+  c_other_fields: 0.15, // user, system, attachment records differing only in advisorModel, serverClassifierRequest, content ids
+  x_meta_types: 0.06, // own session_meta with forked_from_id or session_id of the wrong type, and a session_meta without id
   x_dup_meta: 0.05, // second own session_meta of one thread, equal ordinal, no timestamp, other thread_source
 } as const;
 
@@ -401,6 +411,19 @@ function blankLines(c: Ctx, lines: string[]): void {
   if (!hit) return;
   used(c, "io_blank_lines");
   const fills = ["", "   ", "\t", "\t  \t", "\r"];
+  for (const pp of [p1, p2, p3].slice(0, n)) lines.splice(Math.floor(pp * (lines.length + 1)), 0, fills[Math.floor(pp * 1000) % fills.length]!);
+}
+
+/** JSON lines that are not objects. Constant draws. */
+function nonObjectLines(c: Ctx, lines: string[]): void {
+  const hit = c.r.chance(c.k.io_nonobject_lines);
+  const n = c.r.int(1, 3);
+  const p1 = c.r.f();
+  const p2 = c.r.f();
+  const p3 = c.r.f();
+  if (!hit) return;
+  used(c, "io_nonobject_lines");
+  const fills = ["5", "[1]", "null", '"x"', "true", "[]"];
   for (const pp of [p1, p2, p3].slice(0, n)) lines.splice(Math.floor(pp * (lines.length + 1)), 0, fills[Math.floor(pp * 1000) % fills.length]!);
 }
 
@@ -741,6 +764,19 @@ function claudeOther(c: Ctx, th: ClaudeThread): void {
     rec.content = "synthetic-system";
   } else if (type === "attachment") rec.attachment = { type: "synthetic-attachment" };
   th.records.push(rec);
+  const ofHit = r.chance(c.k.c_other_fields);
+  const ofVariants = [r.int(0, 3), r.int(0, 3)];
+  if (ofHit && type !== "mystery") {
+    used(c, "c_other_fields");
+    for (const v of ofVariants) {
+      const d: Obj = structuredClone(rec);
+      if (v === 0) d.advisorModel = r.pick(CLAUDE_MODELS);
+      else if (v === 1) d.serverClassifierRequest = r.pick<unknown>([true, false, {}, "x"]);
+      else if (v === 2) d.message = { role: "user", content: [{ type: "tool_result", tool_use_id: "synthetic-toolu-a" }] };
+      else d.message = { role: "user", content: [{ type: "tool_use", id: "synthetic-toolu-b", name: "Agent" }] };
+      th.records.push(d);
+    }
+  }
   // unlisted-type records that are duplicates except for parentUuid, logicalParentUuid or version
   const dupHit = r.chance(c.k.c_mystery_dups);
   const dupVariant = r.int(0, 2);
@@ -782,20 +818,33 @@ function claudeCostState(c: Ctx, th: ClaudeThread): void {
   const r = c.r;
   const has = r.chance(c.k.c_cost_state);
   const bad = r.chance(c.k.c_cost_range);
+  const full = r.chance(c.k.c_cost_full);
+  const dupKey = r.chance(c.k.c_cost_dupkey);
+  const alias = r.chance(c.k.c_cost_alias);
   const badPick = r.f();
-  const badSlot = r.int(0, 3);
+  const badSlot = r.int(0, 4);
   const nModels = r.int(1, 2);
-  const names = ["inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"];
+  const names = full ? ["inputTokens", "outputTokens", "thinkingTokens", "cacheReadInputTokens", "cacheCreationInputTokens"] : ["inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"];
   const body: Obj = {};
   for (let i = 0; i < nModels; i++) {
     const m = r.pick(CLAUDE_MODELS);
     const u: Obj = {};
     for (const n of names) u[n] = r.int(0, 50000);
+    const web = r.int(0, 5);
+    const usd = Math.round(r.f() * 100000) / 10000;
+    if (full) {
+      u.webSearchRequests = web;
+      u.costUSD = usd;
+    }
     if (bad && i === 0) {
       used(c, "c_cost_range");
-      u[names[badSlot]!] = RANGE_BAD[Math.floor(badPick * RANGE_BAD.length)];
+      u[names[badSlot % names.length]!] = RANGE_BAD[Math.floor(badPick * RANGE_BAD.length)];
     }
     body[m] = u;
+    if (dupKey && i === 0) {
+      used(c, "c_cost_dupkey");
+      body[`${m}-20251001`] = { ...u, inputTokens: typeof u.inputTokens === "number" ? u.inputTokens + 1 : 1 };
+    }
   }
   const t = r.int(1, 30) * 1000;
   if (!has) return;
@@ -804,6 +853,12 @@ function claudeCostState(c: Ctx, th: ClaudeThread): void {
   const rec = claudeBase(c, th, "cost-state", th.clock);
   rec.modelUsage = body;
   th.records.push(rec);
+  if (alias) {
+    used(c, "c_cost_alias");
+    const rec2 = claudeBase(c, th, "cost-state", th.clock + 1000);
+    rec2.costState = { modelUsage: structuredClone(body) };
+    th.records.push(rec2);
+  }
 }
 
 /** compact_boundary system record with preTokens and postTokens, some out of range with c_compact_range. */
@@ -815,6 +870,8 @@ function claudeCompact(c: Ctx, th: ClaudeThread): void {
   const which = r.chance(0.5);
   const pre = r.int(1000, 200000);
   const post = r.int(100, 20000);
+  const subBad = r.chance(c.k.c_compact_subtype);
+  const subPick = r.int(0, 3);
   const t = r.int(1, 30) * 1000;
   if (!has) return;
   used(c, "c_compact");
@@ -829,6 +886,14 @@ function claudeCompact(c: Ctx, th: ClaudeThread): void {
   if (bad) {
     used(c, "c_compact_range");
     meta[which ? "preTokens" : "postTokens"] = RANGE_BAD[Math.floor(badPick * RANGE_BAD.length)];
+  }
+  if (subBad) {
+    used(c, "c_compact_subtype");
+    meta.preTokens = RANGE_BAD[Math.floor(badPick * RANGE_BAD.length)];
+    if (subPick === 0) rec.subtype = "other";
+    else if (subPick === 1) delete rec.subtype;
+    else if (subPick === 2) rec.subtype = 5;
+    else rec.subtype = null;
   }
   rec.compactMetadata = meta;
   th.records.push(rec);
@@ -894,6 +959,15 @@ function genClaudeSession(c: Ctx, idx: number): ClaudeSessionOut {
       out.agents.push(f);
       journal.push({ type: "agent_started", agentId, key: "synthetic-key", label: "synthetic-label", result: "synthetic-result" });
     }
+    if (r.chance(k.c_journal_dups)) {
+      used(c, "c_journal_dups");
+      const first = journal[0];
+      if (first) {
+        journal.push({ ...first });
+        journal.push({ ...first, type: "agent_finished" });
+        journal.push({ ...first, type: "mystery" });
+      }
+    }
     let json: string | null = JSON.stringify({ runId, status: "completed", label: "synthetic-label" }) + "\n";
     let jl: string | null = journal.map((j) => JSON.stringify(j)).join("\n") + "\n";
     if (r.chance(k.c_bad_sidecar)) {
@@ -946,6 +1020,7 @@ function claudeFiles(c: Ctx, sessions: readonly ClaudeSessionOut[]): void {
       lines.splice(r.int(0, lines.length), 0, r.pick(["not json at all", '{"type":"assistant","message":', "}{", "\u0000"]));
     }
     blankLines(c, lines);
+    nonObjectLines(c, lines);
     let body = lines.join("\n") + "\n";
     if (r.chance(k.c_truncated_tail)) {
       used(c, "c_truncated_tail");
@@ -978,6 +1053,8 @@ function claudeFiles(c: Ctx, sessions: readonly ClaudeSessionOut[]): void {
     }
   }
   strayClaudeSidecars(c, sessions);
+  badClaudeLayouts(c, sessions);
+  dualAgentFiles(c, sessions);
 }
 
 /** Sidecars in places no reader looks at. Constant draws. */
@@ -1003,6 +1080,60 @@ function strayClaudeSidecars(c: Ctx, sessions: readonly ClaudeSessionOut[]): voi
   ];
   const [path, content] = files[pick]!;
   c.files.push({ path, content, mtimeMs: OLD_MTIME_MS });
+}
+
+/** Claude files at wrong layouts. Constant draws. */
+function badClaudeLayouts(c: Ctx, sessions: readonly ClaudeSessionOut[]): void {
+  const r = c.r;
+  const hit = r.chance(c.k.c_bad_layout);
+  const picks = [r.int(0, 5), r.int(0, 5)];
+  const s = sessions[r.int(0, sessions.length - 1)];
+  const sub = r.sub();
+  if (!hit || !s) return;
+  used(c, "c_bad_layout");
+  const base = `projects/${s.proj}/${s.sessionId}`;
+  const th = newThread(c, s.sessionId, "synthetic-agent-layout", s.main.clock + 5000, s.main.version);
+  claudeRequest({ ...c, r: sub }, th, {});
+  const body = th.records.map(jsonLine).join("\n") + "\n";
+  const broken = `{"type":"agent_started","agentId":"synthetic-agent-layout"}\nnot json\n{"type":`;
+  const variants: Array<[string, string]> = [
+    [`projects/${s.proj}/subagents/agent-synthetic-agent-layout.jsonl`, body],
+    [`${base}/x/subagents/agent-synthetic-agent-layout.jsonl`, body],
+    [`${base}/subagents/workflows/wf_deep/deeper/agent-synthetic-agent-layout.jsonl`, body],
+    [`projects/${s.proj}/.jsonl`, body],
+    [`${base}/x/subagents/agent-synthetic-agent-layout.meta.json`, broken],
+    [`${base}/x/subagents/workflows/wf_deep/journal.jsonl`, broken],
+  ];
+  for (const pk of new Set(picks)) {
+    const [path, content] = variants[pk]!;
+    c.files.push({ path, content, mtimeMs: OLD_MTIME_MS });
+  }
+}
+
+/** The same agent chain in subagents/ and in subagents/workflows/wf_dual/, the second file holding one odd record. */
+function dualAgentFiles(c: Ctx, sessions: readonly ClaudeSessionOut[]): void {
+  const r = c.r;
+  const hit = r.chance(c.k.c_dual_agent);
+  const kind = r.int(0, 2);
+  const sub = r.sub();
+  const s = sessions.find((x) => x.agents.some((a) => a.workflowRun === null));
+  if (!hit || !s) return;
+  const a = s.agents.find((x) => x.workflowRun === null)!;
+  used(c, "c_dual_agent");
+  const th = newThread(c, s.sessionId, a.agentId, a.thread.clock + 3000, kind === 2 ? "2.0.1" : s.main.version);
+  let recs: Obj[];
+  if (kind === 0) {
+    const rec = claudeBase({ ...c, r: sub }, th, "mystery", th.clock);
+    recs = [rec];
+  } else if (kind === 1) {
+    const rec = claudeBase({ ...c, r: sub }, th, "cost-state", th.clock);
+    rec.modelUsage = { "claude-opus-5-5": { inputTokens: 5, outputTokens: 7, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 } };
+    recs = [rec];
+  } else {
+    claudeRequest({ ...c, r: sub }, th, {});
+    recs = th.records;
+  }
+  c.files.push({ path: `projects/${s.proj}/${s.sessionId}/subagents/workflows/wf_dual/agent-${a.agentId}.jsonl`, content: recs.map(jsonLine).join("\n") + "\n", mtimeMs: OLD_MTIME_MS });
 }
 
 function genClaude(c: Ctx): void {
@@ -1403,6 +1534,27 @@ function mutateCodex(c: Ctx, threads: CxThread[]): void {
   for (const [th, arr] of extraByThread) th.lines.push(...arr);
   // 3. unknown record type, stream conflicts
   for (const th of threads) {
+    const metaTypes = r.chance(k.x_meta_types);
+    const metaVariant = r.int(0, 3);
+    const metaWrong = r.pick<unknown>([{}, 5, [], "x"]);
+    if (metaTypes) {
+      const first = th.lines.find((l) => l.type === "session_meta");
+      if (first) {
+        used(c, "x_meta_types");
+        const p2: Obj = structuredClone(first.payload);
+        if (metaVariant === 0) p2.forked_from_id = metaWrong;
+        else if (metaVariant === 1) p2.session_id = metaWrong;
+        else if (metaVariant === 2) {
+          delete p2.id;
+          p2.forked_from_id = th.id;
+          p2.subagent_history_start_ordinal = 2;
+        } else {
+          p2.forked_from_id = metaWrong;
+          p2.subagent_history_start_ordinal = metaWrong;
+        }
+        th.lines.push({ type: "session_meta", ordinal: th.ordinal++, timestamp: new Date(th.clock + 500).toISOString(), ms: th.clock + 500, payload: p2 });
+      }
+    }
     const dupMeta = r.chance(k.x_dup_meta);
     const dupMetaSrc = r.chance(0.5);
     if (dupMeta) {
@@ -1450,6 +1602,7 @@ function codexFiles(c: Ctx, threads: CxThread[]): void {
       lines.splice(r.int(0, lines.length), 0, r.pick(["not json at all", '{"type":"token_usage_record","payload":', "}{"]));
     }
     blankLines(c, lines);
+    nonObjectLines(c, lines);
     let splits: number[] = [];
     if (r.chance(k.x_split_file) && lines.length > 2) {
       used(c, "x_split_file");

@@ -488,6 +488,25 @@ function parseAsst(o: Obj, ctx: FileCtx): { a: Asst; proj: unknown[] } {
   return { a, proj };
 }
 
+/** S1.3c, S5.1: the content blocks of a record (type, ids, tool name), the same shape on every graph record type. */
+function blocksProj(content: unknown): unknown[] {
+  const blocks: unknown[] = [];
+  if (content !== undefined && content !== null && !Array.isArray(content)) blocks.push(["~bad", null, null, null]);
+  if (Array.isArray(content)) {
+    for (const b of content) {
+      if (!isObj(b)) {
+        blocks.push(["other", null, null, null]);
+        continue;
+      }
+      const bt = pick(b["type"], BLOCK_VALUES);
+      if (bt === "tool_use") blocks.push([bt, idProj(b["id"]), pick(b["name"], TOOL_NAMES), null]);
+      else if (bt === "tool_result") blocks.push([bt, null, null, idProj(b["tool_use_id"])]);
+      else blocks.push([bt, null, null, null]);
+    }
+  }
+  return blocks;
+}
+
 function parseSys(o: Obj): { s: SysData; side: number; proj: unknown[] } {
   const subtype = pick(o["subtype"], ["compact_boundary"] as const); // S1.2: missing (null) differs from other
   const boundary = subtype === "compact_boundary";
@@ -517,42 +536,34 @@ function parseSys(o: Obj): { s: SysData; side: number; proj: unknown[] } {
   };
 }
 
-const COST_SLOTS: Array<[string, string]> = [
-  ["inputTokens", "input_tokens"],
-  ["outputTokens", "output_tokens"],
-  ["cacheReadInputTokens", "cache_read_input_tokens"],
-  ["cacheCreationInputTokens", "cache_creation_input_tokens"],
-];
+/** S12.0: the token members of a `modelUsage` entry. The first four feed the R17.5 estimate; `thinkingTokens` is range checked. */
+const COST_SLOTS = ["inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"] as const;
+const COST_MEMBERS = [...COST_SLOTS, "thinkingTokens"] as const;
 
 function parseCost(o: Obj): { c: CostData; side: number; proj: unknown[] } {
-  const raw = isObj(o["modelUsage"])
-    ? o["modelUsage"]
-    : isObj(o["costState"]) && isObj((o["costState"] as Obj)["modelUsage"])
-      ? ((o["costState"] as Obj)["modelUsage"] as Obj)
-      : undefined;
+  // S12.0: only the top-level `modelUsage` is read, no alias path.
+  const raw = isObj(o["modelUsage"]) ? o["modelUsage"] : undefined;
   const models: CostData["models"] = [];
   const projRows: Array<[string, string[]]> = [];
   let side = 0;
   if (raw !== undefined) {
     for (const [name, val] of Object.entries(raw)) {
+      // the estimate matches responses by their normalized model; the range check and the projection use the raw key
       const model = normModel(name) ?? "unlisted";
       const slots: Array<bigint | null> = [];
       const states: string[] = [];
-      for (const [camel, snake] of COST_SLOTS) {
-        const c = isObj(val) ? cnt(val[camel] ?? val[snake]) : "missing";
+      for (const member of COST_MEMBERS) {
+        const c = isObj(val) ? cnt(val[member]) : "missing";
         states.push(cntProj(c));
-        if (isBig(c)) slots.push(c);
-        else {
-          if (c === "range") side++;
-          slots.push(null);
-        }
+        if (c === "range") side++; // once per raw model key and member
+        if ((COST_SLOTS as readonly string[]).includes(member)) slots.push(isBig(c) ? c : null);
       }
       models.push([model, slots]);
-      projRows.push([model, states]);
+      projRows.push([name, states]);
     }
     // Two keys can normalize to one model: the order must not depend on key order (R4.10), so ties break on the slots.
     models.sort((x, y) => cmpStr(x[0], y[0]) || cmpStr(JSON.stringify(x[1].map(String)), JSON.stringify(y[1].map(String))));
-    projRows.sort((x, y) => cmpStr(x[0], y[0]) || cmpStr(JSON.stringify(x[1]), JSON.stringify(y[1])));
+    projRows.sort((x, y) => cmpStr(x[0], y[0]));
   }
   return { c: { models }, side, proj: projRows };
 }
@@ -561,7 +572,7 @@ function parseCost(o: Obj): { c: CostData; side: number; proj: unknown[] } {
 function makeRec(v: unknown, ctx: FileCtx): Rec {
   if (!isObj(v)) {
     return {
-      d: sha(JSON.stringify(["nonobject", typeof v])),
+      d: sha(JSON.stringify(["nonobject"])), // S1.3c: all non-object lines are equal records of type `missing`
       type: "other",
       graph: false,
       ver: "unlisted",
@@ -591,7 +602,7 @@ function makeRec(v: unknown, ctx: FileCtx): Rec {
     const rc = resolveChain(v);
     return {
       // S1.2: an absent record type is `missing`, an unlisted one is `other`, and the two differ.
-      d: sha(JSON.stringify([v["type"] === undefined || v["type"] === null ? "missing" : "other", idProj(v["uuid"]), idProj(v["parentUuid"]), idProj(v["logicalParentUuid"]), idProj(v["sessionId"]), idProj(v["agentId"]), tsP, typeof v["version"] === "string" && VERSION_RE.test(v["version"]) ? v["version"] : "unlisted"])),
+      d: sha(JSON.stringify([v["type"] === undefined || v["type"] === null ? "missing" : "other", idProj(v["uuid"]), idProj(v["parentUuid"]), idProj(v["logicalParentUuid"]), idProj(v["sessionId"]), idProj(v["agentId"]), tsP, v["version"] === undefined || v["version"] === null ? "~missing" : typeof v["version"] === "string" && VERSION_RE.test(v["version"]) ? v["version"] : "unlisted"])),
       type,
       graph: false,
       ver: "unlisted",
@@ -611,6 +622,7 @@ function makeRec(v: unknown, ctx: FileCtx): Rec {
   const { S, T, hasSid } = resolveChain(v);
   const verRaw = v["version"];
   const ver = typeof verRaw === "string" && VERSION_RE.test(verRaw) ? verRaw : "unlisted";
+  const verP = verRaw === undefined || verRaw === null ? "~missing" : ver; // S1.3b: absent differs from off the grammar
   const graph = type !== "cost-state";
   const supported = graph ? FULL_VERSIONS.has(ver) : true;
   const parent = str(v["parentUuid"]);
@@ -626,8 +638,8 @@ function makeRec(v: unknown, ctx: FileCtx): Rec {
     idProj(v["sessionId"]),
     idProj(v["agentId"]),
     tsP,
-    ver,
-    boolProj(v["isCompactSummary"]),
+    verP,
+    ...(type === "cost-state" ? [] : [boolProj(v["isCompactSummary"])]), // S1.3c: a cost-state record projects the common fields
   ];
   const rec: Rec = {
     d: "",
@@ -665,24 +677,15 @@ function makeRec(v: unknown, ctx: FileCtx): Rec {
   } else if (type === "user") {
     const msg = isObj(v["message"]) ? v["message"] : undefined;
     const role = pick(msg?.["role"], ["user", "assistant"] as const);
-    const blocks: unknown[] = [];
-    const content = msg?.["content"];
-    if (content !== undefined && content !== null && !Array.isArray(content)) blocks.push(["~bad", null]);
-    if (Array.isArray(content)) {
-      for (const b of content) {
-        if (!isObj(b)) {
-          blocks.push(["other", null]);
-          continue;
-        }
-        const bt = pick(b["type"], BLOCK_VALUES);
-        blocks.push([bt, bt === "tool_result" ? idProj(b["tool_use_id"]) : null]);
-      }
-    }
-    extra = [role, blocks];
+    extra = [role]; // the content blocks are part of the shared fields of every graph record
+
   }
   // Fields read on every graph record (R1.2) that are not used downstream still take part in equality.
   const shared: unknown[] = graph
     ? [
+        normModel(v["advisorModel"]),
+        v["serverClassifierRequest"] !== undefined && v["serverClassifierRequest"] !== null,
+        blocksProj(isObj(v["message"]) ? v["message"]["content"] : undefined),
         boolProj(v["isSidechain"]),
         boolProj(v["isApiErrorMessage"]),
         pick(v["entrypoint"], ENTRY_VALUES),
@@ -1138,7 +1141,7 @@ interface ChainAgg {
   /** stream_start, exact nanoseconds (R4.6, S3.3). */
   start: bigint | null;
   files: Set<number>;
-  workflowFile: boolean;
+  workflowFile: boolean; // unused: the kind follows wfChain (S10.1)
 }
 
 const FLAG_ORDER: ReadonlyMap<ResponseFlag, number> = new Map(RESPONSE_FLAGS.map((f, i) => [f, i]));
@@ -1231,9 +1234,12 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
         else tail++;
         continue;
       }
-      const type = isObj(v) && v["type"] === "started" ? "started" : "other";
-      const agent = isObj(v) ? str(v["agentId"]) : null;
-      const d = sha(JSON.stringify([type, agent]));
+      // S1.3c: a journal record projects to its `type` (enum state: missing, started, other) and `agentId` (id state)
+      // only; a line that is not a JSON object is a record of type `missing` with no other field.
+      const type = pick(isObj(v) ? v["type"] : undefined, ["started"] as const);
+      const agentRaw: unknown = isObj(v) ? v["agentId"] : undefined;
+      const agent = str(agentRaw);
+      const d = sha(JSON.stringify([type, idProj(agentRaw)]));
       seenLines.set(d, (seenLines.get(d) ?? 0) + 1);
       if (type === "started" && agent !== null) started.push(agent);
     }
@@ -1351,6 +1357,7 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
   // below are built from sets of collapsed records, so line order, file order and duplication cannot change them.
   const chainKeyOf = (S: string, T: string): ChainKey => ({ provider: "claude", root_session: S, thread: T });
   const cidOf = (S: string, T: string): ChainId => chainIdOf(chainKeyOf(S, T));
+  const wfChain = new Map<string, number>(); // chain -> lowest index of a workflow agent file that names it (S10.1)
   const seenChains = new Set<ChainId>();
   const bySession = new Map<string, Set<ChainId>>(); // R0.9 link (i)
   const named: Array<Set<ChainId>> = files.map(() => new Set<ChainId>());
@@ -1377,7 +1384,16 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     let g = bySession.get(r.S);
     if (!g) bySession.set(r.S, (g = new Set()));
     g.add(id);
-    for (const fi of r.files) named[fi]?.add(id);
+    for (const fi of r.files) {
+      named[fi]?.add(id);
+      // S10.1: any parsed record that names the chain (any type, any version) under subagents/workflows/wf_*/ makes it a
+      // workflow agent chain; the lowest file index names its run.
+      if ((files[fi] as DiscoveredFile).workflowAgent === true) {
+        const k = chainStr(r.S, r.T);
+        const have = wfChain.get(k);
+        if (have === undefined || fi < have) wfChain.set(k, fi);
+      }
+    }
   }
 
   // ----- phase 4: chains / streams ---------------------------------------------------------------------------
@@ -1711,7 +1727,7 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
       const flags = new Set<ResponseFlag>(sh.flags);
       if (own.ambiguous) flags.add("ownership_ambiguous");
       let kind: RequestKind = "main";
-      if (agg.T !== "main") kind = agg.workflowFile ? "workflow_agent" : "subagent";
+      if (agg.T !== "main") kind = wfChain.has(cs) ? "workflow_agent" : "subagent";
       const role = cs === own.owner ? "owner" : "replayed";
       const r: ClaudeResponse = {
         provider: "claude",
@@ -1798,7 +1814,8 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     // The agent file(s) that contributed records to this chain, in canonical order. Linkage is judged on them
     // because the directory (path) is the only place where meta.json, journal and run files live.
     const contributing = [...agg.files].sort((x, y) => x - y);
-    const wfFiles = contributing.filter((fi) => (files[fi] as DiscoveredFile).workflowAgent === true);
+    const wfIdx = wfChain.get(ck);
+    const wfFiles = wfIdx === undefined ? [] : [wfIdx];
     const agentFiles = contributing.filter((fi) => {
       const f = files[fi] as DiscoveredFile;
       return f.kind === "claude-subagent" && f.workflowAgent !== true;
