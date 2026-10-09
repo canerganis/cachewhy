@@ -601,3 +601,34 @@ Further resolutions in the same step:
 Verification: `npm run typecheck`, `npm run build`, `npm run lint:privacy` and `npm pack --dry-run` clean. `npm test`: 1091 pass, 0 fail, 0 todo. Fuzz: 1000 seeds of every generator suite at scale 1 and at scale 2, plus table seeds 1 to 1000, gave 0 divergences.
 
 Next: G1 audit round 7, with `src/report`, `src/discover.ts` and `src/io` embedded.
+
+## G1 round 7
+
+Auditor: `gpt-6.1-sol`, medium effort, read-only. The prompt now also embeds `src/report/*.ts`, `src/discover.ts` and `src/io/*.ts`. Target: commit `61edfdb`. Verdict: FAIL, with 0 P0, 4 P1 and 0 P2. Each finding was re-checked against the code; all four are correct and none was rejected.
+
+| # | Sev | Rules | Finding (short) | Resolution |
+|---|---|---|---|---|
+| 1 | P1 | R0.9, R17.1 | A discovered path whose `stat` fails (a broken symbolic link to a log) was skipped by both implementations, so it was neither counted unreadable nor tainted the provider | New S12.6c: such a path is a discovered file, counted in `files_total` and `files_unreadable`, and it taints the provider with `file_unreadable`. Both implementations changed |
+| 2 | P1 | S12.7, R13.2 | src keyed model rows by (model, verified) and recompute by model alone, so a model with clean and tainted responses had different rows | S12.7 now keys rows by the pair (model key, `model_verified`). recompute changed, and the fuzz compares model rows exactly |
+| 3 | P1 | S8.5b (4), (5), (7) | recompute accepted an empty `multipliers` object on a documented model and a non-object modifier, and did not count entry ids in the duplicate check | S8.5b states each case; recompute changed and src is pinned by tests |
+| 4 | P1 | S8.5b (6) | The table-level copies `modifiers.openai_long_context.threshold_input_tokens` and `modifiers.geo_us.multiplier` were not checked against `C25` and `C32` | Both implementations validate every copy at entry and table level |
+
+The table-mutation fuzz gained these mutations, and the generator gained mixed clean and tainted model rows and an unreadable discovered file.
+
+Final answer of round 7, verbatim:
+
+VERDICT: FAIL
+
+- **P1 | src/discover.ts, scripts/recompute/index.mjs | R0.9, R17.1:** Sembolik bağlantıda `stat` başarısız olunca iki keşif uygulaması da `continue` ile girdiyi kaybediyor. Okunamayan bir günlük bağlantısı `files_unreadable` sayılmıyor ve sağlayıcı taint almıyor; kalan Claude yanıtları fiyatlanabiliyor. **Düzeltme:** Keşif kapsamına giren bağlantıları okunamayan dosya girdisi olarak koruyun; sağlayıcı çapında `file_unreadable` uygulayın. Bozuk günlük bağlantılı fixture ekleyin.
+
+- **P1 | src/report/input.ts `rowKey`, scripts/recompute/index.mjs `byModel` | S12.7, R13.2:** Aynı Claude modelinin temiz ve tainted yanıtları ana uygulamada doğrulama durumuna göre iki model satırına ayrılıyor; recompute bunları tek model satırında topluyor. Örneğin aynı modeli kullanan iki oturumdan biri tainted olduğunda model başına yanıt ve bucket sonuçları aynı normal formda değil. **Düzeltme:** Model satırını yalnız S12.7 model anahtarıyla gruplayın; satırdaki herhangi bir yanıt doğrulanmamışsa `model_verified=false` yapın. Karışık temiz/tainted fixture üzerinde model satırlarını tam karşılaştırın.
+
+- **P1 | scripts/recompute/index.mjs `validateTable`, `checkDocumented` | S8.5b(4),(5),(7), R13.2:** Tablo doğrulaması ana uygulamayla eşdeğer değil. Claude girdisinde `multipliers={}` recompute tarafından kabul edilirken ana uygulama reddediyor; `modifiers.geo_us=5` de recompute kontrolünden geçiyor. Ayrıca recompute duplicate kontrolünde `entry.id` değerlerini kapsamıyor. **Düzeltme:** Zorunlu belgelenmiş çarpanların eksikliğini reddedin, her modifier için boolean `verified` zorunlu tutun ve normalize edilmiş `id` ile `model_ids` birleşiminde duplicate kontrolü yapın. Her karşı örnekte iki yükleyicinin de tabloyu reddettiğini doğrulayın.
+
+- **P1 | src/pricing/index.ts, scripts/recompute/index.mjs | S8.5b(6):** Tablo düzeyindeki `modifiers.openai_long_context.threshold_input_tokens` kontrol edilmiyor. Bunu `272001` yapmak, model düzeyindeki eşikler değişmeden iki uygulamada da kabul ediliyor; bağlayıcı C25 kopyası doğrulaması eksik. **Düzeltme:** Tablo düzeyindeki eşik dahil tüm C25, C26 ve C32 kopyalarını yükleme sırasında doğrulayın.
+
+Paylaşılan test özeti bu karşı örneklerin doğrulandığını göstermiyor; değerlendirme gömülü kodun statik incelemesine dayanıyor.
+
+A hand-built table case (repro T11, an Anthropic `long_context` object with an extra empty `multipliers` and no prices) also differed. S8.5b (5) now says that the documented-list check applies to the entry multipliers and their inherited copies, and that long-context multipliers are read only by the ratio test of a priced row. recompute changed.
+
+Verification: `npm run typecheck`, `npm run build`, `npm run lint:privacy` and `npm pack --dry-run` clean; `npm test` 1101 pass, 0 fail, 3 skipped. Two of the skips are the broken symbolic link tests, which cannot create a link on this Windows machine (EPERM), so the S12.6c symlink path is not exercised here; the third skip predates this round. Fuzz: 1000 seeds of every generator suite at scale 1 and 2 and table seeds 1 to 1000 gave 0 divergences.

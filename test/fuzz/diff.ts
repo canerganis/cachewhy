@@ -1,8 +1,8 @@
 // Runs src/ and scripts/recompute on one fuzz scan and compares everything both expose (spec R13.1, R13.2). Used by
 // test/differential-fuzz.test.ts and by local triage scripts. All data is synthetic.
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { recompute, type RecomputeResult } from "../../scripts/recompute/index.mjs";
 import { analyze } from "../../src/analyze.ts";
 import { discover } from "../../src/discover.ts";
@@ -169,6 +169,17 @@ export async function runBoth(scan: FuzzScan, opts: RunOptions): Promise<BothRes
   const diffs: Diff[] = [];
   try {
     writeFiles(dir, scan.files);
+    // io_broken_symlink: a symlink with a log name whose target does not exist. Skipped where the platform refuses
+    // symlinks (for example Windows without the symlink privilege): the knob then has no effect there.
+    for (const rel of scan.links ?? []) {
+      try {
+        const abs = join(dir, ...rel.split("/"));
+        mkdirSync(dirname(abs), { recursive: true });
+        symlinkSync(join(dir, "no-such-target"), abs);
+      } catch {
+        // not supported here
+      }
+    }
     let analysis: Awaited<ReturnType<typeof analyze>> | undefined;
     let view: ReturnType<typeof buildReportInput> | undefined;
     let rec: RecomputeResult | undefined;
@@ -311,22 +322,38 @@ function compare(analysis: Awaited<ReturnType<typeof analyze>>, view: ReturnType
     };
     const recTotals = { responses: rp.totals.responses, responses_priced: rp.totals.responses_priced, tokens: rp.totals.tokens, context_tokens: rp.totals.context_tokens, tokens_total: rp.totals.tokens_total, tokens_unpriced: rp.totals.tokens_unpriced, usd_pico: rp.totals.usd_pico };
     deepDiff(srcTotals, recTotals, `totals.${p}`, out);
-    // per model: merge src rows by label
+    // per model: recompute's published rows are keyed `<label>` (verified) and `<label>:unverified`
     const srcModels = new Map<string, { responses: number; responses_priced: number; tokens_unpriced: bigint; usd_pico: bigint; tokens_total: bigint; context_tokens: bigint }>();
     for (const m of t.models) {
-      const label = m.model ?? "model_unknown";
-      const e = srcModels.get(label) ?? { responses: 0, responses_priced: 0, tokens_unpriced: 0n, usd_pico: 0n, tokens_total: 0n, context_tokens: 0n };
-      e.responses += m.responses;
-      e.responses_priced += m.requests_priced;
-      e.tokens_unpriced += m.tokens_unpriced;
-      e.usd_pico += m.usd_pico ?? 0n;
-      e.tokens_total += m.tokens_total;
-      e.context_tokens += m.total_input;
-      srcModels.set(label, e);
+      const label = `${m.model ?? "model_unknown"}${m.model_verified ? "" : ":unverified"}`;
+      srcModels.set(label, { responses: m.responses, responses_priced: m.requests_priced, tokens_unpriced: m.tokens_unpriced, usd_pico: m.usd_pico ?? 0n, tokens_total: m.tokens_total, context_tokens: m.total_input });
     }
     const recModels: Record<string, unknown> = {};
     for (const [label, a] of Object.entries(rp.by_model)) recModels[label] = { responses: a.responses, responses_priced: a.responses_priced, tokens_unpriced: a.tokens_unpriced, usd_pico: a.usd_pico, tokens_total: a.tokens_total, context_tokens: a.context_tokens };
     deepDiff(Object.fromEntries(srcModels), recModels, `by_model.${p}`, out);
+    // per-model rows keyed by (model key, model_verified): src rows against recompute's counted responses
+    const srcRows: Record<string, unknown> = {};
+    for (const m of t.models) {
+      srcRows[`${m.model ?? "model_unknown"}|${m.model_verified ? "verified" : "unverified"}`] = { responses: m.responses, responses_priced: m.requests_priced, tokens_unpriced: m.tokens_unpriced, usd_pico: m.usd_pico ?? 0n, tokens_total: m.tokens_total, context_tokens: m.total_input, output_unknown: m.output_unknown };
+    }
+    const recRows: Record<string, { responses: number; responses_priced: number; tokens_unpriced: bigint; usd_pico: bigint; tokens_total: bigint; context_tokens: bigint; output_unknown: number }> = {};
+    for (const x of rec.responses) {
+      if (x.provider !== p || !x.counted) continue;
+      const verified = ["own_turn", "carried_verified", "claude_explicit"].includes(String(x.model_source));
+      const key = `${x.model_label ?? "unlisted"}|${verified ? "verified" : "unverified"}`;
+      const b = x.buckets!;
+      const ctx = b.input_uncached + b.cache_read + b.cache_write_5m + b.cache_write_1h + b.cache_write_unknown_ttl + b.cache_write;
+      const row = (recRows[key] ??= { responses: 0, responses_priced: 0, tokens_unpriced: 0n, usd_pico: 0n, tokens_total: 0n, context_tokens: 0n, output_unknown: 0 });
+      row.responses += 1;
+      row.context_tokens += ctx;
+      row.tokens_total += ctx + (b.output ?? b.output_lower_bound);
+      if (b.output === null) row.output_unknown += 1;
+      if (x.price!.priced) {
+        row.responses_priced += 1;
+        row.usd_pico += x.price!.pico;
+      } else row.tokens_unpriced += x.price!.tokens_unpriced;
+    }
+    deepDiff(srcRows, recRows, `model_rows.${p}`, out);
     const kinds: Record<string, number> = {};
     for (const [k, n] of srcByKind[p]) kinds[k] = n;
     const recKinds: Record<string, number> = {};

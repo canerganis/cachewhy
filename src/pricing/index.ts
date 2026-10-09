@@ -356,8 +356,14 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
       c.add("schema", `modifiers.${k}`, "an object under modifiers needs a boolean verified (R3.1)");
     }
   }
+  // S8.5b (6): the table-level copy of C25 (absent or null is no copy)
+  const olc = modifiers["openai_long_context"] as { threshold_input_tokens?: unknown } | null | undefined;
+  const olcThreshold = typeof olc === "object" && olc !== null ? olc.threshold_input_tokens : undefined;
+  if (olcThreshold !== undefined && olcThreshold !== null && (!Number.isSafeInteger(olcThreshold) || BigInt(olcThreshold as number) !== CONSTANTS.CODEX_LONG_CTX)) {
+    c.add("constant_mismatch", "modifiers.openai_long_context.threshold_input_tokens", "must equal C25 (CODEX_LONG_CTX)");
+  }
   const geoMod = modifiers["geo_us"];
-  if (geoMod !== undefined && geoMod["multiplier"] !== undefined && geoMod["multiplier"] !== null) {
+  if (typeof geoMod === "object" && geoMod !== null && geoMod["multiplier"] !== undefined && geoMod["multiplier"] !== null) {
     checkGeoMultiplier(geoMod["multiplier"], "modifiers.geo_us.multiplier", ctx);
   }
   const fastWithGeoVerified = isVerified(fastGeo, null, ctx);
@@ -433,7 +439,9 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
     let tierSplit: bigint | null = null;
     if (entry.tiers !== null && entry.tiers !== undefined) {
       auditVerified(entry.tiers, entry, `${path}.tiers`, ctx);
-      if (!Number.isSafeInteger(entry.tiers.split_tokens) || BigInt(entry.tiers.split_tokens) !== CONSTANTS.HAIKU_TIER_SPLIT) {
+      // S8.5b (6): a copy that is absent or null is no copy
+      const splitCopy = entry.tiers.split_tokens as unknown;
+      if (splitCopy !== undefined && splitCopy !== null && (!Number.isSafeInteger(splitCopy) || BigInt(splitCopy as number) !== CONSTANTS.HAIKU_TIER_SPLIT)) {
         c.add("constant_mismatch", `${path}.tiers.split_tokens`, "must equal C26 (HAIKU_TIER_SPLIT)");
       }
       tierSplit = CONSTANTS.HAIKU_TIER_SPLIT;
@@ -464,6 +472,7 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
         typeof lc === "object" &&
         !Array.isArray(lc) &&
         lc.threshold_input_tokens !== undefined &&
+        lc.threshold_input_tokens !== null &&
         (!Number.isSafeInteger(lc.threshold_input_tokens) || BigInt(lc.threshold_input_tokens) !== CONSTANTS.CODEX_LONG_CTX)
       ) {
         c.add("constant_mismatch", `${path}.long_context.threshold_input_tokens`, "must equal C25 (CODEX_LONG_CTX)");

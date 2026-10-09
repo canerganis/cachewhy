@@ -329,7 +329,9 @@ function walk(dir, out, onBad, seen = new Set()) {
         isDir = st.isDirectory();
         isFile = st.isFile();
       } catch {
-        continue;
+        // S12.6c: a link that cannot be examined may be a log of the layout; it is handed on as a file, and it counts as
+        // an unreadable one if its path matches (never skipped silently)
+        isFile = true;
       }
     }
     if (isDir) walk(p, out, onBad, seen);
@@ -532,6 +534,7 @@ function documentedMultiplier(e, field) {
   const ids = new Set([e.id, ...(Array.isArray(e.model_ids) ? e.model_ids : [])].map(tableModelId).filter((x) => x !== null));
   const any = (...names) => names.some((n) => ids.has(n));
   if (e.provider === "anthropic") {
+    if (![...ids].some((n) => n.startsWith("claude-"))) return undefined; // the list names Claude models
     if (field === "cache_write_5m") return [5n, 4n];
     if (field === "cache_write_1h") return [2n, 1n];
     if (field === "cache_read") {
@@ -571,11 +574,18 @@ function checkRatio(row, mult, strict) {
 
 /** R3.2 (2): the stored multipliers equal the documented list. */
 function checkDocumented(e, mult) {
+  if (mult !== undefined && !isObj(mult)) {
+    // a stored multipliers value (null included) that is no object cannot store the listed multipliers
+    if (MULT_KEYS.some((k) => documentedMultiplier(e, k) !== undefined)) throw new Error("table_malformed");
+    return;
+  }
   if (!isObj(mult)) return;
   for (const k of MULT_KEYS) {
-    if (mult[k] === undefined || mult[k] === null) continue;
     const doc = documentedMultiplier(e, k);
-    if (doc !== undefined && !sameRational(decimalRational(mult[k]), doc)) throw new Error("table_malformed");
+    if (doc === undefined) continue;
+    // a model the list names must store every listed multiplier: an empty or partial object fails
+    if (mult[k] === undefined || mult[k] === null) throw new Error("table_malformed");
+    if (!sameRational(decimalRational(mult[k]), doc)) throw new Error("table_malformed");
   }
 }
 
@@ -594,9 +604,11 @@ function validateTable(table) {
   if (typeof table.schema_version !== "number") bad();
   if (table.modifiers !== undefined && table.modifiers !== null) {
     if (!isObj(table.modifiers)) bad();
-    for (const v of Object.values(table.modifiers)) if (isObj(v) && typeof v.verified !== "boolean") bad();
+    for (const v of Object.values(table.modifiers)) if (!isObj(v) || typeof v.verified !== "boolean") bad(); // S8.5b (4)
     const g = table.modifiers.geo_us;
     if (isObj(g) && g.multiplier !== undefined && g.multiplier !== null && !sameRational(decimalRational(g.multiplier), C32)) bad(); // C32
+    const ol = table.modifiers.openai_long_context;
+    if (isObj(ol) && ol.threshold_input_tokens !== undefined && ol.threshold_input_tokens !== null && ol.threshold_input_tokens !== Number(C25)) bad(); // C25
   }
   const seen = new Set();
   for (const e of table.models) {
@@ -627,31 +639,34 @@ function validateTable(table) {
     // (5) R3.2: ratio test on every row with an effective multiplier object, documented multipliers, inherited objects
     const own = isObj(e.multipliers) ? e.multipliers : null;
     checkRatio(e.prices_usd_per_mtok, own, e.verified === true);
-    checkDocumented(e, own);
+    checkDocumented(e, e.multipliers);
     if (isObj(e.fast)) {
       const inherited = e.fast.multipliers;
       if (inherited !== undefined && inherited !== null && canon(inherited) !== canon(e.multipliers ?? null)) bad();
+      if (isObj(inherited)) checkDocumented(e, inherited); // the inherited copy lists every documented multiplier too
       checkRatio(e.fast.prices_usd_per_mtok, isObj(inherited) ? inherited : own, e.verified === true);
     }
     if (isObj(e.tiers)) {
       const inherited = e.tiers.high_multipliers;
       if (inherited !== undefined && inherited !== null && canon(inherited) !== canon(e.multipliers ?? null)) bad();
+      if (isObj(inherited)) checkDocumented(e, inherited);
       checkRatio(e.tiers.high, isObj(inherited) ? inherited : own, e.verified === true);
-      if (e.tiers.split_tokens !== undefined && e.tiers.split_tokens !== Number(C26)) bad(); // C26
+      if (e.tiers.split_tokens !== undefined && e.tiers.split_tokens !== null && e.tiers.split_tokens !== Number(C26)) bad(); // C26
     }
     if (isObj(e.long_context)) {
       const lc = e.long_context;
       if (lc.verified === true) {
         checkRatio(lc.prices_usd_per_mtok, isObj(lc.multipliers) ? lc.multipliers : own, e.verified === true);
-        checkDocumented(e, lc.multipliers);
       }
-      if ("threshold_input_tokens" in lc && lc.threshold_input_tokens !== Number(C25)) bad(); // C25
+      if (lc.threshold_input_tokens !== undefined && lc.threshold_input_tokens !== null && lc.threshold_input_tokens !== Number(C25)) bad(); // C25
     }
     if (isObj(e.geo_us) && e.geo_us.multiplier !== undefined && e.geo_us.multiplier !== null && !sameRational(decimalRational(e.geo_us.multiplier), C32)) bad(); // C32
     // (7) two model ids anywhere with the same normalized form, inside one entry or in two
-    for (const raw of Array.isArray(e.model_ids) ? e.model_ids : []) {
-      const id = tableModelId(raw);
-      if (id === null) continue;
+    // the model ids of an entry are its `id` and every member of `model_ids` (the id counts once when it is also a member)
+    const members = (Array.isArray(e.model_ids) ? e.model_ids : []).map(tableModelId).filter((x) => x !== null);
+    const own_id = tableModelId(e.id);
+    const all = own_id !== null && members.includes(own_id) ? members : own_id !== null ? [own_id, ...members] : members;
+    for (const id of all) {
       if (seen.has(id)) bad();
       seen.add(id);
     }
@@ -2540,10 +2555,12 @@ function run(entries, opts) {
     for (const r of responses) {
       if (r.provider !== provider || !r.counted) continue;
       r.model_label = provider === "codex" && r.model === null ? "model_unknown" : modelLabel(r.model);
+      // S12.7: a model row is keyed by (model key, model_verified): a model's verified and unverified responses are two rows
+      r.model_verified = r.model_source === "claude_explicit" || (provider === "codex" && r.model_source !== "chain_tainted" && r.attr.verified === true);
       addToAgg(total, r);
-      const mk = r.model_label;
-      if (!byModel.has(mk)) byModel.set(mk, emptyAgg());
-      addToAgg(byModel.get(mk), r);
+      const mk = r.model_verified ? r.model_label : `${r.model_label}:unverified`;
+      if (!byModel.has(mk)) byModel.set(mk, { label: r.model_label, verified: r.model_verified, agg: emptyAgg() });
+      addToAgg(byModel.get(mk).agg, r);
       if (!byKind.has(r.kind)) byKind.set(r.kind, emptyAgg());
       addToAgg(byKind.get(r.kind), r);
       if (!r.price.priced) {
@@ -2556,7 +2573,8 @@ function run(entries, opts) {
     tokensTotal[provider] = total.tokens_total;
     providers[provider] = {
       totals: serializeAgg(total),
-      by_model: sortedObject(byModel, serializeAgg),
+      by_model: sortedObject(byModel, (x) => serializeAgg(x.agg)),
+      by_model_rows: [...byModel.keys()].sort().map((k) => ({ model: byModel.get(k).label, model_verified: byModel.get(k).verified, ...serializeAgg(byModel.get(k).agg) })),
       by_kind: sortedObject(byKind, serializeAgg),
       unpriced_by_reason: sortedObject(unpricedReasons, (u) => ({ responses: u.responses, tokens_unpriced: u.tokens_unpriced.toString() })),
     };
@@ -2664,6 +2682,7 @@ export function toJson(result, { perResponse = false, rawKeys = false, salt = un
         if (!r.counted) return row;
         row.kind = r.kind;
         row.model = r.model_label;
+        row.model_verified = r.model_verified === true;
         row.model_source = r.model_source;
         if (r.flags.length) row.flags = [...r.flags].sort();
         const b = r.buckets;

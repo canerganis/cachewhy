@@ -150,6 +150,8 @@ const MALFORMATIONS = {
   c_agent_main: 0.04, // agentId set to the literal "main"
   c_nonbool_flags: 0.04, // isSidechain or isApiErrorMessage that is not a boolean
   c_iterations_nonarray: 0.05, // usage.iterations that is not an array of one object
+  c_model_split: 0.1, // one Claude model with responses in a clean chain and in a tainted chain
+  io_broken_symlink: 0.05, // a broken symlink with a log name (created only where the platform allows symlinks)
   c_early_records: 0.1, // records of other types before every assistant record, with replayed keys across sessions (ownership by stream_start)
   c_cross_dups: 0.1, // journal rows and log lines duplicated across two files
   c_stray_copy: 0.06, // extra copy of an existing requestId without sessionId (maybe no timestamp, other input or model)
@@ -361,6 +363,8 @@ export interface FuzzScan {
   maxMs: number;
   /** Features that fired, for triage. */
   used: string[];
+  /** Relative paths to create as broken symlinks (skipped where the platform refuses symlinks). */
+  links?: string[];
 }
 
 interface Ctx {
@@ -369,6 +373,7 @@ interface Ctx {
   files: GeneratedFile[];
   eventMs: number[];
   used: Set<string>;
+  links: string[];
   counters: Map<string, number>;
   baseMs: number;
 }
@@ -1209,6 +1214,36 @@ function crossFileDups(c: Ctx, provider: "claude" | "codex", from: number): void
   }
 }
 
+/** One model with responses in a clean chain and in a tainted chain (a range-failed sibling request taints the chain). */
+function modelSplitClaude(c: Ctx): void {
+  const r = c.r;
+  const hit = r.chance(c.k.c_model_split);
+  const model = r.pick(CLAUDE_MODELS);
+  const nClean = r.int(1, 2);
+  const nTainted = r.int(1, 2);
+  const sub = r.sub();
+  if (!hit) return;
+  used(c, "c_model_split");
+  const sc: Ctx = { ...c, r: sub, k: { ...c.k, ...NO_MALFORMATION } as Knobs };
+  const proj = "synthetic-project-split";
+  const start = c.baseMs + r.int(0, 3600) * 1000;
+  const make = (clean: boolean): void => {
+    const sid = nextId(c, "session");
+    const th = newThread(sc, sid, null, start, "2.1.293");
+    const n = clean ? nClean : nTainted + 1;
+    for (let i = 0; i < n; i++) {
+      const recs = claudeRequest(sc, th, { tool: null });
+      for (const rec of recs) {
+        if (rec.message) rec.message.model = model;
+        if (!clean && i === n - 1 && rec.message?.usage && typeof rec.message.usage === "object") rec.message.usage.input_tokens = 1.5; // range failure taints the chain
+      }
+    }
+    c.files.push({ path: `projects/${proj}/${sid}.jsonl`, content: th.records.map(jsonLine).join("\n") + "\n", mtimeMs: OLD_MTIME_MS });
+  };
+  make(true);
+  make(false);
+}
+
 function genClaude(c: Ctx): void {
   const r = c.r;
   const from = c.files.length;
@@ -1218,7 +1253,14 @@ function genClaude(c: Ctx): void {
   if (r.chance(c.k.c_replay)) replayClaude(c, sessions);
   earlyClaudeRecords(c, sessions);
   claudeFiles(c, sessions);
+  modelSplitClaude(c);
   crossFileDups(c, "claude", from);
+  const linkHit = r.chance(c.k.io_broken_symlink);
+  const linkPick = r.int(0, 1);
+  if (linkHit) {
+    used(c, "io_broken_symlink");
+    c.links.push(linkPick === 0 ? "projects/synthetic-project-1/broken-link.jsonl" : "sessions/2026/01/01/rollout-2026-01-01T00-00-00-synthetic-thread-broken.jsonl");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1721,6 +1763,7 @@ export function generateScan(seed: number, knobs: Knobs): FuzzScan {
     files: [],
     eventMs: [],
     used: new Set(),
+    links: [],
     counters: new Map(),
     baseMs: Date.UTC(2026, 0, 1) + r.int(0, 20) * 86_400_000,
   };
@@ -1731,7 +1774,7 @@ export function generateScan(seed: number, knobs: Knobs): FuzzScan {
   genCodex({ ...c, r: cx });
   c.eventMs.sort((x, y) => x - y);
   const ev = c.eventMs.length > 0 ? c.eventMs : [c.baseMs];
-  return { seed, files: c.files, eventMs: c.eventMs, minMs: Math.min(...ev), maxMs: Math.max(...ev), used: [...c.used].sort() };
+  return { seed, files: c.files, eventMs: c.eventMs, minMs: Math.min(...ev), maxMs: Math.max(...ev), used: [...c.used].sort(), links: c.links };
 }
 
 export interface WindowSpec {

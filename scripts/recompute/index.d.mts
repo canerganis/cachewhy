@@ -109,7 +109,10 @@ export interface RecomputeAgg {
 
 export interface RecomputeProvider {
   totals: RecomputeAgg;
+  /** S12.7: keyed by the model label, with `:unverified` appended for the unverified row of a model. */
   by_model: Record<string, RecomputeAgg>;
+  /** S12.7: the same rows as a list of (model, model_verified) pairs. */
+  by_model_rows: Array<RecomputeAgg & { model: string; model_verified: boolean }>;
   by_kind: Record<string, RecomputeAgg>;
   unpriced_by_reason: Record<string, { responses: number; tokens_unpriced: string }>;
 }

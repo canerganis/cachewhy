@@ -164,6 +164,13 @@ export const TABLE_REPROS: Array<{ id: string; title: string; mutate: (t: Tbl) =
   { id: "T5", title: "OpenAI long_context.threshold_input_tokens differs from C25", mutate: (t) => { entry(t, "gpt-6-astra").long_context.threshold_input_tokens = 272001; } },
   { id: "T6", title: "the same normalized id twice inside one entry's model_ids", mutate: (t) => { const e = entry(t, "claude-sonnet-4-6"); e.model_ids = [...e.model_ids, "claude-sonnet-4-6-20251001"]; } },
   { id: "T7", title: "unverified entry whose price row is the string 'x'", mutate: (t) => { const e = entry(t, "claude-sonnet-4-6"); e.verified = false; e.prices_usd_per_mtok = "x"; } },
+  { id: "T9", title: "entry.multipliers is the string 'x'", mutate: (t) => { entry(t, "claude-opus-5-5").multipliers = "x"; } },
+  { id: "T10", title: "entry.multipliers is an empty object", mutate: (t) => { entry(t, "claude-opus-5-5").multipliers = {}; } },
+  { id: "T11", title: "claude-sonnet-4-6 long_context.multipliers is an empty object", mutate: (t) => { const e = entry(t, "claude-sonnet-4-6"); e.long_context = { ...(e.long_context ?? {}), multipliers: {} }; } },
+  { id: "T12", title: "modifiers.geo_us is the number 5", mutate: (t) => { t.modifiers.geo_us = 5; } },
+  { id: "T13", title: "table-level modifiers.geo_us.multiplier = '1.2' (copy of C32)", mutate: (t) => { t.modifiers.geo_us.multiplier = "1.2"; } },
+  { id: "T14", title: "table-level modifiers.openai_long_context.threshold_input_tokens = 272001 (copy of C25)", mutate: (t) => { t.modifiers.openai_long_context.threshold_input_tokens = 272001; } },
+  { id: "T15", title: "entry id equals another entry's model id", mutate: (t) => { entry(t, "claude-opus-4-1").id = "claude-opus-5-5"; } },
   { id: "T8", title: "control: all prices of one entry doubled (ratios intact)", mutate: (t) => { const e = entry(t, "claude-opus-5-5"); for (const row of [e.prices_usd_per_mtok, e.fast.prices_usd_per_mtok]) for (const k of Object.keys(row)) row[k] = String(Number(row[k]) * 2); } },
 ];
 

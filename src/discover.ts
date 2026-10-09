@@ -278,7 +278,16 @@ export async function discover(opts: DiscoverOptions = {}): Promise<DiscoverResu
             isDirectory = st.isDirectory();
             isFile = st.isFile();
           } catch {
-            diagnostics.push({ level: "info", code: "file_unreadable", path: p, message: "broken symlink" });
+            // S12.6c: a path that matches the layout and cannot be examined is a discovered file, never skipped silently
+            const rel = relative(rootPath, p).split(sep).join("/");
+            const matched: ({ kind: SourceKind } & Partial<ClassifiedClaude>) | null =
+              c.agent === "claude" ? classifyClaude(rel.split("/")) : ((k) => (k === null ? null : { kind: k }))(classifyCodex(ent.name));
+            if (matched === null) {
+              diagnostics.push({ level: "info", code: "file_unreadable", path: p, message: "broken symlink" });
+            } else {
+              diagnostics.push({ level: "warn", code: "file_unreadable", path: p, message: "cannot stat: broken symlink" });
+              files.push({ ...matched, agent: c.agent, path: p, relPath: rel, root: rootPath, size: 0, mtimeMs: 0 });
+            }
             continue;
           }
         }

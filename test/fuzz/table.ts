@@ -52,6 +52,52 @@ function pickRow(t: Obj, r: Rng, provider?: string): { e: Obj; owner: Obj; key: 
 
 const MUTATIONS: Array<[string, Mutation]> = [
   [
+    "multipliers_empty_or_partial",
+    (t, r) => {
+      const e = r.pick(entries(t));
+      const where = r.int(0, 3);
+      const v = r.pick<unknown>([{}, null, "x", [], 5, { cache_read: "0.1" }, { cache_write_5m: "1.25", cache_write_1h: "2" }]);
+      if (where === 0) e.multipliers = v;
+      else if (where === 1 && isObj(e.fast)) e.fast.multipliers = v;
+      else if (where === 2 && isObj(e.long_context)) e.long_context.multipliers = v;
+      else if (isObj(e.tiers)) e.tiers.high_multipliers = v;
+      else e.multipliers = v;
+      return `${e.id} multipliers (slot ${where}) = ${JSON.stringify(v)}`;
+    },
+  ],
+  [
+    "modifier_not_an_object",
+    (t, r) => {
+      const name = r.pick(["geo_us", "fast_with_geo_us", "openai_long_context", "batch", "openai_service_tier", "openai_regional_endpoint"]);
+      const v = r.pick<unknown>([5, [], null, "x", true]);
+      t.modifiers[name] = v;
+      return `modifiers.${name} = ${JSON.stringify(v)}`;
+    },
+  ],
+  [
+    "entry_id_duplicates",
+    (t, r) => {
+      const es = entries(t);
+      const a = r.pick(es);
+      const b = r.pick(es);
+      const suffix = r.pick(["", "-20251001"]);
+      const target = r.chance(0.5) ? String(b.id) : String((b.model_ids ?? [b.id])[0]);
+      a.id = `${target}${suffix}`;
+      return `${a.id} (entry id) now equals ${target}${suffix}`;
+    },
+  ],
+  [
+    "table_level_constants",
+    (t, r) => {
+      const which = r.int(0, 3);
+      if (which === 0) t.modifiers.openai_long_context.threshold_input_tokens = r.pick<unknown>([272001, 271999, "272000", null]);
+      else if (which === 1) t.modifiers.geo_us.multiplier = r.pick<unknown>(["1.2", "1.10", 1.1, null]);
+      else if (which === 2) t.modifiers.geo_us.constant = r.pick<unknown>(["C33", null, 5]);
+      else t.modifiers.openai_long_context.constant = r.pick<unknown>(["C24", null]);
+      return `table-level constant copy (case ${which})`;
+    },
+  ],
+  [
     "entry_prices_scaled",
     (t, r) => {
       const e = r.pick(entries(t));

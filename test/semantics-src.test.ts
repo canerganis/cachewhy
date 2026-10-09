@@ -3,7 +3,7 @@
 // marked "already conforming" where src/ implemented the item already. All data is synthetic (fixed ids, no free text).
 // This file imports nothing from scripts/recompute (R13.1: the two implementations stay independent).
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -2331,5 +2331,128 @@ describe("S8.5b (3): any present price row of a verified entry must be complete"
     assert.equal(refused((t) => { entry(t, "claude-opus-5-5").service_tier = { batch: { verified: true } }; }), false);
     assert.equal(refused((t) => { const e = entry(t, "claude-opus-5-5"); e.verified = false; delete e.fast.prices_usd_per_mtok.output; }), false);
     assert.equal(refused((t) => { const e = entry(t, "gpt-6-luna"); e.verified = false; delete e.long_context.prices_usd_per_mtok.input; }), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// G1 round 7: S12.6c, S8.5b (4) to (7), S12.7
+// ---------------------------------------------------------------------------
+
+describe("S12.6c: a path that matches the layout and cannot be read is a discovered, unreadable file", () => {
+  const link = (root: string, rel: string): boolean => {
+    const abs = join(root, ...rel.split("/"));
+    mkdirSync(dirname(abs), { recursive: true });
+    try {
+      symlinkSync(join(root, "no-such-target"), abs);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  it("a broken symlink at a Claude log path counts in files_total and files_unreadable and taints the provider", async (ctx) => {
+    const root = writeTree([cfile(SESS, [arec({ uuid: "u1" })])]);
+    if (!link(root, `projects/synthetic-project/synthetic-session-b.jsonl`)) return ctx.skip("symlinks not permitted");
+    link(root, `projects/synthetic-project/${SESS}/subagents/agent-ag1.meta.json`);
+    link(root, `projects/synthetic-project/notes.txt`); // does not match the layout: not discovered
+    const d = await discover({ claudeDirs: [join(root, "projects")], codexDirs: [join(root, "none")], env: {}, home: root });
+    assert.equal(d.files.length, 3);
+    const res = await parseClaude(d.files);
+    assert.equal(res.coverage.files_total, 3);
+    assert.equal(res.coverage.files_unreadable, 2);
+    assert.equal(res.coverage.lines_total, 1); // the unreadable files add no line
+    assert.ok(res.integrity.triggers.some((x) => x.reason === "file_unreadable" && x.names === "provider"));
+  });
+
+  it("a broken symlink at a Codex rollout path is a discovered unreadable file", async (ctx) => {
+    const th = "synthetic-thread-x";
+    const root = writeTree([xfile("a", [cmeta(th, t(1), 0), ctur(t(2), 1, "r1", th, "turn-1", cu())])]);
+    if (!link(root, `sessions/2026/01/01/rollout-2026-01-01T00-00-00-broken.jsonl`)) return ctx.skip("symlinks not permitted");
+    const d = await discover({ codexDirs: [root], home: join(root, "no-home"), env: {} });
+    assert.equal(d.files.length, 2);
+    const res = await parseCodex(d.files);
+    assert.equal(res.coverage.files_total, 2);
+    assert.equal(res.coverage.files_unreadable, 1);
+    assert.ok(res.integrity.triggers.some((x) => x.reason === "file_unreadable" && x.names === "provider"));
+    assert.equal(res.responses.length, 1); // the readable file is still accounted
+  });
+
+  it("a file that cannot be read (a corrupt archive) counts the same way", async () => {
+    const root = writeTree([{ path: "archived_sessions/rollout-2026-01-01T00-00-00-bad.jsonl.zst", content: "not a zstd stream" }]);
+    const d = await discover({ codexDirs: [root], home: join(root, "no-home"), env: {} });
+    assert.equal(d.files.length, 1);
+    const res = await parseCodex(d.files);
+    assert.equal(res.coverage.files_total, 1);
+    assert.equal(res.coverage.files_unreadable, 1);
+    assert.equal(res.coverage.lines_total, 0);
+    assert.ok(res.integrity.triggers.some((x) => x.reason === "file_unreadable" && x.names === "provider"));
+  });
+});
+
+describe("S8.5b (4) to (7) at table level and for the documented list", () => {
+  const entry = (tbl: any, id: string): any => tbl.models.find((m: any) => m.id === id);
+  const refused = (fn: (t: any) => void): boolean => {
+    const tbl = tableCopy();
+    fn(tbl);
+    try {
+      loadPriceBook(tbl);
+      return false;
+    } catch (e) {
+      if (e instanceof PriceTableError) return true;
+      throw e;
+    }
+  };
+
+  it("(6) the table-level copies of C25 and C32; absent or null is no copy", () => {
+    assert.equal(refused((tbl) => { tbl.modifiers.openai_long_context.threshold_input_tokens = 200000; }), true);
+    assert.equal(refused((tbl) => { tbl.modifiers.openai_long_context.threshold_input_tokens = "272000"; }), true);
+    assert.equal(refused((tbl) => { tbl.modifiers.openai_long_context.threshold_input_tokens = 272000; }), false);
+    assert.equal(refused((tbl) => { tbl.modifiers.openai_long_context.threshold_input_tokens = null; }), false);
+    assert.equal(refused((tbl) => { delete tbl.modifiers.openai_long_context.threshold_input_tokens; }), false);
+    assert.equal(refused((tbl) => { tbl.modifiers.geo_us.multiplier = "1.2"; }), true);
+    assert.equal(refused((tbl) => { tbl.modifiers.geo_us.multiplier = null; }), false);
+    assert.equal(refused((tbl) => { delete tbl.modifiers.geo_us.multiplier; }), false);
+    assert.equal(refused((tbl) => { entry(tbl, "claude-haiku-5-5").tiers.split_tokens = null; }), false);
+    assert.equal(refused((tbl) => { delete entry(tbl, "claude-haiku-5-5").tiers.split_tokens; }), false);
+    assert.equal(refused((tbl) => { entry(tbl, "gpt-6-sol").long_context.threshold_input_tokens = null; }), false);
+  });
+
+  it("(4) a member of modifiers that is not an object", () => {
+    for (const v of [5, "x", null, true, []]) assert.equal(refused((tbl) => { tbl.modifiers.geo_us = v; }), true, JSON.stringify(v));
+    assert.equal(refused((tbl) => { tbl.modifiers.openai_long_context = 0; }), true);
+  });
+
+  it("(5) a model the documented list names must store every listed multiplier", () => {
+    assert.equal(refused((tbl) => { entry(tbl, "claude-opus-5-5").multipliers = {}; }), true);
+    assert.equal(refused((tbl) => { entry(tbl, "claude-opus-5-5").multipliers = null; }), true);
+    assert.equal(refused((tbl) => { delete entry(tbl, "claude-opus-5-5").multipliers.cache_write_1h; }), true);
+    assert.equal(refused((tbl) => { delete entry(tbl, "gpt-6-sol").multipliers.cache_write; }), true);
+    assert.equal(refused((tbl) => { entry(tbl, "gpt-6-sol").multipliers = {}; }), true);
+  });
+
+  it("(7) an entry id against any normalized id", () => {
+    assert.equal(refused((tbl) => { entry(tbl, "claude-opus-5").id = "claude-opus-5-5"; }), true);
+    assert.equal(refused((tbl) => { entry(tbl, "claude-opus-5").id = "claude-opus-5-5-20260101"; }), true);
+    assert.equal(refused((tbl) => { entry(tbl, "claude-opus-5").model_ids = ["claude-opus-5"]; entry(tbl, "claude-opus-4-8").id = "claude-opus-5-20250101"; }), true);
+  });
+});
+
+describe("S12.7: model rows are keyed by (model key, model_verified)", () => {
+  it("clean and tainted responses of one model are two rows", async () => {
+    const A = "synthetic-session-a";
+    const B = "synthetic-session-b";
+    const files = [
+      cfile(A, [arec({ sid: A, uuid: "ua", req: "ra", msg: "ma", ts: t(5) })]),
+      // session B is tainted by a range-failed request; its other request keeps the model candidate, unverified
+      cfile(B, [
+        arec({ sid: B, uuid: "ub1", req: "rb1", msg: "mb1", ts: t(6) }),
+        arec({ sid: B, uuid: "ub2", req: "rb2", msg: "mb2", ts: t(7), usage: ausage({ input_tokens: -1 }) }),
+      ]),
+    ];
+    const { view } = await analyzeTree(files, { since: "2025-01-01", until: "2027-01-01" });
+    const rows = view.totals.find((x) => x.provider === "claude")!.models.filter((m) => m.model === "claude-opus-5-5");
+    assert.deepEqual(rows.map((m) => [m.responses, m.model_verified]).sort(), [[1, false], [1, true]]);
+    const total = view.totals.find((x) => x.provider === "claude")!;
+    assert.equal(total.models.reduce((a, m) => a + m.responses, 0), total.requests_total);
   });
 });
