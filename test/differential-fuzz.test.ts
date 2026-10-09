@@ -8,12 +8,13 @@
 //   CACHEWHY_FUZZ_PROFILE=all         profile of the single-seed run: bare | valid | all (default all)
 //   CACHEWHY_FUZZ_KNOBS=ts_format=0,counter_bad=0.5   override single knobs (probabilities)
 //   CACHEWHY_FUZZ_SCALE=2             multiply every probability
+// The table-mutation suite (test/fuzz/table.ts) uses seeds 1..min(N,200); reproduce one with runTableSeed(seed).
 //
 // A failure prints the seed, the window, the tier flag and the first differing field path with both values, so one
 // seed reproduces it:  CACHEWHY_FUZZ_SEED=<seed> node --import tsx --test test/differential-fuzz.test.ts
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { formatDiff, runSeed, type SeedResult } from "./fuzz/diff.ts";
+import { formatDiff, runSeed, runTableSeed, type SeedResult } from "./fuzz/diff.ts";
 import { KNOB_NAMES, knobsFor, type KnobName, type Knobs, type Profile } from "./fuzz/gen.ts";
 
 const SEEDS = Math.max(1, Number.parseInt(process.env.CACHEWHY_FUZZ_SEEDS ?? "300", 10) || 300);
@@ -77,6 +78,19 @@ describe("differential fuzz: src/ against scripts/recompute on random synthetic 
 
   it(`${Math.min(SEEDS, 150)} dense seeds (all knobs at twice their probability) agree exactly`, async () => {
     const failures = await sweep("all x2", "all", 5001, Math.min(SEEDS, 150), 2);
+    assert.equal(failures.length, 0, `\n${failures.join("\n")}`);
+  });
+  it(`${Math.min(SEEDS, 200)} table-mutation seeds: both implementations refuse the table, or both accept it and agree`, async () => {
+    const failures: string[] = [];
+    const n = Math.min(SEEDS, 200);
+    let failed = 0;
+    for (let seed = 1; seed <= n; seed++) {
+      const r = await runTableSeed(seed);
+      if (r.diffs.length === 0) continue;
+      failed += 1;
+      if (failures.length < MAX_REPORTED) failures.push(`[table] seed=${seed} tier=${r.tier} mutations=[${r.notes.join(" ; ")}] diffs=${r.diffs.length} first: ${formatDiff(r.diffs[0]!)}`);
+    }
+    if (failed > failures.length) failures.push(`... ${failed - failures.length} more failing seeds (${failed} of ${n})`);
     assert.equal(failures.length, 0, `\n${failures.join("\n")}`);
   });
 });

@@ -31,7 +31,7 @@ import {
 } from "../model/types.js";
 import type { CoverageCounters, DriftFinding, Provider, ProviderTotals, ReportInput } from "../model/types.js";
 import { loadDefaultPriceBook } from "../pricing/index.js";
-import { modelIdSchema, s, serialize, versionSchema } from "../util/sanitize.js";
+import { VERSION_RE, modelIdSchema, s, serialize, versionSchema } from "../util/sanitize.js";
 import type { Schema } from "../util/sanitize.js";
 
 const TABLE_VERSION_RE = /^pt-[0-9]{4}-[0-9]{2}-[0-9]{2}(\.[0-9]+)?$/;
@@ -60,7 +60,9 @@ function coverageSchema(): Schema {
   fields["chains_tainted_by_reason"] = intRecord(TAINT_REASONS);
   // R17.5: signed decimal strings
   fields["unlogged_tokens_estimate"] = s.object(Object.fromEntries(UNLOGGED_BUCKETS.map((b) => [b, s.decimal()])));
-  fields["versions"] = s.array(s.object({ version: versionSchema, lines: s.int(0) }), 64);
+  // R17.5: the required label of the estimate, carried as an enum-coded note
+  fields["unlogged_tokens_estimate_note"] = s.enum(UNLOGGED_NOTES);
+  fields["versions"] = s.array(s.object({ version: versionSchema, lines: s.int(0) }), MAX_VERSIONS);
   return s.object(fields);
 }
 
@@ -148,12 +150,34 @@ const ser = serialize as unknown as (schema: Schema, value: unknown) => unknown;
 
 const iso = (ms: number): string => new Date(ms).toISOString();
 
-/** Coverage in output form: `versions` becomes a sorted array. Pure. */
+const MAX_VERSIONS = 256;
+const UNLOGGED_NOTES = ["includes_helper_classifier_and_logging_gaps"] as const;
+
+/**
+ * The versions of the output: every version string that does not match the R14.3 grammar (or is too long to print) is
+ * merged into one `unlisted` entry, and at most 256 entries are kept (sorted by lines descending, then version; the
+ * rest is summed into `unlisted`). Never throws on a count. Output order: by version.
+ */
+function versionsToJson(versions: Readonly<Record<string, number>>): Array<{ version: string; lines: number }> {
+  const merged = new Map<string, number>();
+  let unlisted = 0;
+  for (const [v, n] of Object.entries(versions)) {
+    if (v !== "unlisted" && VERSION_RE.test(v) && v.length <= 64) merged.set(v, (merged.get(v) ?? 0) + n);
+    else unlisted += n;
+  }
+  const ranked = [...merged.entries()].sort(([a, x], [b, y]) => y - x || (a < b ? -1 : a > b ? 1 : 0));
+  const keep = ranked.slice(0, MAX_VERSIONS - 1);
+  for (const [, n] of ranked.slice(MAX_VERSIONS - 1)) unlisted += n;
+  const out = keep.map(([version, lines]) => ({ version, lines }));
+  if (unlisted > 0 || versions["unlisted"] !== undefined) out.push({ version: "unlisted", lines: unlisted });
+  return out.sort((a, b) => (a.version < b.version ? -1 : a.version > b.version ? 1 : 0));
+}
+
+/** Coverage in output form: `versions` becomes a sorted, bounded array. Pure. */
 export function coverageToJson(c: CoverageCounters): Record<string, unknown> {
   const out: Record<string, unknown> = { ...c };
-  out["versions"] = Object.entries(c.versions)
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-    .map(([version, lines]) => ({ version, lines }));
+  out["versions"] = versionsToJson(c.versions);
+  out["unlogged_tokens_estimate_note"] = UNLOGGED_NOTES[0];
   return out;
 }
 

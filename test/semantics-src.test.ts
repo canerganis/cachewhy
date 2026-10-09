@@ -11,6 +11,8 @@ import { analyze } from "../src/analyze.ts";
 import { classifyClaude, discover } from "../src/discover.ts";
 import { buildGraph } from "../src/graph/index.ts";
 import { buildReportInput } from "../src/report/input.ts";
+import { doctorCoverageToJson, reportToJsonText } from "../src/report/json.ts";
+import { renderReport } from "../src/report/text.ts";
 import {
   CONSTANTS,
   chainIdOf,
@@ -949,10 +951,10 @@ describe("item 9: geo us needs the table level modifiers.geo_us object too (S8.2
     assert.equal(price(t, claudePriced({ geo: "not_available" })).cost.pico, 4_000_000_000_000n);
   });
 
-  it("modifiers.geo_us.verified is a boolean: the string \"true\" is not verified", () => {
+  it("modifiers.geo_us.verified must be a boolean: the string \"true\" refuses the table (R3.1, S8.5b (4))", () => {
     const t = tableCopy();
     t.modifiers.geo_us.verified = "true";
-    assert.equal(price(t, OPUS_GEO).modifier_reason, "geo_other");
+    assert.throws(() => loadPriceBook(t), PriceTableError);
   });
 
   it("a placeholder date makes the table object unverified (S8.1), an ISO date with a time is a date", () => {
@@ -2022,5 +2024,312 @@ describe("S10.4: the prefix check fires when any own fork record has no valid hi
     assert.equal(res.streams[0]?.fork?.prefix_resolved, true);
     const two = await run(fork, { ...fork, thread_source: "user" });
     assert.deepEqual(triggersOf(two, "fork_prefix_unresolved"), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// G1 round 6: S10.5a, S12.6b, S8.5a
+// ---------------------------------------------------------------------------
+
+describe("S10.5a: stream_start is the minimum instant over every parsed record that names the chain", () => {
+  const A = "synthetic-session-a";
+  const B = "synthetic-session-b";
+  const early = (sid: string, ts: string, extra: Record<string, unknown> = {}): any => ({ type: "zzz", uuid: `u-early-${sid}`, sessionId: sid, timestamp: ts, ...extra });
+
+  it("an early record of an unlisted type makes A the owner of a replayed key", async () => {
+    const files = [
+      cfile(A, [early(A, t(1)), arec({ sid: A, uuid: "ua", req: "k", msg: "mk", ts: t(10) })]),
+      cfile(B, [arec({ sid: B, uuid: "ub0", req: "own-b", msg: "mb", ts: t(5) }), arec({ sid: B, uuid: "ub", req: "k", msg: "mk", ts: t(10) })]),
+    ];
+    const res = await parseC(files);
+    const rows = claudeResp(res, "k");
+    assert.equal(rows.find((r) => r.chain.root_session === A)?.ownership.role, "owner");
+    assert.equal(rows.find((r) => r.chain.root_session === B)?.ownership.role, "replayed");
+    assert.equal(res.streams.find((s) => s.chain.root_session === A)?.start_ns, parseInstantNs(t(1)));
+    // by-kind totals: the key counts once
+    const { view } = await analyzeTree(files, { since: "2025-01-01", until: "2027-01-01" });
+    const total = view.totals.find((x) => x.provider === "claude")!;
+    assert.equal(total.requests_total, 2); // k (owned by A) and own-b
+    assert.equal(total.requests_by_kind.main, 2);
+  });
+
+  it("a cost-state record and an unsupported-version record count; another agentId or an invalid instant does not", async () => {
+    const start = async (rec: any): Promise<bigint | null | undefined> =>
+      (await parseC([cfile(A, [rec, arec({ sid: A, uuid: "ua", req: "k", msg: "mk", ts: t(10) })])])).streams.find((s) => s.chain.root_session === A)?.start_ns;
+    assert.equal(await start({ type: "cost-state", uuid: "c", sessionId: A, timestamp: t(2), version: V, modelUsage: {} }), parseInstantNs(t(2)));
+    assert.equal(await start(arec({ sid: A, uuid: "ux", req: "kx", msg: "mx", ts: t(3), patch: (r) => { r.version = "2.1.290"; } })), parseInstantNs(t(3)));
+    assert.equal(await start(early(A, t(1), { agentId: "other" })), parseInstantNs(t(10)));
+    assert.equal(await start(early(A, "2026-02-30T00:00:00Z")), parseInstantNs(t(10)));
+    assert.equal(await start(early(A, t(4), { agentId: "main" })), parseInstantNs(t(4)));
+  });
+});
+
+describe("S12.6b: duplicates are found across files", () => {
+  it("the same journal line in two journal files counts one duplicate", async () => {
+    const j = (run: string): TreeFile => ({ path: `projects/synthetic-project/${SESS}/subagents/workflows/wf_${run}/journal.jsonl`, content: jsonl([{ type: "started", agentId: "a" }]) });
+    const main = cfile(SESS, [arec({ uuid: "u1" })]);
+    const two = await parseC([main, j("r1"), j("r2")]);
+    assert.equal(two.coverage.lines_duplicate_collapsed, 1);
+    assert.equal(two.coverage.duplicate_records_collapsed, 1);
+    const three = await parseC([main, j("r1"), j("r2"), j("r3")]);
+    assert.equal(three.coverage.lines_duplicate_collapsed, 2);
+    assert.equal(three.coverage.duplicate_records_collapsed, 1);
+    const one = await parseC([main, j("r1")]);
+    assert.equal(one.coverage.lines_duplicate_collapsed, 0);
+  });
+
+  it("the same log record in two files counts one duplicate (already conforming)", async () => {
+    const rec = arec({ uuid: "u1" });
+    const res = await parseC([cfile("synthetic-session-a", [rec]), cfile("synthetic-session-b", [rec])]);
+    assert.equal(res.coverage.lines_duplicate_collapsed, 1);
+    assert.equal(res.coverage.duplicate_records_collapsed, 1);
+  });
+
+  it("the same Codex record in two files counts one duplicate (already conforming)", async () => {
+    const th = "synthetic-thread-x";
+    const line = cmeta(th, t(1), 0);
+    const res = await parseX([xfile("a", [line]), xfile("b", [line])]);
+    assert.equal(res.coverage.lines_duplicate_collapsed, 1);
+    assert.equal(res.coverage.duplicate_records_collapsed, 1);
+  });
+});
+
+describe("S8.5a: every price row of every entry is validated at load with the 1 to 6 decimal grammar", () => {
+  const find = (t: any, id: string): any => t.models.find((m: any) => m.id === id);
+
+  it("seven decimals on an unverified row reject the table; six are fine", () => {
+    const bad = tableCopy();
+    find(bad, "gpt-5.1-codex").prices_usd_per_mtok = { input: "0.1234567", cached_input: "1", output: "1" };
+    assert.throws(() => loadPriceBook(bad), PriceTableError);
+    const ok = tableCopy();
+    find(ok, "gpt-5.1-codex").prices_usd_per_mtok = { input: "0.123456", cached_input: "1", output: "1" };
+    assert.doesNotThrow(() => loadPriceBook(ok));
+  });
+
+  it("a malformed Anthropic long_context price rejects the table, a well formed one does not", () => {
+    const t1 = tableCopy();
+    find(t1, "claude-opus-5-5").long_context.prices_usd_per_mtok = { input: "04", output: "1", cache_read: "1", cache_write_5m: "1", cache_write_1h: "1" };
+    assert.throws(() => loadPriceBook(t1), PriceTableError);
+    const t2 = tableCopy();
+    find(t2, "claude-opus-5-5").long_context.prices_usd_per_mtok = { input: "1", output: "1.1234567", cache_read: "1", cache_write_5m: "1", cache_write_1h: "1" };
+    assert.throws(() => loadPriceBook(t2), PriceTableError);
+    const t3 = tableCopy();
+    find(t3, "claude-opus-5-5").long_context.prices_usd_per_mtok = { input: "1", output: "1", cache_read: "1", cache_write_5m: "1", cache_write_1h: "1" };
+    assert.doesNotThrow(() => loadPriceBook(t3));
+  });
+
+  it("tier, fast, service tier and OpenAI long context rows are checked too, verified or not", () => {
+    const rows: Array<[string, (t: any) => void]> = [
+      ["fast", (t) => { find(t, "claude-opus-5-5").fast.prices_usd_per_mtok.output = "40.0000001"; }],
+      ["service tier", (t) => { find(t, "claude-opus-5-5").service_tier = { priority: { verified: false, prices_usd_per_mtok: { input: "1.1234567", output: "1", cache_read: "1", cache_write_5m: "1", cache_write_1h: "1" } } }; }],
+      ["openai long context", (t) => { find(t, "gpt-6-sol").long_context.prices_usd_per_mtok.input = [4]; }],
+      ["unverified claude entry", (t) => { find(t, "mythos-preview").prices_usd_per_mtok = { input: "1", output: "1", cache_read: 0.1, cache_write_5m: "1", cache_write_1h: "1" }; }],
+    ];
+    for (const [name, mutate] of rows) {
+      const t1 = tableCopy();
+      mutate(t1);
+      assert.throws(() => loadPriceBook(t1), PriceTableError, name);
+    }
+  });
+});
+
+describe("S8.5a: a price row that is not an object rejects the table", () => {
+  it("a string, number or array in place of a row of an unverified or verified entry", () => {
+    for (const row of ["x", 5, [], [{ input: "1" }], true]) {
+      const t1 = tableCopy();
+      t1.models.find((m: any) => m.id === "gpt-5.1-codex").prices_usd_per_mtok = row;
+      assert.throws(() => loadPriceBook(t1), PriceTableError, JSON.stringify(row));
+      const t2 = tableCopy();
+      t2.models.find((m: any) => m.id === "claude-opus-5-5").fast.prices_usd_per_mtok = row;
+      assert.throws(() => loadPriceBook(t2), PriceTableError, JSON.stringify(row));
+    }
+    // an absent row (null) and an empty object on an unverified entry are not malformed values
+    for (const row of [null, {}]) {
+      const t3 = tableCopy();
+      t3.models.find((m: any) => m.id === "gpt-5.1-codex").prices_usd_per_mtok = row;
+      assert.doesNotThrow(() => loadPriceBook(t3), JSON.stringify(row));
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Report layer: coverage.versions bounds, R17.5 unlogged estimate; S8.5b load-time table validation
+// ---------------------------------------------------------------------------
+
+describe("coverage.versions in the JSON report is bounded and never throws", () => {
+  const manyVersions = (n: number): Record<string, number> => {
+    const v: Record<string, number> = {};
+    for (let i = 0; i < n; i++) v[`1.${i}.0`] = i + 1;
+    return v;
+  };
+  const sum = (o: Record<string, number>): number => Object.values(o).reduce((a, b) => a + b, 0);
+
+  it("65 and 300 versions: summary --json and doctor --json keep at most 256 entries and every line", async () => {
+    const { view } = await analyzeTree([cfile(SESS, [arec({ uuid: "u1" })])], { since: "2025-01-01", until: "2027-01-01" });
+    for (const n of [65, 300]) {
+      const versions = { ...manyVersions(n), "not a version": 7, unlisted: 3, "9.9": 2 };
+      const coverage = { ...view.coverage, versions };
+      const j = JSON.parse(reportToJsonText({ ...view, coverage })) as { coverage: { versions: Array<{ version: string; lines: number }> } };
+      const d = doctorCoverageToJson(coverage, view.drift) as { coverage: { versions: Array<{ version: string; lines: number }> } };
+      for (const out of [j.coverage.versions, d.coverage.versions]) {
+        assert.ok(out.length <= 256, `${n}: ${out.length}`);
+        assert.equal(out.reduce((a, e) => a + e.lines, 0), sum(versions), `${n}: lines preserved`);
+        const unlisted = out.find((e) => e.version === "unlisted");
+        assert.ok(unlisted !== undefined && unlisted.lines >= 7 + 3 + 2, `${n}: invalid strings are merged into unlisted`);
+        assert.equal(out.filter((e) => e.version === "unlisted").length, 1);
+        assert.deepEqual(out.map((e) => e.version), [...out.map((e) => e.version)].sort());
+      }
+      if (n === 65) assert.equal(j.coverage.versions.length, 65 + 1); // nothing is cut below 256
+      if (n === 300) {
+        // the rest is cut by lines descending: the busiest versions stay
+        const kept = new Set(j.coverage.versions.map((e) => e.version));
+        assert.ok(kept.has("1.299.0") && !kept.has("1.0.0"));
+      }
+    }
+  });
+});
+
+describe("R17.5: the unlogged estimate is printed with its label", () => {
+  it("text coverage rows per bucket, signed; the JSON carries an enum-coded note", async () => {
+    const { view } = await analyzeTree([cfile(SESS, [arec({ uuid: "u1" })])], { since: "2025-01-01", until: "2027-01-01" });
+    const cl = { ...view.coverage_by_provider.claude, unlogged_tokens_estimate: { input_uncached: 1234n, cache_read: -5678n, cache_write: 0n, output: 0n } };
+    const withEst = { ...view, coverage_by_provider: { ...view.coverage_by_provider, claude: cl } };
+    const text = renderReport(withEst);
+    assert.match(text, /unlogged tokens, input_uncached \(includes helper and classifier calls and logging gaps\)\s+\+1,234/);
+    assert.match(text, /unlogged tokens, cache_read \(includes helper and classifier calls and logging gaps\)\s+-5,678/);
+    assert.doesNotMatch(text, /unlogged tokens, output/); // a zero bucket in every column is not printed
+    assert.doesNotMatch(renderReport(view), /unlogged tokens/);
+    const j = JSON.parse(reportToJsonText(view)) as { coverage: Record<string, unknown> };
+    assert.equal(j.coverage["unlogged_tokens_estimate_note"], "includes_helper_classifier_and_logging_gaps");
+    const d = doctorCoverageToJson(view.coverage, view.drift) as { coverage: Record<string, unknown> };
+    assert.equal(d.coverage["unlogged_tokens_estimate_note"], "includes_helper_classifier_and_logging_gaps");
+  });
+});
+
+describe("S8.5b: load-time table validation refuses exactly the listed cases", () => {
+  const entry = (t: any, id: string): any => t.models.find((m: any) => m.id === id);
+  const refused = (t: unknown): boolean => {
+    try {
+      loadPriceBook(t as PricingTable);
+      return false;
+    } catch (e) {
+      if (e instanceof PriceTableError) return true;
+      throw e;
+    }
+  };
+  const mutate = (fn: (t: any) => void): boolean => {
+    const t = tableCopy();
+    fn(t);
+    return refused(t);
+  };
+
+  it("the shipped table loads", () => {
+    assert.equal(refused(tableCopy()), false);
+  });
+
+  it("(1) table shape", () => {
+    for (const bad of [null, 5, "x", []]) assert.equal(refused(bad), true, JSON.stringify(bad));
+    assert.equal(mutate((t) => { t.table_version = "pt-2026-1-9"; }), true);
+    assert.equal(mutate((t) => { t.table_version = 5; }), true);
+    assert.equal(mutate((t) => { t.schema_version = "1"; }), true);
+    assert.equal(mutate((t) => { t.models = {}; }), true);
+    assert.equal(mutate((t) => { t.table_version = "pt-2026-10-09"; }), false);
+  });
+
+  it("(2) entry shape, provider, min_cacheable_tokens, price rows", () => {
+    assert.equal(mutate((t) => { t.models.push("x"); }), true);
+    assert.equal(mutate((t) => { t.models.push({ id: 5, provider: "openai" }); }), true);
+    for (const p of [undefined, null, "x", 5]) assert.equal(mutate((t) => { entry(t, "gpt-5.2").provider = p; }), true, String(p));
+    for (const m of [-1, 1.5, "512", {}]) assert.equal(mutate((t) => { entry(t, "claude-opus-5-5").min_cacheable_tokens = m; }), true, JSON.stringify(m));
+    assert.equal(mutate((t) => { entry(t, "claude-opus-5-5").min_cacheable_tokens = null; }), false);
+    assert.equal(mutate((t) => { entry(t, "claude-opus-5-5").min_cacheable_tokens = 0; }), false);
+    assert.equal(mutate((t) => { entry(t, "gpt-5.1-codex").prices_usd_per_mtok = "x"; }), true);
+    assert.equal(mutate((t) => { entry(t, "gpt-5.1-codex").prices_usd_per_mtok = { input: "1.1234567", cached_input: "1", output: "1" }; }), true);
+  });
+
+  it("(3) a verified entry needs a complete standard row; a write price may be null only for OpenAI", () => {
+    for (const f of ["input", "output", "cache_read", "cache_write_5m", "cache_write_1h"]) {
+      assert.equal(mutate((t) => { delete entry(t, "claude-sonnet-5-5").prices_usd_per_mtok[f]; }), true, f);
+      assert.equal(mutate((t) => { entry(t, "claude-sonnet-5-5").prices_usd_per_mtok[f] = null; }), true, `${f} null`);
+    }
+    assert.equal(mutate((t) => { delete entry(t, "gpt-5.2").prices_usd_per_mtok.input; }), true);
+    assert.equal(mutate((t) => { delete entry(t, "gpt-5.2").prices_usd_per_mtok.cached_input; }), true);
+    assert.equal(mutate((t) => { entry(t, "gpt-5.2").prices_usd_per_mtok.cache_write = null; }), false);
+    assert.equal(mutate((t) => { entry(t, "claude-sonnet-5-5").prices_usd_per_mtok = null; }), true);
+    // an entry that is not verified at run time (no verified flag, or no effective date) is not refused for a missing row
+    assert.equal(mutate((t) => { entry(t, "gpt-5.2").verified = false; delete entry(t, "gpt-5.2").prices_usd_per_mtok.input; }), false);
+    assert.equal(mutate((t) => { delete t.verified_at; const e = entry(t, "gpt-5.2"); delete e.verified_at; delete e.prices_usd_per_mtok.input; }), false);
+  });
+
+  it("(4) every object under modifiers carries a boolean verified", () => {
+    for (const v of [undefined, "true", 1, null]) {
+      assert.equal(mutate((t) => { if (v === undefined) delete t.modifiers.geo_us.verified; else t.modifiers.geo_us.verified = v; }), true, String(v));
+    }
+    assert.equal(mutate((t) => { t.modifiers.batch = 5; }), true);
+    assert.equal(mutate((t) => { t.modifiers.geo_us.verified = false; }), false);
+  });
+
+  it("(5) the R3.2 tests: ratio, documented multipliers, stored inherited multipliers", () => {
+    assert.equal(mutate((t) => { entry(t, "claude-opus-5-5").prices_usd_per_mtok.cache_write_5m = "5.01"; }), true);
+    assert.equal(mutate((t) => { entry(t, "claude-opus-5-5").fast.prices_usd_per_mtok.cache_read = "0.41"; }), true);
+    assert.equal(mutate((t) => { entry(t, "claude-opus-5-5").multipliers.cache_read = "0.1"; }), true);
+    assert.equal(mutate((t) => { entry(t, "claude-opus-5-5").fast.multipliers.cache_read = "0.1"; }), true);
+    assert.equal(mutate((t) => { const m = entry(t, "claude-haiku-5-5"); m.tiers.high_multipliers.cache_write_1h = "3"; }), true);
+  });
+
+  it("(6) a table copy of C25, C26 or C32 that differs", () => {
+    assert.equal(mutate((t) => { entry(t, "gpt-6-sol").long_context.threshold_input_tokens = 272001; }), true);
+    assert.equal(mutate((t) => { entry(t, "claude-opus-5-5").long_context.threshold_input_tokens = 200000; }), true);
+    assert.equal(mutate((t) => { entry(t, "claude-haiku-5-5").tiers.split_tokens = 1; }), true);
+    assert.equal(mutate((t) => { t.modifiers.geo_us.multiplier = "1.2"; }), true);
+    assert.equal(mutate((t) => { entry(t, "claude-opus-5-5").geo_us.multiplier = "1.2"; }), true);
+    assert.equal(mutate((t) => { entry(t, "gpt-6-sol").long_context.threshold_input_tokens = 272000; }), false);
+  });
+
+  it("(7) two model ids anywhere with one normalized form", () => {
+    assert.equal(mutate((t) => { entry(t, "claude-opus-5-5").model_ids.push("claude-opus-5-5-20260101"); }), true); // one entry
+    assert.equal(mutate((t) => { entry(t, "claude-opus-5").model_ids.push("claude-opus-5-5-20260101"); }), true); // two entries
+    assert.equal(mutate((t) => { entry(t, "claude-opus-5").model_ids.push("claude-opus-5-5"); }), true);
+    assert.equal(mutate((t) => { entry(t, "claude-opus-5").id = "claude-opus-5-5-20260101"; }), true); // entry id against another entry's ids
+    assert.equal(mutate((t) => { entry(t, "mythos-preview").model_ids = ["claude-opus-5-5-20260101"]; }), true); // unverified entries count too
+    assert.equal(mutate((t) => { entry(t, "claude-opus-5-5").model_ids.push("claude-opus-5-5"); }), true); // the same string twice is two ids
+    assert.equal(mutate((t) => { entry(t, "claude-opus-5-5").model_ids = ["claude-opus-5-5"]; }), false); // the entry id equal to its own member is one id
+  });
+
+  it("a missing or placeholder verified_at is never a refusal", () => {
+    assert.equal(mutate((t) => { delete t.verified_at; }), false);
+    assert.equal(mutate((t) => { entry(t, "claude-opus-5-5").verified_at = "TBD"; }), false);
+    assert.equal(mutate((t) => { t.modifiers.geo_us.verified_at = 5; }), false);
+  });
+});
+
+describe("S8.5b (3): any present price row of a verified entry must be complete", () => {
+  const entry = (t: any, id: string): any => t.models.find((m: any) => m.id === id);
+  const refused = (fn: (t: any) => void): boolean => {
+    const t = tableCopy();
+    fn(t);
+    try {
+      loadPriceBook(t);
+      return false;
+    } catch (e) {
+      if (e instanceof PriceTableError) return true;
+      throw e;
+    }
+  };
+
+  it("fast, tiers.high, long_context and service_tier rows", () => {
+    assert.equal(refused((t) => { delete entry(t, "claude-opus-5-5").fast.prices_usd_per_mtok.output; }), true);
+    assert.equal(refused((t) => { delete entry(t, "claude-haiku-5-5").tiers.high.output; }), true);
+    assert.equal(refused((t) => { delete entry(t, "gpt-6-luna").long_context.prices_usd_per_mtok.input; }), true);
+    assert.equal(refused((t) => { entry(t, "claude-opus-5-5").long_context.prices_usd_per_mtok = { input: "1" }; }), true); // an Anthropic row too
+    assert.equal(refused((t) => { entry(t, "claude-opus-5-5").service_tier = { batch: { verified: true, prices_usd_per_mtok: { input: "1" } } }; }), true);
+    assert.equal(refused((t) => { entry(t, "claude-opus-5-5").service_tier = { batch: { verified: false, prices_usd_per_mtok: {} } }; }), true);
+  });
+
+  it("an absent row, or any row of an entry that is not verified, is not a refusal", () => {
+    assert.equal(refused((t) => { entry(t, "claude-opus-5-5").fast = null; }), false);
+    assert.equal(refused((t) => { entry(t, "claude-opus-5-5").service_tier = { batch: { verified: true } }; }), false);
+    assert.equal(refused((t) => { const e = entry(t, "claude-opus-5-5"); e.verified = false; delete e.fast.prices_usd_per_mtok.output; }), false);
+    assert.equal(refused((t) => { const e = entry(t, "gpt-6-luna"); e.verified = false; delete e.long_context.prices_usd_per_mtok.input; }), false);
   });
 });

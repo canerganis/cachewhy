@@ -150,6 +150,8 @@ const MALFORMATIONS = {
   c_agent_main: 0.04, // agentId set to the literal "main"
   c_nonbool_flags: 0.04, // isSidechain or isApiErrorMessage that is not a boolean
   c_iterations_nonarray: 0.05, // usage.iterations that is not an array of one object
+  c_early_records: 0.1, // records of other types before every assistant record, with replayed keys across sessions (ownership by stream_start)
+  c_cross_dups: 0.1, // journal rows and log lines duplicated across two files
   c_stray_copy: 0.06, // extra copy of an existing requestId without sessionId (maybe no timestamp, other input or model)
   c_mystery_dups: 0.08, // unlisted-type records duplicated except parentUuid, logicalParentUuid or version
   x_total_range: 0.06, // thread_token_usage.total_tokens out of range while usage is valid
@@ -312,8 +314,8 @@ function subMilli(r: Rng, ms: number): string {
 // Model ids
 // ---------------------------------------------------------------------------
 
-const CLAUDE_MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-haiku-4-5", "claude-haiku-5-5", "claude-sonnet-4-5", "claude-opus-4-1"] as const;
-const CODEX_MODELS = ["gpt-6-sol", "gpt-6-luna", "gpt-5.5", "gpt-6.1-sol", "gpt-5.3-codex", "gpt-5-codex", "gpt-6-astra", "gpt-5.6-luna"] as const;
+export const CLAUDE_MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-haiku-4-5", "claude-haiku-5-5", "claude-sonnet-4-5", "claude-opus-4-1"] as const;
+export const CODEX_MODELS = ["gpt-6-sol", "gpt-6-luna", "gpt-5.5", "gpt-6.1-sol", "gpt-5.3-codex", "gpt-5-codex", "gpt-6-astra", "gpt-5.6-luna"] as const;
 
 function modelValue(r: Rng, k: Knobs, base: string): unknown {
   const suffix = r.chance(k.model_suffix);
@@ -1136,13 +1138,87 @@ function dualAgentFiles(c: Ctx, sessions: readonly ClaudeSessionOut[]): void {
   c.files.push({ path: `projects/${s.proj}/${s.sessionId}/subagents/workflows/wf_dual/agent-${a.agentId}.jsonl`, content: recs.map(jsonLine).join("\n") + "\n", mtimeMs: OLD_MTIME_MS });
 }
 
+/** Early records of other types (unlisted, cost-state, user, system, unsupported versions) in one Claude stream. */
+function earlyClaudeRecords(c: Ctx, sessions: ClaudeSessionOut[]): void {
+  const r = c.r;
+  const hit = r.chance(c.k.c_early_records);
+  const target = r.int(0, sessions.length - 1);
+  const n = r.int(1, 3);
+  const lead = r.int(60, 3600) * 1000;
+  const kinds = [r.int(0, 4), r.int(0, 4), r.int(0, 4)];
+  const unsup = r.chance(0.5);
+  const doReplay = r.chance(0.7);
+  const sub = r.sub();
+  const s = sessions[target];
+  if (!hit || !s) return;
+  used(c, "c_early_records");
+  const sc: Ctx = { ...c, r: sub };
+  let first = c.baseMs;
+  const stamps = s.main.records.map((x) => (typeof x.timestamp === "string" ? Date.parse(x.timestamp) : Number.NaN)).filter((x) => Number.isFinite(x));
+  if (stamps.length > 0) first = Math.min(...stamps);
+  const th = newThread(sc, s.sessionId, null, first - lead, unsup ? "2.0.1" : s.main.version);
+  for (const kd of kinds.slice(0, n)) {
+    th.clock += 1000;
+    if (kd === 4) {
+      claudeRequest(sc, th, {});
+      continue;
+    }
+    const type = ["mystery", "cost-state", "user", "system"][kd]!;
+    const rec = claudeBase(sc, th, type, th.clock);
+    if (type === "cost-state") rec.modelUsage = { "claude-opus-5-5": { inputTokens: 5, outputTokens: 7, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 } };
+    else if (type === "user") rec.message = { role: "user", content: [{ type: "text", text: "synthetic-user-text" }] };
+    else if (type === "system") rec.subtype = "informational";
+    th.records.push(rec);
+  }
+  s.main.records.splice(0, 0, ...th.records);
+  if (doReplay && sessions.length >= 2) replayClaude(sc, sessions);
+}
+
+/** Journal rows and log lines duplicated across two files. Constant draws. */
+function crossFileDups(c: Ctx, provider: "claude" | "codex", from: number): void {
+  const r = c.r;
+  const hit = r.chance(c.k.c_cross_dups);
+  const nLines = r.int(1, 4);
+  const picks = [r.f(), r.f(), r.f(), r.f(), r.f(), r.f()];
+  const journalHit = r.chance(0.5);
+  if (!hit) return;
+  used(c, "c_cross_dups");
+  const logs = c.files.slice(from).filter((f) => typeof f.content === "string" && f.path.endsWith(".jsonl") && !f.path.endsWith("journal.jsonl"));
+  if (logs.length >= 2) {
+    const ai = Math.floor(picks[0]! * logs.length);
+    const bi = (ai + 1 + Math.floor(picks[1]! * (logs.length - 1))) % logs.length;
+    const a = logs[ai]!;
+    const b = logs[bi]!;
+    const aLines = String(a.content).split("\n").map((l) => l.replace(/^\ufeff/, "").replace(/\r$/, "")).filter((l) => l.trim() !== "");
+    const bLines = String(b.content).split("\n");
+    for (let i = 0; i < nLines && aLines.length > 0; i++) {
+      const line = aLines[Math.floor(picks[2 + (i % 4)]! * aLines.length)]!;
+      bLines.splice(1 + Math.floor(picks[(i + 3) % 6]! * Math.max(1, bLines.length - 1)), 0, line);
+    }
+    b.content = bLines.join("\n");
+  }
+  if (provider === "claude" && journalHit) {
+    const main = c.files.slice(from).find((f) => /^projects\/[^/]+\/[^/]+\.jsonl$/.test(f.path));
+    if (main) {
+      const base = main.path.replace(/\.jsonl$/, "");
+      const row = (type: string): string => JSON.stringify({ type, agentId: "synthetic-agent-xdup", key: "synthetic-key" });
+      const nl = "\n";
+      c.files.push({ path: `${base}/subagents/workflows/wf_xa/journal.jsonl`, content: [row("agent_started"), row("agent_started"), row("agent_finished")].join(nl) + nl, mtimeMs: OLD_MTIME_MS });
+      c.files.push({ path: `${base}/subagents/workflows/wf_xb/journal.jsonl`, content: [row("agent_started"), row("mystery")].join(nl) + nl, mtimeMs: OLD_MTIME_MS });
+    }
+  }
+}
+
 function genClaude(c: Ctx): void {
   const r = c.r;
+  const from = c.files.length;
   const n = r.int(1, 3);
   const sessions: ClaudeSessionOut[] = [];
   for (let i = 0; i < n; i++) sessions.push(genClaudeSession(c, i));
   if (r.chance(c.k.c_replay)) replayClaude(c, sessions);
+  earlyClaudeRecords(c, sessions);
   claudeFiles(c, sessions);
+  crossFileDups(c, "claude", from);
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,6 +1467,7 @@ function newCx(c: Ctx, o: { id?: string; sessionId?: string; startMs: number; ve
 
 function genCodex(c: Ctx): void {
   const r = c.r;
+  const from = c.files.length;
   const k = c.k;
   const threads: CxThread[] = [];
   const nRoots = r.int(1, 2);
@@ -1458,6 +1535,7 @@ function genCodex(c: Ctx): void {
   }
   mutateCodex(c, threads);
   codexFiles(c, threads);
+  crossFileDups(c, "codex", from);
 }
 
 function mutateCodex(c: Ctx, threads: CxThread[]): void {

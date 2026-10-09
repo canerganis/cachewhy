@@ -613,7 +613,7 @@ function makeRec(v: unknown, ctx: FileCtx): Rec {
       uuid: null,
       parent: null,
       lparent: null,
-      tn: null,
+      tn, // S10.5a: an unlisted-type record still names its chain at its instant
       isSummary: false,
       files: [],
       sideRangeFailed: 0,
@@ -1243,8 +1243,9 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
       seenLines.set(d, (seenLines.get(d) ?? 0) + 1);
       if (type === "started" && agent !== null) started.push(agent);
     }
-    return { i, f, lines, perr, tail, started, dupLines: [...seenLines.values()], unreadable: stats.error !== undefined };
+    return { i, f, lines, perr, tail, started, seen: seenLines, unreadable: stats.error !== undefined };
   });
+  const journalDigests = new Map<string, number>();
   for (const res of journalRes) {
     if (!res.ok || !res.value) {
       continue;
@@ -1255,12 +1256,8 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     cov.lines_truncated_tail += j.tail;
     fileLines[j.i] = j.lines;
     fileUnparsed[j.i] = j.perr + j.tail;
-    for (const n of j.dupLines) {
-      if (n >= 2) {
-        cov.lines_duplicate_collapsed += n - 1;
-        cov.duplicate_records_collapsed += 1;
-      }
-    }
+    // S12.6b: a journal line is compared with every earlier journal line of the scan, across files
+    for (const [d, n] of j.seen) journalDigests.set(d, (journalDigests.get(d) ?? 0) + n);
     if (j.unreadable) {
       fileUnreadable[j.i] = true;
       cov.files_unreadable += 1;
@@ -1270,6 +1267,12 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     let set = journalStarted.get(k);
     if (!set) journalStarted.set(k, (set = new Set()));
     for (const a of j.started) set.add(a);
+  }
+  for (const n of journalDigests.values()) {
+    if (n >= 2) {
+      cov.lines_duplicate_collapsed += n - 1;
+      cov.duplicate_records_collapsed += 1;
+    }
   }
   // journal read failures that threw
   journalRes.forEach((res, n) => {
@@ -1357,6 +1360,8 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
   // below are built from sets of collapsed records, so line order, file order and duplication cannot change them.
   const chainKeyOf = (S: string, T: string): ChainKey => ({ provider: "claude", root_session: S, thread: T });
   const cidOf = (S: string, T: string): ChainId => chainIdOf(chainKeyOf(S, T));
+  // S10.5a: stream_start is the minimum valid instant over every parsed record that names the chain, of any type and version
+  const chainStartAll = new Map<string, bigint>();
   const wfChain = new Map<string, number>(); // chain -> lowest index of a workflow agent file that names it (S10.1)
   const seenChains = new Set<ChainId>();
   const bySession = new Map<string, Set<ChainId>>(); // R0.9 link (i)
@@ -1384,6 +1389,11 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     let g = bySession.get(r.S);
     if (!g) bySession.set(r.S, (g = new Set()));
     g.add(id);
+    if (r.tn !== null) {
+      const ks = chainStr(r.S, r.T);
+      const have = chainStartAll.get(ks);
+      if (have === undefined || r.tn < have) chainStartAll.set(ks, r.tn);
+    }
     for (const fi of r.files) {
       named[fi]?.add(id);
       // S10.1: any parsed record that names the chain (any type, any version) under subagents/workflows/wf_*/ makes it a
@@ -1402,8 +1412,7 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
   for (const r of supportedGraph) {
     const k = recChain(r);
     let c = chains.get(k);
-    if (!c) chains.set(k, (c = { S: r.S, T: r.T, start: null, files: new Set(), workflowFile: false }));
-    if (r.tn !== null && (c.start === null || r.tn < c.start)) c.start = r.tn;
+    if (!c) chains.set(k, (c = { S: r.S, T: r.T, start: chainStartAll.get(k) ?? null, files: new Set(), workflowFile: false }));
     for (const fi of r.files) {
       c.files.add(fi);
       if ((files[fi] as DiscoveredFile).workflowAgent === true) c.workflowFile = true;

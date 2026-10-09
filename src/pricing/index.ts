@@ -46,6 +46,7 @@ import {
 
 // S8.5a: no leading zeros, `0` alone or `0.` followed by digits; `05`, `00.5`, `.5`, `5.` and signs are malformed.
 const DECIMAL = /^(0|[1-9][0-9]*)(?:\.([0-9]+))?$/;
+const PRICE_GRAMMAR = /^(0|[1-9][0-9]*)(\.[0-9]{1,6})?$/;
 const PRICE_SCALE = 1_000_000n; // price units are 1e-6 USD per MTok
 
 /** Exact rational of a non-negative decimal string, or null when it is not one. */
@@ -186,10 +187,16 @@ interface RowParse {
  */
 function parseRow(provider: TableProvider, p: TablePriceRow | null | undefined, grammar?: (path: string) => void): RowParse {
   if (p === null || p === undefined) return { row: null, error: null };
+  // S8.5a: a price row that is present and is not an object (a string, a number, an array) is no row of prices
+  if (typeof p !== "object" || Array.isArray(p)) {
+    grammar?.("row");
+    return { row: null, error: "a price row must be an object of decimal strings" };
+  }
   const get = (v: unknown, name: string, required: boolean): bigint | null | "bad" => {
     if (v === null || v === undefined) return required ? "bad" : null;
-    // S8.5a: a price that is not a string of the decimal grammar makes the table malformed, verified entry or not.
-    if (parseDecimal(v) === null) grammar?.(name);
+    // S8.5a: a price that is not a string of the price grammar (1 to 6 decimals) makes the table malformed, whatever the
+    // provider, the row and the verification status of the entry.
+    if (typeof v !== "string" || !PRICE_GRAMMAR.test(v)) grammar?.(name);
     const u = parsePriceUnits(v);
     return u === null ? "bad" : u;
   };
@@ -343,6 +350,12 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
   for (const [k, v] of Object.entries(modifiers)) {
     if (k !== "fast_with_geo_us") auditVerified(v, null, `modifiers.${k}`, ctx);
   }
+  // S8.5b (4), R3.1: an object under `modifiers` carries a boolean `verified`
+  for (const [k, v] of Object.entries(modifiers)) {
+    if (typeof v !== "object" || v === null || Array.isArray(v) || typeof (v as { verified?: unknown }).verified !== "boolean") {
+      c.add("schema", `modifiers.${k}`, "an object under modifiers needs a boolean verified (R3.1)");
+    }
+  }
   const geoMod = modifiers["geo_us"];
   if (geoMod !== undefined && geoMod["multiplier"] !== undefined && geoMod["multiplier"] !== null) {
     checkGeoMultiplier(geoMod["multiplier"], "modifiers.geo_us.multiplier", ctx);
@@ -352,6 +365,7 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
   // table's) in addition to the model's own `geo_us` object.
   const geoTableVerified = isVerified(geoMod, null, ctx);
 
+  const idOwner = new Map<string, { idx: number; raw: string }>();
   table.models.forEach((entry, idx) => {
     const path = `models[${idx}]`;
     if (typeof entry !== "object" || entry === null || typeof entry.id !== "string") {
@@ -377,6 +391,12 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
     // Standard row.
     const rawPrices = (entry.prices_usd_per_mtok ?? null) as TablePriceRow | null;
     // S8.5a: a price that is not a decimal string of the grammar makes the table malformed (fatal), verified or not.
+    // S8.5b (3): any price row of a verified entry that is present must be complete for its provider
+    const incompleteRow = (verified: boolean, raw: unknown, parsed: RowParse, where: string): void => {
+      if (verified && raw !== null && raw !== undefined && parsed.row === null) {
+        c.add("schema", where, parsed.error ?? "a price row of a verified entry is incomplete");
+      }
+    };
     const badPrice = (where: string) => (name: string): void => {
       c.add("schema", `${where}.${name}`, "price is not a decimal string of the grammar ^(0|[1-9][0-9]*)(\\.[0-9]+)?$ (S8.5a)");
     };
@@ -401,9 +421,10 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
         c.add("schema", `${path}.fast.multipliers`, "the stored fast multipliers differ from the multipliers of the entry (R3.2)");
       }
       if (f.row !== null) ratioTest(fastMult, f.row, `${path}.fast`, ctx);
+      incompleteRow(entryVerified, entry.fast.prices_usd_per_mtok, f, `${path}.fast.prices_usd_per_mtok`);
       if (isVerified(entry.fast, entry, ctx)) {
-        if (f.row === null) c.add("schema", `${path}.fast`, f.error ?? "verified fast object without prices");
-        else fast = f.row;
+        // S8.5b lists no refusal for an incomplete fast row: it is unusable, so the model has no fast row
+        if (f.row !== null) fast = f.row;
       }
     }
 
@@ -426,9 +447,9 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
         c.add("schema", `${path}.tiers.high_multipliers`, "the stored high tier multipliers differ from the multipliers of the entry (R3.2)");
       }
       if (t.row !== null) ratioTest(highMult, t.row, `${path}.tiers.high`, ctx);
+      incompleteRow(entryVerified, entry.tiers.high, t, `${path}.tiers.high`);
       if (isVerified(entry.tiers, entry, ctx)) {
-        if (t.row === null) c.add("schema", `${path}.tiers.high`, t.error ?? "verified tiers object without a high row");
-        else tierHigh = t.row;
+        if (t.row !== null) tierHigh = t.row; // an incomplete high tier row is unusable (tier_unverified), not a refusal
       }
     }
 
@@ -438,25 +459,32 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
     if (lc !== null) {
       auditVerified(lc, entry, `${path}.long_context`, ctx);
       const scope = effectiveScope(lc, entry, `${path}.long_context`, ctx);
+      // S8.5b (6): a table copy of C25 differs, whatever the provider
+      if (
+        typeof lc === "object" &&
+        !Array.isArray(lc) &&
+        lc.threshold_input_tokens !== undefined &&
+        (!Number.isSafeInteger(lc.threshold_input_tokens) || BigInt(lc.threshold_input_tokens) !== CONSTANTS.CODEX_LONG_CTX)
+      ) {
+        c.add("constant_mismatch", `${path}.long_context.threshold_input_tokens`, "must equal C25 (CODEX_LONG_CTX)");
+      }
       if (provider === "openai") {
-        if (
-          lc.threshold_input_tokens !== undefined &&
-          (!Number.isSafeInteger(lc.threshold_input_tokens) || BigInt(lc.threshold_input_tokens) !== CONSTANTS.CODEX_LONG_CTX)
-        ) {
-          c.add("constant_mismatch", `${path}.long_context.threshold_input_tokens`, "must equal C25 (CODEX_LONG_CTX)");
-        }
         const pricesVerified = isVerified(lc, entry, ctx) && lc.prices_usd_per_mtok !== null && lc.prices_usd_per_mtok !== undefined;
         let lcRow: PriceRow | null = null;
         if (lc.prices_usd_per_mtok !== null && lc.prices_usd_per_mtok !== undefined) {
           const l = parseRow(provider, lc.prices_usd_per_mtok, badPrice(`${path}.long_context.prices_usd_per_mtok`));
+          incompleteRow(entryVerified, lc.prices_usd_per_mtok, l, `${path}.long_context.prices_usd_per_mtok`);
           // R3.2: a long-context row stores its own multiplier object; an absent one falls back to the entry's.
           if (l.row !== null && lc.verified === true) ratioTest(lc.multipliers ?? entry.multipliers, l.row, `${path}.long_context`, ctx);
           if (pricesVerified) {
-            if (l.row === null) c.add("schema", `${path}.long_context`, l.error ?? "verified long_context without prices");
-            else lcRow = l.row;
+            if (l.row !== null) lcRow = l.row; // an incomplete long-context row is unusable, not a refusal (S8.5b)
           }
         }
         longContext = { threshold: CONSTANTS.CODEX_LONG_CTX, prices_verified: pricesVerified && lcRow !== null, row: lcRow, scope };
+      } else if (lc.prices_usd_per_mtok !== null && lc.prices_usd_per_mtok !== undefined) {
+        // Anthropic has no long-context rule, but a price row is validated like every other one (S8.5a)
+        const l = parseRow(provider, lc.prices_usd_per_mtok, badPrice(`${path}.long_context.prices_usd_per_mtok`));
+        incompleteRow(entryVerified, lc.prices_usd_per_mtok, l, `${path}.long_context.prices_usd_per_mtok`);
       }
     }
 
@@ -476,15 +504,14 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
       for (const [k, v] of Object.entries(entry.service_tier) as [string, (TableVerifiable & { readonly prices_usd_per_mtok: TablePriceRow }) | null | undefined][]) {
         const sp = `${path}.service_tier.${k}`;
         if (!(SERVICE_TIER_KEYS as readonly string[]).includes(k)) {
-          c.add("schema", sp, "service_tier rows exist only for priority and batch");
-          continue;
+          continue; // only priority and batch rows are read; another key is ignored (not a refusal case of S8.5b)
         }
         if (v === undefined || v === null) continue;
         auditVerified(v, entry, sp, ctx);
         const s = parseRow(provider, v.prices_usd_per_mtok, badPrice(`${sp}.prices_usd_per_mtok`));
+        incompleteRow(entryVerified, v.prices_usd_per_mtok, s, `${sp}.prices_usd_per_mtok`);
         if (isVerified(v, entry, ctx)) {
-          if (s.row === null) c.add("schema", sp, s.error ?? "verified service_tier row without prices");
-          else serviceRows[k as ServiceTier] = s.row;
+          if (s.row !== null) serviceRows[k as ServiceTier] = s.row; // an incomplete service tier row is unusable, not a refusal
         }
       }
     }
@@ -504,17 +531,27 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
       service_tier_rows: entryVerified ? serviceRows : {},
     };
 
+    // S8.5b (7): no two model ids anywhere (the entry id and every model_ids member, in one entry or two) share a
+    // normalized form; the same raw string within one entry is one id.
+    // Every member of model_ids is a model id (the same string twice is two ids); the entry id counts as one more id
+    // unless it is itself a member of model_ids.
+    const raws: string[] = [];
     for (const raw of entry.model_ids ?? []) {
-      if (typeof raw !== "string") {
-        c.add("schema", `${path}.model_ids`, "model ids must be strings");
-        continue;
-      }
+      if (typeof raw === "string") raws.push(raw); // a non-string member is no model id
+    }
+    if (!raws.includes(entry.id)) raws.push(entry.id);
+    for (const raw of raws) {
       const norm = normalizeModelId(raw);
-      if (models.has(norm)) {
-        c.add("schema", `${path}.model_ids`, "a normalized model id occurs in two entries");
+      if (idOwner.has(norm)) {
+        c.add("schema", `${path}.model_ids`, "a normalized model id occurs twice");
         continue;
       }
-      models.set(norm, mp);
+      idOwner.set(norm, { idx, raw });
+    }
+    for (const raw of entry.model_ids ?? []) {
+      if (typeof raw !== "string") continue;
+      const norm = normalizeModelId(raw);
+      if (!models.has(norm)) models.set(norm, mp);
     }
   });
 

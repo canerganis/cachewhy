@@ -568,3 +568,36 @@ A second internal review hunted for the class of gap that round 5 found: a check
 | P2 | `preTokens` and `postTokens` checked on any `system` record; id-less `session_meta` dropped before the copy test; journal, `cost-state`, non-object line and attribute-field projections; absent and off-grammar `version`; `since > until`; fork prefix check on the first own record only (found by the extended fuzz) | S12.0, S1.3b, S1.3c, S7.0 and S10.4 written and implemented on both sides |
 
 The generator gained knobs for each shape (wrong layouts, dual-directory agent chains, full `cost-state` records, compact boundary subtypes, wrong-type `session_meta` ids, journal duplicates, non-object lines, attribute fields on non-assistant records). Verification: `npm test` 1051 pass, 0 fail. 1000 seeds of every fuzz suite gave 0 divergences, at scale 1 and at scale 2.
+
+## G1 round 6
+
+Auditor: `gpt-6.1-sol`, medium effort, read-only. Embedded content as in round 5. Target: commit `7618bb3`. Verdict: FAIL, with 0 P0, 3 P1 and 0 P2. Each finding was re-checked with a synthetic reproducer. All three are correct; none was rejected.
+
+| # | Sev | Rules | Finding (short) | Resolution |
+|---|---|---|---|---|
+| 1 | P1 | R4.6, S3.3 | `stream_start` was the minimum over supported graph records only in both implementations, so an earlier record of another type or version of stream A did not count and ownership of a replayed key could go to B | New S10.5a: the minimum valid instant over every parsed record that names the chain, any type and any version. Both implementations changed, with an ownership and by-kind fixture |
+| 2 | P1 | R13.2, R17.6, S1.3c | src counted journal duplicates within one file; recompute counted them across the scan | New S12.6b: the duplicate counters compare across files for every class of line. src changed |
+| 3 | P1 | S8.5a, R13.2 | src accepted a price with 7 decimals on an unverified row and did not validate Anthropic `long_context` prices, while recompute rejected the table | src validates every price row of every entry at load, whatever the provider or verification status |
+
+The auditor also noted that `src/report`, discovery and line reading were not embedded. From round 7 on, the prompt embeds `src/report/*.ts`, `src/discover.ts` and `src/io/*.ts`, and a gate owner review of that layer ran before round 7. The fuzz gained knobs for early records of other types, cross-file duplicates, and a table-mutation suite that runs both implementations on mutated price tables.
+
+Final answer of round 6, verbatim:
+
+VERDICT: FAIL
+
+- **P1 | R4.6, S3.3 | `src/sources/claude.ts`, `scripts/recompute/index.mjs`:** `stream_start` yalnız desteklenen graph kayıtlarından hesaplanıyor. Geçerli zaman ve `sessionId` taşıyan diğer kayıtlar dışlanıyor. Örneğin A akışındaki erken bir `other` kaydı, B akışındaki daha sonraki kullanıcı kaydından önceyse sahiplik yine B’ye verilebilir; yanıt yanlış kind toplamına girer. **Düzeltme:** sahiplik başlangıcını R4.6’nın tanımladığı tüm stream kayıtlarının geçerli nanosaniye zamanlarından hesaplayın; owner ve kind toplamlarını sınayan fixture ekleyin.
+
+- **P1 | R13.2, R17.6, S1.3c | `src/sources/claude.ts` journal okuma bölümü:** journal eşit kayıtları ve duplicate sayaçları dosya içinde hesaplanıyor; recompute bunları bütün taramada birleştiriyor. İki workflow journal dosyasındaki aynı `{"type":"started","agentId":"a"}` kaydı için src duplicate saymazken recompute sayıyor. **Düzeltme:** journal projeksiyonlarını tarama genelinde birleştirin; dosyalar arası tekrarların iki duplicate sayacını tam eşitlikle sınayın.
+
+- **P1 | S8.5a, R13.2 | `src/pricing/index.ts`, `parseRow` / `buildBook`:** doğrulanmamış satırdaki `"0.1234567"` fiyatı bütün tabloyu reddetmiyor. `parseDecimal` kabul ediyor, `parsePriceUnits` reddediyor, fakat satır hatası yalnız doğrulanmış entry için fatal oluyor. Ayrıca Anthropic `long_context` fiyatları bu doğrulamadan geçmiyor. Recompute aynı tabloyu reddediyor; src diğer yanıtlara dolar üretmeye devam edebiliyor. **Düzeltme:** sağlayıcı ve verification durumundan bağımsız olarak bütün fiyat satırlarını S8.5a’nın 1 ila 6 ondalık grameriyle yükleme sırasında doğrulayın; herhangi bir ihlalde bütün tabloyu reddedin.
+
+Paylaşılan test özeti bu karşı örneklerin doğrulandığını göstermiyor. `src/report/` ve discovery/I/O uygulamaları gömülmediği için nihai coverage, withholding ve çıktı gizliliğinin tamamı da bu içerikle doğrulanamıyor.
+
+Further resolutions in the same step:
+
+* A table-mutation suite (`test/fuzz/table.ts`) mutates the price table and asserts that both implementations refuse it, or both accept it with identical outputs. At first, 176 of 1000 seeds disagreed. The disagreements were all accept-or-refuse mismatches; whenever both accepted, outputs were identical. New checklist item S8.5b lists exactly when a table is refused at load: shape, provider, a complete price row for every present row of a verified entry, modifier `verified` booleans, the R3.2 ratio and documented-multiplier tests, constant copies, and duplicate normalized ids. Both sides now implement it, and seeds 1 to 1000 agree.
+* A gate owner review of the report, discovery and line-reading layer, run before its first embedding, found two P1s, both fixed. (1) `coverage.versions` was capped at 64 entries and threw on 65, which lost the whole JSON report: off-grammar versions now merge into `unlisted`, at most 256 entries are kept and the rest are summed, and nothing throws on a count. (2) The R17.5 estimate was not printed in the text coverage, and its required label was missing in both outputs: it is now printed per bucket under the label, with an enum note in JSON. Everything else in that layer came out clean: line reading, windowed coverage, the revision 11.1 timestamp rule, per-provider withholding, R3.9, the R16.1 test, pricing arithmetic, privacy of output strings, and filters.
+
+Verification: `npm run typecheck`, `npm run build`, `npm run lint:privacy` and `npm pack --dry-run` clean. `npm test`: 1091 pass, 0 fail, 0 todo. Fuzz: 1000 seeds of every generator suite at scale 1 and at scale 2, plus table seeds 1 to 1000, gave 0 divergences.
+
+Next: G1 audit round 7, with `src/report`, `src/discover.ts` and `src/io` embedded.

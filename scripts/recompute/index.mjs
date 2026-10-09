@@ -509,26 +509,165 @@ function checkPriceRow(row) {
   }
 }
 
-function loadBook(table) {
-  if (!isObj(table) || !Array.isArray(table.models)) throw new Error("table_malformed");
-  const byModel = new Map();
+const DECIMAL_RE = /^(0|[1-9][0-9]*)(\.[0-9]+)?$/;
+const TABLE_VERSION_RE = /^pt-[0-9]{4}-[0-9]{2}-[0-9]{2}(\.[0-9]+)?$/;
+
+/** An exact rational [num, den] of a decimal string, or null when it is no decimal. */
+function decimalRational(v) {
+  if (typeof v !== "string" || !DECIMAL_RE.test(v)) return null;
+  const [i, f = ""] = v.split(".");
+  return [BigInt(i + f), 10n ** BigInt(f.length)];
+}
+const sameRational = (x, y) => x !== null && y !== null && x[0] * y[1] === y[0] * x[1];
+
+/** The price fields a verified entry must carry in its standard row, per provider (docs/pricing.md). */
+const REQUIRED_ROW = {
+  anthropic: { strings: ["input", "output", "cache_read", "cache_write_5m", "cache_write_1h"], nullable: [] },
+  openai: { strings: ["input", "cached_input", "output"], nullable: [] }, // a write price is n/a (null or absent) on GPT-5.5 and earlier
+};
+const MULT_KEYS = ["cache_read", "cache_write_5m", "cache_write_1h", "cached_input", "cache_write"];
+
+/** R3.2 (2): the documented multiplier of a field for an entry, or undefined when the model has no documented one. */
+function documentedMultiplier(e, field) {
+  const ids = new Set([e.id, ...(Array.isArray(e.model_ids) ? e.model_ids : [])].map(tableModelId).filter((x) => x !== null));
+  const any = (...names) => names.some((n) => ids.has(n));
+  if (e.provider === "anthropic") {
+    if (field === "cache_write_5m") return [5n, 4n];
+    if (field === "cache_write_1h") return [2n, 1n];
+    if (field === "cache_read") {
+      if (any("claude-fable-5-1", "claude-mythos-5-1")) return [25n, 1000n];
+      if (any("claude-opus-5-5", "claude-sonnet-5-5")) return [5n, 100n];
+      return [1n, 10n];
+    }
+    return undefined;
+  }
+  // OpenAI: GPT-5.6 and later (gpt-5.6-*, gpt-6-*, gpt-6.1-*)
+  const later = [...ids].some((n) => /^gpt-5\.6(-|$)/.test(n) || /^gpt-6(\.[0-9]+)?(-|$)/.test(n));
+  if (!later) return undefined;
+  if (field === "cache_write") return [5n, 4n];
+  if (field === "cached_input") return any("gpt-6.1-sol") ? [5n, 100n] : [1n, 10n];
+  return undefined;
+}
+
+/** R3.2 (1): every cache price of a row equals the input price of the row times the effective multiplier. */
+function checkRatio(row, mult, strict) {
+  if (!isObj(row) || !isObj(mult)) return;
+  // a price that is absent or null (n/a) has nothing to compare; completeness is S8.5b (3), grammar is S8.5a
+  if (row.input === undefined || row.input === null) return;
+  const input = decimalRational(row.input);
+  for (const k of MULT_KEYS) {
+    const m = mult[k];
+    if (m === undefined || m === null) continue;
+    if (row[k] === undefined || row[k] === null) {
+      if (strict) throw new Error("table_malformed"); // a verified entry's cache price cannot be absent where a multiplier is stored
+      continue;
+    }
+    const mr = decimalRational(m);
+    const price = decimalRational(row[k]);
+    if (mr === null || price === null || input === null) throw new Error("table_malformed");
+    if (!sameRational(price, [input[0] * mr[0], input[1] * mr[1]])) throw new Error("table_malformed");
+  }
+}
+
+/** R3.2 (2): the stored multipliers equal the documented list. */
+function checkDocumented(e, mult) {
+  if (!isObj(mult)) return;
+  for (const k of MULT_KEYS) {
+    if (mult[k] === undefined || mult[k] === null) continue;
+    const doc = documentedMultiplier(e, k);
+    if (doc !== undefined && !sameRational(decimalRational(mult[k]), doc)) throw new Error("table_malformed");
+  }
+}
+
+const canon = (v) => JSON.stringify(v, (k, x) => (isObj(x) ? Object.fromEntries(Object.keys(x).sort().map((q) => [q, x[q]])) : x));
+
+/**
+ * S8.5b: load-time validation of the whole table (R3.1, R3.2, R3.11, S8.5a). Any violation refuses the table as a whole with
+ * `table_malformed`, before any response is priced. A missing or placeholder verified_at is never a refusal (R3.11).
+ */
+function validateTable(table) {
+  const bad = () => {
+    throw new Error("table_malformed");
+  };
+  if (!isObj(table) || !Array.isArray(table.models)) bad();
+  if (typeof table.table_version !== "string" || !TABLE_VERSION_RE.test(table.table_version)) bad();
+  if (typeof table.schema_version !== "number") bad();
+  if (table.modifiers !== undefined && table.modifiers !== null) {
+    if (!isObj(table.modifiers)) bad();
+    for (const v of Object.values(table.modifiers)) if (isObj(v) && typeof v.verified !== "boolean") bad();
+    const g = table.modifiers.geo_us;
+    if (isObj(g) && g.multiplier !== undefined && g.multiplier !== null && !sameRational(decimalRational(g.multiplier), C32)) bad(); // C32
+  }
+  const seen = new Set();
   for (const e of table.models) {
-    if (!isObj(e)) continue;
-    // S8.5a: the whole table is validated when it is loaded, verified or not, used or not
+    if (!isObj(e) || typeof e.id !== "string") bad();
+    if (e.provider !== "anthropic" && e.provider !== "openai") bad();
+    if (e.min_cacheable_tokens !== undefined && e.min_cacheable_tokens !== null && !(Number.isInteger(e.min_cacheable_tokens) && e.min_cacheable_tokens >= 0)) bad();
+    // S8.5a: every price row that is present is an object whose prices follow the grammar
     checkPriceRow(e.prices_usd_per_mtok);
     if (isObj(e.fast)) checkPriceRow(e.fast.prices_usd_per_mtok);
     if (isObj(e.tiers)) checkPriceRow(e.tiers.high);
     if (isObj(e.long_context)) checkPriceRow(e.long_context.prices_usd_per_mtok);
     if (isObj(e.service_tier)) for (const v of Object.values(e.service_tier)) if (isObj(v)) checkPriceRow(v.prices_usd_per_mtok);
-    const ids = Array.isArray(e.model_ids) ? e.model_ids : [];
-    for (const raw of ids) {
-      const id = tableModelId(raw); // S2.4: the table side is normalized the same way
+    // (3) a verified entry carries a complete standard row for its provider
+    if (e.verified === true) {
+      const complete = (row) => {
+        const need = REQUIRED_ROW[e.provider];
+        for (const k of need.strings) if (typeof row[k] !== "string") bad();
+        for (const k of need.nullable) if (!(k in row)) bad();
+      };
+      if (!isObj(e.prices_usd_per_mtok)) bad();
+      complete(e.prices_usd_per_mtok);
+      // any other price row of a verified entry that is present must be complete as well
+      if (isObj(e.fast) && isObj(e.fast.prices_usd_per_mtok)) complete(e.fast.prices_usd_per_mtok);
+      if (isObj(e.tiers) && isObj(e.tiers.high)) complete(e.tiers.high);
+      if (isObj(e.long_context) && isObj(e.long_context.prices_usd_per_mtok)) complete(e.long_context.prices_usd_per_mtok);
+      if (isObj(e.service_tier)) for (const v of Object.values(e.service_tier)) if (isObj(v) && isObj(v.prices_usd_per_mtok)) complete(v.prices_usd_per_mtok);
+    }
+    // (5) R3.2: ratio test on every row with an effective multiplier object, documented multipliers, inherited objects
+    const own = isObj(e.multipliers) ? e.multipliers : null;
+    checkRatio(e.prices_usd_per_mtok, own, e.verified === true);
+    checkDocumented(e, own);
+    if (isObj(e.fast)) {
+      const inherited = e.fast.multipliers;
+      if (inherited !== undefined && inherited !== null && canon(inherited) !== canon(e.multipliers ?? null)) bad();
+      checkRatio(e.fast.prices_usd_per_mtok, isObj(inherited) ? inherited : own, e.verified === true);
+    }
+    if (isObj(e.tiers)) {
+      const inherited = e.tiers.high_multipliers;
+      if (inherited !== undefined && inherited !== null && canon(inherited) !== canon(e.multipliers ?? null)) bad();
+      checkRatio(e.tiers.high, isObj(inherited) ? inherited : own, e.verified === true);
+      if (e.tiers.split_tokens !== undefined && e.tiers.split_tokens !== Number(C26)) bad(); // C26
+    }
+    if (isObj(e.long_context)) {
+      const lc = e.long_context;
+      if (lc.verified === true) {
+        checkRatio(lc.prices_usd_per_mtok, isObj(lc.multipliers) ? lc.multipliers : own, e.verified === true);
+        checkDocumented(e, lc.multipliers);
+      }
+      if ("threshold_input_tokens" in lc && lc.threshold_input_tokens !== Number(C25)) bad(); // C25
+    }
+    if (isObj(e.geo_us) && e.geo_us.multiplier !== undefined && e.geo_us.multiplier !== null && !sameRational(decimalRational(e.geo_us.multiplier), C32)) bad(); // C32
+    // (7) two model ids anywhere with the same normalized form, inside one entry or in two
+    for (const raw of Array.isArray(e.model_ids) ? e.model_ids : []) {
+      const id = tableModelId(raw);
       if (id === null) continue;
-      if (byModel.has(id) && byModel.get(id) !== e) throw new Error("table_malformed"); // two entries with the same normalized model id
-      byModel.set(id, e);
+      if (seen.has(id)) bad();
+      seen.add(id);
     }
   }
-  return { table, byModel, version: typeof table.table_version === "string" ? table.table_version : "unlisted" };
+}
+
+function loadBook(table) {
+  validateTable(table);
+  const byModel = new Map();
+  for (const e of table.models) {
+    for (const raw of Array.isArray(e.model_ids) ? e.model_ids : []) {
+      const id = tableModelId(raw); // S2.4: the table side is normalized the same way
+      if (id !== null) byModel.set(id, e);
+    }
+  }
+  return { table, byModel, version: table.table_version };
 }
 
 /** Entry is usable when the entry itself is verified (R3.1) and has prices. */
@@ -1145,7 +1284,8 @@ function firstOf(set, key) {
 }
 
 function scanClaude(entries, cov, window) {
-  const streams = new Map(); // chain id -> { sess, agent, start }
+  const streams = new Map(); // chain id -> { sess, agent }
+  const streamStart = new Map(); // chain id -> stream_start in nanoseconds (R4.6, S10.5a)
   const wfChains = new Set(); // S10.1: chains with a record in a file under subagents/workflows/wf_*/
   const requests = new Map(); // rid -> copies[] (usage-bearing copies of a supported version)
   const midToRids = new Map();
@@ -1206,8 +1346,14 @@ function scanClaude(entries, cov, window) {
         triggers.push({ reason: "unattributed_record", names: "provider" }); // R0.9: no key, no accounting
       }
       const supported = claudeSupported(rec.version);
-      if (!known) continue;
       const ts = instantNs(rec.timestamp); // S3: BigInt nanoseconds or null
+      // R4.6, S10.5a: stream_start is the minimum valid instant over every parsed record that names the chain, of any type
+      // (unlisted ones and cost-state included) and any version, in any file
+      if (chain !== null && ts !== null) {
+        const cur = streamStart.get(chain);
+        if (cur === undefined || ts < cur) streamStart.set(chain, ts);
+      }
+      if (!known) continue;
       // S12.0, R2.15: non-counter integers that fail the range, once per logical record and field. A cost-state record
       // is not a request, so its version is not looked at.
       if (type === "cost-state" || (graph && supported)) {
@@ -1217,11 +1363,7 @@ function scanClaude(entries, cov, window) {
       }
       if (!graph) continue;
       if (!supported) c.lines_unverified_version += 1;
-      if (supported && chain !== null) {
-        let st = streams.get(chain);
-        if (!st) streams.set(chain, (st = { sess, agent, start: null }));
-        if (ts !== null && (st.start === null || ts < st.start)) st.start = ts; // R4.6 stream_start
-      }
+      if (supported && chain !== null && !streams.has(chain)) streams.set(chain, { sess, agent });
       if (type !== "assistant") continue;
       const msg = isObj(rec.message) ? rec.message : null;
       // S12.0: logical records that carry a usage object, chainless ones included; unmappable ones are incomplete or range (S4.3).
@@ -1332,7 +1474,7 @@ function scanClaude(entries, cov, window) {
     let owner = sids[0] ?? null;
     let ambiguous = false;
     if (sids.length > 1) {
-      const startOf = (st) => streams.get(st).start; // BigInt nanoseconds or null (null sorts last)
+      const startOf = (st) => streamStart.get(st) ?? null; // BigInt nanoseconds or null (null sorts last)
       const minStart = sids.map(startOf).reduce((x, y) => (cmpNullLast(x, y) <= 0 ? x : y));
       const tied = sids.filter((st) => startOf(st) === minStart);
       if (tied.length > 1) {

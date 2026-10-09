@@ -480,7 +480,7 @@ describe("table audit", () => {
     bad((t) => { t.models = {}; });
     bad((t) => { entryOf(t, "claude-opus-5-5").provider = "mistral"; });
     bad((t) => { entryOf(t, "claude-opus-5-5").min_cacheable_tokens = 12.5; });
-    bad((t) => { entryOf(t, "claude-opus-5-5").service_tier = { standard: { verified: true, prices_usd_per_mtok: {} } }; });
+    // S8.5b lists no refusal for a service_tier key other than priority and batch: it is ignored
     assert.throws(() => loadPriceBook(null as unknown as PricingTable), PriceTableError);
   });
 

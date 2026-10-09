@@ -4,7 +4,7 @@
 // R16.5 (withheld), R17.2, R0.9 (taint lines).
 //
 // G1 prints no boundary, event or delta line (sections 7 to 11 are not computed) and says so.
-import { PROVIDERS, REQUEST_KINDS, UNPRICED_TOKEN_REASONS } from "../model/types.js";
+import { PROVIDERS, REQUEST_KINDS, UNLOGGED_BUCKETS, UNPRICED_TOKEN_REASONS } from "../model/types.js";
 import type { CoverageCounters, DriftFinding, HeadlineFigures, ModelTotals, Provider, ProviderTotals, ReportInput } from "../model/types.js";
 import { formatBig, formatInt, formatPercentBig, formatTable, formatUsdPico, makePainter } from "./format.js";
 import type { Painter } from "./format.js";
@@ -210,6 +210,13 @@ export function renderCoverage(
     if (r.label === "requests unpriced by modifier") rows.push(...breakdown("reason", by[providers[0] as Provider].requests_unpriced_modifier_by_reason, providers, by, (c) => c.requests_unpriced_modifier_by_reason));
     if (r.label === "links unlinked") rows.push(...breakdown("reason", by[providers[0] as Provider].links_unlinked_by_reason, providers, by, (c) => c.links_unlinked_by_reason));
     if (r.label === "chains tainted (R0.9)") rows.push(...breakdown("reason", by[providers[0] as Provider].chains_tainted_by_reason, providers, by, (c) => c.chains_tainted_by_reason));
+  }
+  // R17.5: the unlogged estimate per bucket, signed, with its required label. Never part of totals or dollars.
+  const signed = (n: bigint): string => (n > 0n ? `+${formatBig(n)}` : formatBig(n));
+  for (const b of UNLOGGED_BUCKETS) {
+    const vals = providers.map((p) => by[p].unlogged_tokens_estimate[b]);
+    if (vals.every((v) => v === 0n)) continue;
+    rows.push([`unlogged tokens, ${b} (includes helper and classifier calls and logging gaps)`, ...vals.map(signed)]);
   }
   const out: string[] = [paint("bold", "Coverage"), formatTable([{ header: "Counter" }, ...providers.map((p) => ({ header: PROVIDER_LABEL[p], align: "right" as const }))], rows)];
   if (taint) {

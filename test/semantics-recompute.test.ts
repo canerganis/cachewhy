@@ -54,7 +54,7 @@ const FAST = row("8", "40", "0.4", "10", "16");
 function makeTable(over: Obj = {}, models: Obj[] | null = null): Obj {
   return {
     schema_version: 1,
-    table_version: "pt-sem",
+    table_version: "pt-2026-10-09.1",
     verified_at: "2026-10-09",
     sources: { A1: "x", OM1: "y" },
     modifiers: { geo_us: { verified: true }, fast_with_geo_us: { verified: true } },
@@ -666,10 +666,12 @@ describe("S8.2: geo us needs the table-level modifiers.geo_us and the model's ge
   });
 
   it("without a verified table-level geo_us the response is unpriced geo_other", () => {
-    for (const modifiers of [{ fast_with_geo_us: { verified: true } }, { geo_us: { verified: false }, fast_with_geo_us: { verified: true } }, { geo_us: { verified: "true" }, fast_with_geo_us: { verified: true } }, { geo_us: { verified: true, verified_at: "n/a" }, fast_with_geo_us: { verified: true } }]) {
+    for (const modifiers of [{ fast_with_geo_us: { verified: true } }, { geo_us: { verified: false }, fast_with_geo_us: { verified: true } }, { geo_us: { verified: true, verified_at: "n/a" }, fast_with_geo_us: { verified: true } }]) {
       const r = recomputeFiles([geoUs()], { table: makeTable({ modifiers }), runStartMs: RUN });
       assert.equal(rowOf(r, "claude:synthetic-r1").unpriced_reason, "geo_other", JSON.stringify(modifiers));
     }
+    // a modifier object without a boolean verified refuses the table (S8.5b)
+    assert.throws(() => recomputeFiles([geoUs()], { table: makeTable({ modifiers: { geo_us: { verified: "true" }, fast_with_geo_us: { verified: true } } }), runStartMs: RUN }), /table_malformed/);
     // the table's own date makes it effective (S8.1): no own verified_at needed
     const ok = recomputeFiles([geoUs()], { table: makeTable({ modifiers: { geo_us: { verified: true }, fast_with_geo_us: { verified: true } } }), runStartMs: RUN });
     assert.notEqual(rowOf(ok, "claude:synthetic-r1").usd_pico, null);
@@ -1107,20 +1109,21 @@ describe("S8.5a: the whole table is validated at load time", () => {
     for (const [name, e] of bad) assert.throws(load(unused(e)), /table_malformed/, name);
     // the entry is not used by any response and not verified: it still fails the load
     assert.doesNotThrow(load(unused({})), "control");
-    assert.doesNotThrow(load(unused({ prices_usd_per_mtok: { input: "1", output: "2", cache_read: "0", cache_write_5m: "0.5", cache_write_1h: null } })), "null is n/a");
+    assert.doesNotThrow(load(unused({ verified: false, prices_usd_per_mtok: { input: "1", output: "2", cache_read: "0", cache_write_5m: "0.5", cache_write_1h: null } })), "null is n/a on an unverified entry");
+    assert.throws(load(unused({ prices_usd_per_mtok: { input: "1", output: "2", cache_read: "0", cache_write_5m: "0.5", cache_write_1h: null } })), /table_malformed/, "a verified entry needs a complete standard row");
   });
 
   it("two entries with the same normalized model id make the table malformed", () => {
     const dup = makeTable({}, [claudeEntry("claude-sonnet-5-5", SONNET), claudeEntry("claude-sonnet-5-5-20260101", SONNET)]);
     assert.throws(load(dup), /table_malformed/);
     const same = makeTable({}, [{ ...claudeEntry("claude-sonnet-5-5", SONNET), model_ids: ["claude-sonnet-5-5", "claude-sonnet-5-5-20260101"] }]);
-    assert.doesNotThrow(load(same), "one entry, two spellings of one id");
+    assert.throws(load(same), /table_malformed/, "two spellings of one normalized id in one entry (S8.5b 7)");
   });
 
   it("an entry is used only for its own provider", () => {
     const table = makeTable({}, [
-      { ...claudeEntry("claude-sonnet-5-5", SONNET), provider: "openai" },
-      { ...gptEntry("gpt-6-sol", { input: "2", cached_input: "0.2", cache_write: "2.5", output: "10" }, null), provider: "anthropic" },
+      gptEntry("claude-sonnet-5-5", { input: "2", cached_input: "0.2", cache_write: "2.5", output: "10" }, null),
+      claudeEntry("gpt-6-sol", SONNET),
     ]);
     const c = recomputeFiles([mainFile("s1", [copy({})])], { table, runStartMs: RUN });
     assert.equal(rowOf(c, "claude:synthetic-r1").unpriced_reason, "unknown_model");
@@ -1651,5 +1654,270 @@ describe("S1.3b: id states in the R4.11 comparison; id-less session_meta; versio
     assert.equal(cdup(cm(undefined), cm("garbage")), 0);
     assert.equal(cdup(cm(undefined), cm(null)), 1);
     assert.equal(cdup(cm("garbage"), cm(9)), 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round 6: S10.5a stream_start, S12.6b duplicate scope, S8.5a unverified rows
+// ---------------------------------------------------------------------------
+
+describe("S10.5a: stream_start is the minimum valid instant over every parsed record that names the chain", () => {
+  const shared = (sess: string, ts: string, mid = "mshared") => copy({ sess, req: "shared", mid, ts });
+  const owned = (r: RecomputeResult) => rows(r).find((x) => x.id === "shared" && x.provider === "claude");
+
+  it("an early record of an unlisted type makes its stream the owner of a replayed key", () => {
+    // stream B's first graph record is at T(5); stream A's earliest record is an unlisted-type record at T(1), its graph
+    // record of the key is later than B's. A owns the key.
+    const early = { type: "mystery", uuid: "m1", sessionId: "sa", timestamp: T(1), version: CV };
+    const r = run([mainFile("sa", [early as Obj, shared("sa", T(9))]), mainFile("sb", [shared("sb", T(5))])]);
+    assert.equal(cov(r, "claude").replay_ownership_ambiguous, 0);
+    assert.equal(owned(r)?.kind, "main");
+    assert.equal(cov(r, "claude").replay_requests_excluded, 1);
+    // control: without the early record B starts first and owns it (the response is counted once either way)
+    const ctl = run([mainFile("sa", [shared("sa", T(9))]), mainFile("sb", [shared("sb", T(5))])]);
+    assert.equal(cov(ctl, "claude").replay_requests_excluded, 1);
+    // who owns it shows in the chain: ask for the model-free per-chain count through the taint of a conflict instead
+    const own = (extra: Obj[]) => {
+      const a = copy({ sess: "sa", req: "shared", mid: "mshared", ts: T(9), usage: usage({ input_tokens: 10 }) });
+      const b = copy({ sess: "sb", req: "shared", mid: "mshared", ts: T(5), usage: usage({ input_tokens: 10 }) });
+      return run([mainFile("sa", [...extra, a]), mainFile("sb", [b])]);
+    };
+    const withEarly = own([early as Obj]);
+    const without = own([]);
+    const chainOf = (res: RecomputeResult) => (res.responses.find((x) => x.counted && x.key === "shared")?.chain ?? "").split("\u0000")[1];
+    assert.equal(chainOf(withEarly), "sa");
+    assert.equal(chainOf(without), "sb");
+  });
+
+  it("a cost-state record, a record of an unsupported version and a record without a graph type all count; an invalid instant does not", () => {
+    const a = copy({ sess: "sa", req: "shared", mid: "mshared", ts: T(9) });
+    const b = copy({ sess: "sb", req: "shared", mid: "mshared", ts: T(5) });
+    const chainOf = (extra: Obj[]) => {
+      const res = run([mainFile("sa", [...extra, a]), mainFile("sb", [b])]);
+      return (res.responses.find((x) => x.counted && x.key === "shared")?.chain ?? "").split("\u0000")[1];
+    };
+    assert.equal(chainOf([]), "sb");
+    assert.equal(chainOf([{ type: "cost-state", sessionId: "sa", timestamp: T(1), modelUsage: {} }]), "sa");
+    assert.equal(chainOf([{ type: "user", uuid: "u", sessionId: "sa", timestamp: T(1), version: "1.0.0" }]), "sa", "any version");
+    assert.equal(chainOf([{ type: "user", uuid: "u", sessionId: "sa", timestamp: "2026-02-30T00:00:00Z", version: CV }]), "sb", "an invalid instant takes no part");
+    // the record must name the chain: another session id or another agent id does not
+    assert.equal(chainOf([{ type: "mystery", uuid: "u", sessionId: "other", timestamp: T(1) }]), "sb");
+    assert.equal(chainOf([{ type: "mystery", uuid: "u", sessionId: "sa", agentId: "ag", timestamp: T(1) }]), "sb");
+    assert.equal(chainOf([{ type: "mystery", uuid: "u", sessionId: "sa", agentId: "main", timestamp: T(1) }]), "sa", "agentId main is the main chain");
+    // a tie at full precision is still a tie
+    const tie = run([mainFile("sa", [{ type: "mystery", uuid: "u", sessionId: "sa", timestamp: T(5) } as Obj, a]), mainFile("sb", [b])]);
+    assert.equal(cov(tie, "claude").replay_ownership_ambiguous, 1);
+  });
+});
+
+describe("S12.6b: the duplicate counters compare across files", () => {
+  it("the same started line in two journal files, and the same record in two logs, are duplicates", () => {
+    const j = (run: string) => ({ path: `projects/p/ss/subagents/workflows/wf_${run}/journal.jsonl`, content: '{"type":"started","agentId":"a"}\n' }) as F;
+    const base = [mainFile("ss", [copy({ sess: "ss" })])];
+    const c = cov(run([...base, j("r1"), j("r2")]), "claude");
+    assert.equal(c.lines_duplicate_collapsed, 1);
+    assert.equal(c.duplicate_records_collapsed, 1);
+    const three = cov(run([...base, j("r1"), j("r2"), j("r3")]), "claude");
+    assert.equal(three.lines_duplicate_collapsed, 2);
+    assert.equal(three.duplicate_records_collapsed, 1);
+    // another agentId is another record
+    const other = { path: "projects/p/ss/subagents/workflows/wf_r3/journal.jsonl", content: '{"type":"started","agentId":"b"}\n' } as F;
+    assert.equal(cov(run([...base, j("r1"), j("r2"), other]), "claude").lines_duplicate_collapsed, 1);
+    // logs across files; and Codex across files
+    const rec = copy({ sess: "dup" });
+    assert.equal(cov(run([mainFile("dup", [rec]), { path: "projects/q/dup.jsonl", content: jsonl([rec]) }]), "claude").lines_duplicate_collapsed, 1);
+    const cx = [xmeta("synthetic-td"), xturn("tn", "gpt-6-sol", 1, 1)];
+    assert.equal(cov(run([xfile("d1", cx), xfile("d2", cx)]), "codex").lines_duplicate_collapsed, 2);
+    assert.equal(cov(run([xfile("d1", cx), xfile("d2", cx)]), "codex").duplicate_records_collapsed, 2);
+  });
+});
+
+describe("S8.5a: unverified rows and long-context prices reject the table", () => {
+  const load = (table: Obj) => () => recomputeFiles([], { table, runStartMs: RUN });
+  const withRows = (e: Obj) => makeTable({}, [claudeEntry("claude-sonnet-5-5", SONNET), { ...claudeEntry("claude-unused-8", row("1", "2", "3", "4", "5")), verified: false, ...e }]);
+
+  it("0.1234567 on an unverified row rejects the table", () => {
+    const bad = { ...row("1", "2", "3", "4", "5"), cache_read: "0.1234567" };
+    assert.throws(load(withRows({ prices_usd_per_mtok: bad })), /table_malformed/);
+    assert.throws(load(withRows({ fast: { prices_usd_per_mtok: bad, verified: false } })), /table_malformed/);
+    assert.throws(load(withRows({ tiers: { split_tokens: 1, high: bad, verified: false } })), /table_malformed/);
+    assert.doesNotThrow(load(withRows({ prices_usd_per_mtok: { ...bad, cache_read: "0.123456" } })), "six digits are fine");
+  });
+
+  it("malformed Anthropic long_context prices reject the table", () => {
+    for (const lc of [
+      { prices_usd_per_mtok: { input: 3, output: "4" }, verified: false },
+      { prices_usd_per_mtok: { input: "3", output: "0.1234567" }, verified: false },
+      { prices_usd_per_mtok: { input: "03" }, verified: true },
+      { prices_usd_per_mtok: { input: ["3"] }, verified: false },
+    ]) assert.throws(load(withRows({ long_context: lc })), /table_malformed/, JSON.stringify(lc));
+    assert.doesNotThrow(load(withRows({ long_context: { surcharge: "none", verified: true } })), "a long_context without prices is fine");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S8.5b: load-time table validation
+// ---------------------------------------------------------------------------
+
+describe("S8.5b: a table is refused at load iff one of the listed conditions holds", () => {
+  const load = (table: Obj) => () => recomputeFiles([], { table, runStartMs: RUN });
+  const HAIKU = (extra: Obj = {}) => claudeEntry("claude-haiku-5-5", row("0.1", "0.5", "0.01", "0.125", "0.2"), { multipliers: { cache_read: "0.1", cache_write_5m: "1.25", cache_write_1h: "2" }, ...extra });
+  const base = (over: Obj = {}): Obj => makeTable({}, [claudeEntry("claude-sonnet-5-5", SONNET), HAIKU(), ...(over.models ?? [])]);
+
+  it("the shipped table loads, and so do the test tables", () => {
+    assert.doesNotThrow(() => recomputeFiles([], { runStartMs: RUN }));
+    assert.doesNotThrow(load(TABLE));
+    assert.doesNotThrow(load(base()));
+  });
+
+  it("(1) the table shape: version grammar, schema version, models array", () => {
+    for (const v of ["pt-sem", "2026-10-09", "pt-2026-10-9", "pt-2026-10-09.", "pt-2026-10-09.x", 5, null, undefined]) assert.throws(load({ ...TABLE, table_version: v }), /table_malformed/, String(v));
+    for (const v of ["pt-2026-10-09", "pt-2026-10-09.12"]) assert.doesNotThrow(load({ ...TABLE, table_version: v }), v);
+    for (const v of ["1", null, undefined]) assert.throws(load({ ...TABLE, schema_version: v }), /table_malformed/, String(v));
+    assert.throws(load({ ...TABLE, models: {} }), /table_malformed/);
+  });
+
+  it("(2) an entry needs a string id, a known provider and a sane min_cacheable_tokens; a present price row must be an object", () => {
+    const e = (over: Obj) => makeTable({}, [{ ...claudeEntry("claude-sonnet-5-5", SONNET), ...over }]);
+    assert.throws(load(makeTable({}, [5 as unknown as Obj])), /table_malformed/);
+    assert.throws(load(e({ id: 5 })), /table_malformed/);
+    for (const p of ["x", null, 5, undefined, "OpenAI"]) assert.throws(load(e({ provider: p })), /table_malformed/, String(p));
+    for (const m of [-1, 1.5, "512", true]) assert.throws(load(e({ min_cacheable_tokens: m })), /table_malformed/, String(m));
+    for (const m of [0, 512, null, undefined]) assert.doesNotThrow(load(e({ min_cacheable_tokens: m })), String(m));
+    assert.throws(load(e({ prices_usd_per_mtok: "x", verified: false })), /table_malformed/);
+    assert.doesNotThrow(load(e({ prices_usd_per_mtok: { ...SONNET, input: null }, verified: false })), "a null price is not a refusal on an unverified entry");
+  });
+
+  it("(3) a verified entry needs a complete standard row; an unverified entry may have holes", () => {
+    const e = (over: Obj) => makeTable({}, [{ ...claudeEntry("claude-sonnet-5-5", SONNET), ...over }]);
+    for (const k of Object.keys(SONNET)) {
+      assert.throws(load(e({ prices_usd_per_mtok: { ...SONNET, [k]: null } })), /table_malformed/, k + " null");
+      const gone = { ...SONNET } as Obj;
+      delete gone[k];
+      assert.throws(load(e({ prices_usd_per_mtok: gone })), /table_malformed/, k + " missing");
+      assert.doesNotThrow(load(e({ verified: false, prices_usd_per_mtok: gone })), k + " missing, unverified");
+    }
+    assert.throws(load(e({ prices_usd_per_mtok: null })), /table_malformed/, "no row at all");
+    // OpenAI: the write price may be null or absent (n/a)
+    const g = (row2: Obj, over: Obj = {}) => makeTable({}, [{ ...gptEntry("gpt-5.5", row2, null), ...over }]);
+    assert.doesNotThrow(load(g({ input: "5", cached_input: "0.5", cache_write: null, output: "30" })));
+    assert.doesNotThrow(load(g({ input: "5", cached_input: "0.5", output: "30" })), "an absent write price is n/a, like null");
+    assert.throws(load(g({ input: "5", cached_input: null, cache_write: null, output: "30" })), /table_malformed/);
+  });
+
+  it("(3) any other price row of a verified entry that is present must be complete too", () => {
+    const std = { cache_read: "0.1", cache_write_5m: "1.25", cache_write_1h: "2" };
+    const full = row("0.2", "1", "0.02", "0.25", "0.4");
+    const without = (r: Obj, k: string): Obj => {
+      const c = { ...r };
+      delete c[k];
+      return c;
+    };
+    for (const k of Object.keys(full)) {
+      const fast = (r: Obj, verified = true) => makeTable({}, [HAIKU({ verified, fast: { prices_usd_per_mtok: r, verified: true } })]);
+      assert.doesNotThrow(load(fast(full)), "complete fast row");
+      assert.throws(load(fast(without(full, k))), /table_malformed/, "fast " + k);
+      if (k === "output") assert.doesNotThrow(load(fast(without(full, k), false)), "an unverified entry may have holes: fast " + k); // a missing input or cache price fails the ratio test whatever the verification
+      const hi = row("0.5", "2.5", "0.05", "0.625", "1");
+      assert.throws(load(makeTable({}, [HAIKU({ tiers: { split_tokens: 100000, high: without(hi, k), verified: true } })])), /table_malformed/, "tiers.high " + k);
+      assert.throws(load(makeTable({}, [HAIKU({ service_tier: { batch: { prices_usd_per_mtok: without(full, k), verified: true } } })])), /table_malformed/, "service_tier " + k);
+    }
+    // an OpenAI long-context row: the write price may be null or absent
+    const lc = (prices: Obj) => makeTable({}, [gptEntry("gpt-5.5", { input: "5", cached_input: "0.5", cache_write: null, output: "30" }, { threshold_input_tokens: 272000, prices_usd_per_mtok: prices, scope: "session", scope_verified: true, scope_source_id: "OM1", verified: true })]);
+    assert.doesNotThrow(load(lc({ input: "10", cached_input: "1", cache_write: null, output: "45" })));
+    assert.doesNotThrow(load(lc({ input: "10", cached_input: "1", output: "45" })), "lc cache_write absent is n/a");
+    assert.throws(load(lc({ input: "10", cached_input: "1", cache_write: null })), /table_malformed/, "lc output missing");
+    // a long-context object without prices has no row to complete
+    assert.doesNotThrow(load(makeTable({}, [claudeEntry("claude-sonnet-5-5", SONNET, { long_context: { surcharge: "none", verified: true } })])));
+    void std;
+  });
+
+  it("(4) an object under modifiers without a boolean verified refuses the table", () => {
+    for (const v of [undefined, "true", 1, null]) {
+      assert.throws(load({ ...TABLE, modifiers: { ...TABLE.modifiers, extra: { verified: v } } }), /table_malformed/, String(v));
+    }
+    assert.doesNotThrow(load({ ...TABLE, modifiers: { ...TABLE.modifiers, extra: { verified: false }, plain: 5 } }));
+  });
+
+  it("(5) R3.2: the ratio test runs on the standard, fast, high tier and verified long-context rows", () => {
+    assert.throws(load(makeTable({}, [HAIKU({ prices_usd_per_mtok: row("0.1", "0.5", "0.011", "0.125", "0.2") })])), /table_malformed/, "standard cache read");
+    assert.throws(load(makeTable({}, [HAIKU({ prices_usd_per_mtok: row("0.1", "0.5", "0.01", "0.126", "0.2") })])), /table_malformed/, "5m write");
+    assert.throws(load(makeTable({}, [HAIKU({ prices_usd_per_mtok: row("0.1", "0.5", "0.01", "0.125", "0.21") })])), /table_malformed/, "1h write");
+    // fast and tiers inherit the entry multipliers when they store none
+    const fast = (p: Obj, extra: Obj = {}) => HAIKU({ fast: { prices_usd_per_mtok: p, verified: true, ...extra } });
+    assert.doesNotThrow(load(makeTable({}, [fast(row("0.2", "1", "0.02", "0.25", "0.4"))])), "control");
+    assert.throws(load(makeTable({}, [fast(row("0.2", "1", "0.03", "0.25", "0.4"))])), /table_malformed/, "fast row, inherited");
+    const high = (p: Obj, extra: Obj = {}) => HAIKU({ tiers: { split_tokens: 100000, high: p, verified: true, ...extra } });
+    assert.doesNotThrow(load(makeTable({}, [high(row("0.5", "2.5", "0.05", "0.625", "1"))])), "control");
+    assert.throws(load(makeTable({}, [high(row("0.5", "2.5", "0.05", "0.625", "1.1"))])), /table_malformed/, "high tier row");
+    // a row with a stored multiplier object of its own uses it; no object, no test
+    assert.doesNotThrow(load(makeTable({}, [claudeEntry("claude-sonnet-5-5", row("2", "10", "5", "5", "5"))])), "no multipliers: no ratio test");
+    const gpt = (lcPrices: Obj, verified = true) => makeTable({}, [gptEntry("gpt-6-sol", { input: "2", cached_input: "0.2", cache_write: "2.5", output: "10" }, { threshold_input_tokens: 272000, prices_usd_per_mtok: lcPrices, multipliers: { cached_input: "0.1", cache_write: "1.25" }, scope: "request", scope_verified: true, scope_source_id: "OM1", verified })].map((x) => ({ ...x, multipliers: { cached_input: "0.1", cache_write: "1.25" } })));
+    assert.doesNotThrow(load(gpt({ input: "4", cached_input: "0.4", cache_write: "5", output: "15" })), "control");
+    assert.throws(load(gpt({ input: "4", cached_input: "0.41", cache_write: "5", output: "15" })), /table_malformed/, "verified long-context row");
+    assert.doesNotThrow(load(gpt({ input: "4", cached_input: "0.41", cache_write: "5", output: "15" }, false)), "an unverified long-context row is not tested");
+  });
+
+  it("(5) R3.2: the documented multipliers", () => {
+    const m = (id: string, mult: Obj, p: Obj) => makeTable({}, [claudeEntry(id, p, { multipliers: mult })]);
+    const std = { cache_read: "0.1", cache_write_5m: "1.25", cache_write_1h: "2" };
+    assert.doesNotThrow(load(m("claude-sonnet-4-6", std, row("3", "15", "0.3", "3.75", "6"))));
+    // a consistent but undocumented multiplier fails the documented list
+    assert.throws(load(m("claude-sonnet-4-6", { ...std, cache_read: "0.2" }, row("3", "15", "0.6", "3.75", "6"))), /table_malformed/, "cache read 0.2");
+    assert.throws(load(m("claude-sonnet-4-6", { ...std, cache_write_5m: "1.5" }, row("3", "15", "0.3", "4.5", "6"))), /table_malformed/, "5m write 1.5");
+    assert.throws(load(m("claude-sonnet-4-6", { ...std, cache_write_1h: "3" }, row("3", "15", "0.3", "3.75", "9"))), /table_malformed/, "1h write 3");
+    // 0.05 for Opus 5.5 and Sonnet 5.5, 0.025 for Fable 5.1 and Mythos 5.1
+    assert.doesNotThrow(load(m("claude-opus-5-5", { ...std, cache_read: "0.05" }, row("4", "20", "0.2", "5", "8"))));
+    assert.throws(load(m("claude-opus-5-5", std, row("4", "20", "0.4", "5", "8"))), /table_malformed/, "opus 5.5 stored at 0.1");
+    assert.throws(load(m("claude-sonnet-5-5", std, row("2", "10", "0.2", "2.5", "4"))), /table_malformed/, "sonnet 5.5 stored at 0.1");
+    assert.doesNotThrow(load(m("claude-fable-5-1", { ...std, cache_read: "0.025" }, row("10", "50", "0.25", "12.5", "20"))));
+    assert.throws(load(m("claude-mythos-5-1", std, row("10", "50", "1", "12.5", "20"))), /table_malformed/, "mythos 5.1 stored at 0.1");
+    // OpenAI: 1.25 write and 0.1 cached from GPT-5.6 on, 0.05 for gpt-6.1-sol; earlier models store none
+    const o = (id: string, mult: Obj, p: Obj) => makeTable({}, [{ ...gptEntry(id, p, null), multipliers: mult }]);
+    assert.doesNotThrow(load(o("gpt-5.6-sol", { cached_input: "0.1", cache_write: "1.25" }, { input: "2", cached_input: "0.2", cache_write: "2.5", output: "10" })));
+    assert.throws(load(o("gpt-5.6-sol", { cached_input: "0.2", cache_write: "1.25" }, { input: "2", cached_input: "0.4", cache_write: "2.5", output: "10" })), /table_malformed/, "gpt-5.6 cached 0.2");
+    assert.throws(load(o("gpt-6.1-sol", { cached_input: "0.1", cache_write: "1.25" }, { input: "2", cached_input: "0.2", cache_write: "2.5", output: "10" })), /table_malformed/, "gpt-6.1-sol needs 0.05");
+    assert.doesNotThrow(load(o("gpt-6.1-sol", { cached_input: "0.05", cache_write: "1.25" }, { input: "2", cached_input: "0.1", cache_write: "2.5", output: "10" })));
+    assert.doesNotThrow(load(o("gpt-5.5", { cached_input: "0.2", cache_write: "1.5" }, { input: "5", cached_input: "1", cache_write: "7.5", output: "30" })), "outside the list: not tested by the list (the ratio still holds)");
+  });
+
+  it("(5) an inherited multiplier object that differs from the entry's refuses the table", () => {
+    const std = { cache_read: "0.1", cache_write_5m: "1.25", cache_write_1h: "2" };
+    const fastRow = row("0.2", "1", "0.02", "0.25", "0.4");
+    assert.doesNotThrow(load(makeTable({}, [HAIKU({ fast: { prices_usd_per_mtok: fastRow, multipliers: { ...std }, verified: true } })])), "equal");
+    assert.throws(load(makeTable({}, [HAIKU({ fast: { prices_usd_per_mtok: fastRow, multipliers: { ...std, cache_read: "0.2" }, verified: true } })])), /table_malformed/, "fast.multipliers");
+    assert.throws(load(makeTable({}, [HAIKU({ tiers: { split_tokens: 100000, high: row("0.5", "2.5", "0.05", "0.625", "1"), high_multipliers: { ...std, cache_write_1h: "3" }, verified: true } })])), /table_malformed/, "tiers.high_multipliers");
+    // stored inherited object but no multipliers on the entry
+    assert.throws(load(makeTable({}, [claudeEntry("claude-haiku-5-5", row("0.1", "0.5", "0.01", "0.125", "0.2"), { fast: { prices_usd_per_mtok: fastRow, multipliers: std, verified: true } })])), /table_malformed/);
+  });
+
+  it("(6) a table copy of C25, C26 or C32 that differs refuses the table", () => {
+    const lc = (t: unknown) => makeTable({}, [gptEntry("gpt-6-sol", { input: "2", cached_input: "0.2", cache_write: "2.5", output: "10" }, { threshold_input_tokens: t, scope: "request", scope_verified: true, scope_source_id: "OM1", verified: false })]);
+    assert.doesNotThrow(load(lc(272000)));
+    for (const t of [272001, 271999, "272000", null, 0]) assert.throws(load(lc(t)), /table_malformed/, "C25 " + String(t));
+    const tier = (n: unknown) => makeTable({}, [HAIKU({ tiers: { split_tokens: n, high: row("0.5", "2.5", "0.05", "0.625", "1"), verified: true } })]);
+    assert.doesNotThrow(load(tier(100000)));
+    for (const n of [100001, 99999, "100000", null]) assert.throws(load(tier(n)), /table_malformed/, "C26 " + String(n));
+    const geo = (m: unknown) => makeTable({}, [claudeEntry("claude-sonnet-5-5", SONNET, { geo_us: { applies: true, multiplier: m, verified: true } })]);
+    assert.doesNotThrow(load(geo("1.1")));
+    assert.doesNotThrow(load(geo("1.10")));
+    assert.doesNotThrow(load(geo(null)), "an entry without a geo multiplier");
+    for (const m of ["1.2", "1.11", 1.1, "11/10", ""]) assert.throws(load(geo(m)), /table_malformed/, "C32 " + String(m));
+    assert.throws(load(makeTable({ modifiers: { ...TABLE.modifiers, geo_us: { verified: true, multiplier: "1.2" } } })), /table_malformed/, "table-level C32");
+  });
+
+  it("(7) two model ids with one normalized form anywhere refuse the table", () => {
+    assert.throws(load(makeTable({}, [claudeEntry("claude-sonnet-5-5", SONNET), claudeEntry("claude-sonnet-5-5-20260101", SONNET)])), /table_malformed/, "two entries");
+    assert.throws(load(makeTable({}, [{ ...claudeEntry("claude-sonnet-5-5", SONNET), model_ids: ["claude-sonnet-5-5", "claude-sonnet-5-5-20260101"] }])), /table_malformed/, "one entry");
+    assert.throws(load(makeTable({}, [{ ...claudeEntry("claude-sonnet-5-5", SONNET), model_ids: ["claude-sonnet-5-5", "claude-sonnet-5-5"] }])), /table_malformed/, "the same string twice");
+    assert.doesNotThrow(load(makeTable({}, [{ ...claudeEntry("claude-sonnet-5-5", SONNET), model_ids: ["claude-sonnet-5-5-20260101-20260102", "claude-sonnet-5-5"] }])), "a double suffix strips once: a different id");
+  });
+
+  it("a missing or placeholder verified_at is never a refusal; it makes the object unverified", () => {
+    const t = makeTable({}, [claudeEntry("claude-sonnet-5-5", SONNET, { verified_at: "n/a" })]);
+    delete t.verified_at;
+    assert.doesNotThrow(load(t));
+    const r = recomputeFiles([mainFile("s1", [copy({})])], { table: t, runStartMs: RUN });
+    assert.equal(rowOf(r, "claude:synthetic-r1").unpriced_reason, "unknown_model");
   });
 });

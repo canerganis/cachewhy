@@ -9,6 +9,7 @@
 // 100/10/0/7/1/107 (Codex), the instants to 2026-01-05T00:00:00Z.
 import type { GeneratedFile } from "../fixtures/builder.ts";
 import { formatDiff, runBoth } from "./diff.ts";
+import { shippedTable } from "./table.ts";
 import type { FuzzScan } from "./gen.ts";
 
 const OLD = Date.UTC(2026, 0, 2);
@@ -145,5 +146,36 @@ export async function runRepros(prefix?: string): Promise<void> {
     console.log(`## ${r.id} ${r.title} ${JSON.stringify(r.opts)}`);
     if (res.diffs.length === 0) console.log("   (agree)");
     for (const d of res.diffs.slice(0, 10)) console.log(`   ${formatDiff(d).slice(0, 230)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pricing-table reproducers: both implementations must refuse the table, or both accept it and agree (S8.5a).
+// ---------------------------------------------------------------------------
+
+type Tbl = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+const entry = (t: Tbl, id: string): Tbl => (t.models as Tbl[]).find((m) => m.id === id)!;
+
+export const TABLE_REPROS: Array<{ id: string; title: string; mutate: (t: Tbl) => void }> = [
+  { id: "T1", title: "verified entry: a price value is null", mutate: (t) => { entry(t, "claude-opus-4").prices_usd_per_mtok.input = null; } },
+  { id: "T2", title: "verified entry: a price row key is missing", mutate: (t) => { delete entry(t, "claude-opus-5-5").prices_usd_per_mtok.output; } },
+  { id: "T3", title: "R3.2 ratio: cache_read price off by 0.01", mutate: (t) => { const p = entry(t, "claude-opus-4").prices_usd_per_mtok; p.cache_read = String(Number(p.cache_read) + 0.01); } },
+  { id: "T4", title: "entry provider is not anthropic or openai", mutate: (t) => { entry(t, "claude-opus-4-1").provider = "x"; } },
+  { id: "T5", title: "OpenAI long_context.threshold_input_tokens differs from C25", mutate: (t) => { entry(t, "gpt-6-astra").long_context.threshold_input_tokens = 272001; } },
+  { id: "T6", title: "the same normalized id twice inside one entry's model_ids", mutate: (t) => { const e = entry(t, "claude-sonnet-4-6"); e.model_ids = [...e.model_ids, "claude-sonnet-4-6-20251001"]; } },
+  { id: "T7", title: "unverified entry whose price row is the string 'x'", mutate: (t) => { const e = entry(t, "claude-sonnet-4-6"); e.verified = false; e.prices_usd_per_mtok = "x"; } },
+  { id: "T8", title: "control: all prices of one entry doubled (ratios intact)", mutate: (t) => { const e = entry(t, "claude-opus-5-5"); for (const row of [e.prices_usd_per_mtok, e.fast.prices_usd_per_mtok]) for (const k of Object.keys(row)) row[k] = String(Number(row[k]) * 2); } },
+];
+
+/** Runs the table reproducers on a small generated scan and prints how each side took the table. */
+export async function runTableRepros(): Promise<void> {
+  const { generateScan, knobsFor } = await import("./gen.ts");
+  const scan = generateScan(5, knobsFor("valid"));
+  for (const r of TABLE_REPROS) {
+    const t = shippedTable();
+    r.mutate(t);
+    const res = await runBoth(scan, { tier: true, table: t });
+    const verdict = (x: string | null | undefined): string => (x ? "rejects" : "accepts");
+    console.log(`## ${r.id} ${r.title}: src ${verdict(res.rejected?.src)}, recompute ${verdict(res.rejected?.rec)}${res.diffs.length > 0 && res.rejected?.src === res.rejected?.rec ? " (outputs differ)" : ""}`);
   }
 }

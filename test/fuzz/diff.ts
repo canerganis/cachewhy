@@ -9,10 +9,13 @@ import { discover } from "../../src/discover.ts";
 import { countedResponseIndices } from "../../src/graph/index.ts";
 import { chainIdOf } from "../../src/model/types.ts";
 import type { Provider } from "../../src/model/types.ts";
+import { loadPriceBook, PriceTableError } from "../../src/pricing/index.ts";
+import type { PriceBook, PricingTable } from "../../src/model/types.ts";
 import { buildReportInput } from "../../src/report/input.ts";
 import { writeFiles } from "../fixtures/builder.ts";
 import { RUN_START_MS } from "../fixtures/r09.ts";
 import { generateScan, knobsFor, windowFor, type FuzzScan, type Knobs, type WindowSpec } from "./gen.ts";
+import { mutateTable } from "./table.ts";
 
 export interface Diff {
   path: string;
@@ -147,6 +150,8 @@ export function deepDiff(a: unknown, b: unknown, path: string, out: Diff[], comm
 
 export interface RunOptions extends WindowSpec {
   tier?: boolean;
+  /** A (mutated) pricing table object. src gets loadPriceBook(table) as its `book`, recompute gets its `table` option. */
+  table?: object;
 }
 
 export interface BothResult {
@@ -154,6 +159,8 @@ export interface BothResult {
   /** Raw analysis results, for triage. */
   src?: { view: ReturnType<typeof buildReportInput>; analysis: Awaited<ReturnType<typeof analyze>> };
   rec?: RecomputeResult;
+  /** With opts.table: whether each side refused the table (src PriceTableError, recompute table_* error). */
+  rejected?: { src: string | null; rec: string | null };
 }
 
 /** The run start and the file modification times are injected: every scan uses the same RUN_START_MS. */
@@ -165,9 +172,21 @@ export async function runBoth(scan: FuzzScan, opts: RunOptions): Promise<BothRes
     let analysis: Awaited<ReturnType<typeof analyze>> | undefined;
     let view: ReturnType<typeof buildReportInput> | undefined;
     let rec: RecomputeResult | undefined;
+    let book: PriceBook | undefined;
+    let srcReject: string | null = null;
+    let recReject: string | null = null;
+    if (opts.table !== undefined) {
+      try {
+        book = loadPriceBook(opts.table as PricingTable);
+      } catch (e) {
+        if (e instanceof PriceTableError) srcReject = e.message.slice(0, 160);
+        else diffs.push({ path: "<crash>", src: e instanceof Error ? `${e.name}: ${e.message.slice(0, 200)}` : String(e), rec: "<not run>" });
+      }
+    }
     try {
+      if (srcReject !== null) throw new PriceTableError([]);
       const found = await discover({ claudeDirs: [join(dir, "projects")], codexDirs: [dir], env: {}, home: dir });
-      analysis = await analyze(found.files, { since: opts.since, until: opts.until, now_ms: RUN_START_MS, codex_tier_for_test: opts.tier ? "standard" : undefined });
+      analysis = await analyze(found.files, { since: opts.since, until: opts.until, now_ms: RUN_START_MS, codex_tier_for_test: opts.tier ? "standard" : undefined, ...(book ? { book } : {}) });
       view = buildReportInput({
         graph: analysis.graph,
         parsed: analysis.parsed,
@@ -179,10 +198,11 @@ export async function runBoth(scan: FuzzScan, opts: RunOptions): Promise<BothRes
         tool_version: "fuzz",
       });
     } catch (e) {
-      diffs.push({ path: "<crash>", src: e instanceof Error ? `${e.name}: ${e.message.slice(0, 200)}` : String(e), rec: "<not run>" });
+      if (!(srcReject !== null && e instanceof PriceTableError)) diffs.push({ path: "<crash>", src: e instanceof Error ? `${e.name}: ${e.message.slice(0, 200)}` : String(e), rec: "<not run>" });
     }
     try {
       rec = recompute({
+        ...(opts.table !== undefined ? { table: opts.table } : {}),
         claudeDirs: [join(dir, "projects")],
         codexDirs: [dir],
         since: opts.since ?? null,
@@ -191,10 +211,14 @@ export async function runBoth(scan: FuzzScan, opts: RunOptions): Promise<BothRes
         runStartMs: RUN_START_MS,
       });
     } catch (e) {
-      diffs.push({ path: "<crash>", src: "<not run>", rec: e instanceof Error ? `${e.name}: ${e.message.slice(0, 200)}` : String(e) });
+      if (opts.table !== undefined && e instanceof Error && /^table_/.test(e.message)) recReject = e.message;
+      else diffs.push({ path: "<crash>", src: "<not run>", rec: e instanceof Error ? `${e.name}: ${e.message.slice(0, 200)}` : String(e) });
+    }
+    if (opts.table !== undefined && (srcReject !== null) !== (recReject !== null)) {
+      diffs.push({ path: "<table>", src: srcReject !== null ? `rejected: ${srcReject}` : "accepted", rec: recReject !== null ? `rejected: ${recReject}` : "accepted" });
     }
     if (analysis && view && rec) compare(analysis, view, rec, diffs);
-    return { diffs, src: analysis && view ? { view, analysis } : undefined, rec };
+    return { diffs, src: analysis && view ? { view, analysis } : undefined, rec, rejected: { src: srcReject, rec: recReject } };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -340,3 +364,23 @@ export async function runSeed(seed: number, knobs: Knobs, over: { window?: Windo
 }
 
 export { knobsFor };
+
+export interface TableSeedResult {
+  seed: number;
+  notes: string[];
+  tier: boolean;
+  diffs: Diff[];
+  rejected: { src: string | null; rec: string | null } | undefined;
+}
+
+/**
+ * One table-mutation seed: a generated scan (all features, no malformation) priced with a mutated copy of the shipped
+ * table. Both implementations must refuse the table, or both accept it and agree on everything.
+ */
+export async function runTableSeed(seed: number): Promise<TableSeedResult> {
+  const scan = generateScan(seed + 90000, knobsFor("valid"));
+  const { table, notes } = mutateTable(seed);
+  const tier = seed % 2 === 0;
+  const res = await runBoth(scan, { tier, table });
+  return { seed, notes, tier, diffs: res.diffs, rejected: res.rejected };
+}
