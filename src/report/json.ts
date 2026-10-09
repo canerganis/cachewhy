@@ -4,8 +4,10 @@
 // schema entry here, a test update and an allowlist entry (R14.3).
 //
 // Additions to the field list of R14.5 made for the accounting-only summary (documented here, covered by tests):
-//   totals[].tokens_total, totals[].total_input, totals[].usd_hi, totals[].output_unknown, totals[].requests_priced,
-//   totals[].models[] (per model rows), coverage.versions as an array of {version, lines}.
+//   totals[].tokens_total, totals[].total_input, totals[].output_unknown, totals[].requests_priced,
+//   totals[].models[] (per model rows, with model_verified), coverage.versions as an array of {version, lines},
+//   coverage.chains_tainted_by_reason (R0.9, R17.1). There is no dollar range: a response is priced exactly or not at all
+//   (R3.5).
 // `events` and `boundaries` are empty arrays until sections 7 to 11 exist: the schema accepts no item, so adding one
 // forces a schema change.
 import {
@@ -21,11 +23,12 @@ import {
   REQUEST_KINDS,
   SCHEMA_ID,
   SPEC_ID,
+  TAINT_REASONS,
   UNLINKED_REASONS,
   UNLOGGED_BUCKETS,
   UNPRICED_MODIFIER_REASONS,
 } from "../model/types.js";
-import type { CoverageCounters, DriftFinding, ProviderTotals, ReportInput } from "../model/types.js";
+import type { CoverageCounters, DriftFinding, Provider, ProviderTotals, ReportInput } from "../model/types.js";
 import { loadDefaultPriceBook } from "../pricing/index.js";
 import { modelIdSchema, s, serialize, versionSchema } from "../util/sanitize.js";
 import type { Schema } from "../util/sanitize.js";
@@ -45,6 +48,8 @@ function coverageSchema(): Schema {
   fields["links_unlinked_by_reason"] = intRecord(UNLINKED_REASONS);
   fields["pairs_abstained_by_code"] = intRecord(ABSTAIN_CODES);
   fields["requests_gate_abstained_by_code"] = intRecord(GATE_ABSTAIN_CODES);
+  // R0.9: a chain carrying several reasons counts once under each of them.
+  fields["chains_tainted_by_reason"] = intRecord(TAINT_REASONS);
   // R17.5: signed decimal strings
   fields["unlogged_tokens_estimate"] = s.object(Object.fromEntries(UNLOGGED_BUCKETS.map((b) => [b, s.decimal()])));
   fields["versions"] = s.array(s.object({ version: versionSchema, lines: s.int(0) }), 64);
@@ -68,15 +73,16 @@ function tokensSchema(): Schema {
 
 function totalsSchema(modelId: Schema): Schema {
   const model = s.object({
-    // null: the model is not verified (R2.10). `unlisted`: verified but not in the table (R3.3).
+    // null: no model id is shown (unverified Codex). `unlisted`: not in the table (R3.3). A Claude row of a tainted
+    // chain carries the candidate id with model_verified false (R0.9 effect 1).
     model: s.nullable(modelId),
+    model_verified: s.boolean(),
     responses: s.int(0),
     requests_priced: s.int(0),
     tokens: tokensSchema(),
     total_input: s.decimal(),
     tokens_total: s.decimal(),
     usd: s.nullable(s.decimal()),
-    usd_hi: s.nullable(s.decimal()),
     tokens_unpriced: s.decimal(),
     output_unknown: s.int(0),
   });
@@ -89,7 +95,6 @@ function totalsSchema(modelId: Schema): Schema {
     total_input: s.decimal(),
     tokens_total: s.decimal(),
     usd: s.nullable(s.decimal()),
-    usd_hi: s.nullable(s.decimal()),
     tokens_unpriced: s.decimal(),
     output_unknown: s.int(0),
     models: s.array(model, 512),
@@ -159,18 +164,17 @@ function totalsToJson(t: ProviderTotals, hideUsd: boolean): Record<string, unkno
     total_input: t.total_input,
     tokens_total: t.tokens_total,
     usd: usd(t.usd_pico),
-    usd_hi: usd(t.usd_pico_hi),
     tokens_unpriced: t.tokens_unpriced,
     output_unknown: t.output_unknown,
     models: t.models.map((m) => ({
       model: m.model,
+      model_verified: m.model_verified,
       responses: m.responses,
       requests_priced: m.requests_priced,
       tokens: m.tokens,
       total_input: m.total_input,
       tokens_total: m.tokens_total,
       usd: usd(m.usd_pico),
-      usd_hi: usd(m.usd_pico_hi),
       tokens_unpriced: m.tokens_unpriced,
       output_unknown: m.output_unknown,
     })),
@@ -181,8 +185,11 @@ function totalsToJson(t: ProviderTotals, hideUsd: boolean): Record<string, unkno
  * The report object in schema form. Throws a `SafeError` (code `E_SCHEMA_VIOLATION`, path only) if a value does not
  * fit its declared field. When the headline is withheld (R17.3), no dollar figure is written (R16.5).
  */
-export function reportToJson(input: ReportInput, knownModels?: ReadonlySet<string>): unknown {
+export function reportToJson(input: ReportInput & { readonly shown_providers?: readonly Provider[] }, knownModels?: ReadonlySet<string>): unknown {
   const hideUsd = input.headline_status === "withheld";
+  // A provider hidden by `--agent` or `--project` is omitted: an all-zero entry would read as zero usage, which is
+  // false (R5.9). A shown provider with no activity in the window keeps its zero entry.
+  const shown = input.shown_providers ?? PROVIDERS;
   const value = {
     schema: input.schema,
     generated_at: iso(input.generated_at_ms),
@@ -194,14 +201,14 @@ export function reportToJson(input: ReportInput, knownModels?: ReadonlySet<strin
     withheld_reason: input.withheld_reason,
     assumptions: input.assumptions,
     coverage: coverageToJson(input.coverage),
-    totals: input.totals.map((t) => totalsToJson(t, hideUsd)),
+    totals: input.totals.filter((t) => shown.includes(t.provider)).map((t) => totalsToJson(t, hideUsd)),
     events: [],
     boundaries: [],
   };
   return ser(reportSchema(allowedModelIds(knownModels)), value);
 }
 
-export function reportToJsonText(input: ReportInput, knownModels?: ReadonlySet<string>, space = 2): string {
+export function reportToJsonText(input: ReportInput & { readonly shown_providers?: readonly Provider[] }, knownModels?: ReadonlySet<string>, space = 2): string {
   return JSON.stringify(reportToJson(input, knownModels), null, space);
 }
 

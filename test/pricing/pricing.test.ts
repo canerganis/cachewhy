@@ -4,9 +4,16 @@
 // Money in these tests is picodollars (1e-12 USD, R3.8). 1 USD = 1_000_000_000_000n.
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { scenarios } from "../../scripts/gen-fixtures.ts";
+import { analyze } from "../../src/analyze.ts";
+import { discover } from "../../src/discover.ts";
+import { ClaudeProject, writeFiles, type ClaudeRecord, type GeneratedFile } from "../fixtures/builder.ts";
+import { allR09Fixtures } from "../fixtures/r09.ts";
 import {
   DEFAULT_TABLE,
   PriceTableError,
@@ -23,6 +30,7 @@ import {
 } from "../../src/pricing/index.ts";
 import {
   CONSTANTS,
+  responseTokens,
   type ClaudeResponse,
   type CodexResponse,
   type Geo,
@@ -75,9 +83,11 @@ interface ClaudeOpts {
   model?: string | null;
   verified?: boolean;
   usage?: U | null;
+  /** Default: a final copy that carries speed standard, geo not_available, tier standard (R3.12). `null` is absent. */
   speed?: Speed | null;
   geo?: Geo | null;
   tier?: ServiceTier | null;
+  source?: ClaudeResponse["model"]["source"];
   flags?: ResponseFlag[];
   role?: "owner" | "replayed";
   exclusion?: ClaudeResponse["exclusion"];
@@ -93,11 +103,15 @@ function claude(o: ClaudeOpts = {}): ClaudeResponse {
     kind: "main",
     version: "2.1.293",
     support: "full",
-    model: { candidate: model, verified: o.verified ?? true, source: "claude_explicit", model: (o.verified ?? true) ? model : null },
+    model: { candidate: model, verified: o.verified ?? true, source: o.source ?? "claude_explicit", model: (o.verified ?? true) ? model : null },
     usage: u,
     exclusion: o.exclusion ?? null,
     flags: o.flags ?? [],
-    modifiers: { speed: o.speed ?? null, inference_geo: o.geo ?? null, service_tier: o.tier ?? null },
+    modifiers: {
+      speed: o.speed === undefined ? "standard" : o.speed,
+      inference_geo: o.geo === undefined ? "not_available" : o.geo,
+      service_tier: o.tier === undefined ? "standard" : o.tier,
+    },
     effort: null,
     time,
     ordinal: null,
@@ -119,6 +133,7 @@ function claude(o: ClaudeOpts = {}): ClaudeResponse {
 interface CodexOpts {
   model?: string | null;
   verified?: boolean;
+  source?: CodexResponse["model"]["source"];
   usage?: U | null;
   role?: "owner" | "replayed";
 }
@@ -132,7 +147,7 @@ function codex(o: CodexOpts = {}): CodexResponse {
     kind: "main",
     version: "0.160.1",
     support: "full",
-    model: { candidate: model, verified: o.verified ?? true, source: "own_turn", model: (o.verified ?? true) ? model : null },
+    model: { candidate: model, verified: o.verified ?? true, source: o.source ?? "own_turn", model: (o.verified ?? true) ? model : null },
     usage: usage(o.usage ?? { i: 1000 }),
     exclusion: null,
     flags: [],
@@ -199,7 +214,6 @@ function assertUnpriced(p: PricedResponse, reason: string, modifier: string | nu
   assert.equal(p.cost.usd, null);
   assert.equal(p.cost.reason, reason);
   assert.equal(p.modifier_reason, modifier);
-  assert.equal(p.cost_hi, null);
   assert.equal(p.rates, null);
 }
 
@@ -215,10 +229,10 @@ function perToken(priceStr: string): bigint {
 // The shipped table: R3.1, R3.2, R3.7, R3.11, R7.2 expectation lists
 // ---------------------------------------------------------------------------
 
-describe("shipped table pt-2026-10-09.1", () => {
+describe("shipped table", () => {
   it("loads, has no audit finding, and prints its version (R3.1)", () => {
     assert.deepEqual(auditTable(DEFAULT_TABLE), []);
-    assert.equal(DEFAULT_BOOK.table_version, "pt-2026-10-09.1");
+    assert.equal(DEFAULT_BOOK.table_version, DEFAULT_TABLE.table_version);
     assert.match(DEFAULT_BOOK.table_version, /^pt-[0-9]{4}-[0-9]{2}-[0-9]{2}(\.[0-9]+)?$/);
   });
 
@@ -553,10 +567,10 @@ describe("Claude cost (R3.5)", () => {
     const p = price(claude({ usage: { i: 5, w5: 20000, o: 300 } }));
     assert.equal(usdPico(p), 53_010_000_000n); // 0.05301 USD
     assert.equal(p.cost.usd, "53010000000");
-    assert.equal(p.cost_hi, null);
-    assert.equal(p.output_excluded, false);
     assert.equal(p.tokens_unpriced, 0n);
-    assert.equal(p.table_version, "pt-2026-10-09.1");
+    assert.equal(p.table_version, DEFAULT_TABLE.table_version);
+    // R3.5: a single number or nothing. The result carries no range and no partial-output marker.
+    assert.deepEqual(Object.keys(p).sort(), ["chain", "cost", "key", "modifier_reason", "provider", "rates", "table_version", "tokens_unpriced"]);
     assert.equal(p.rates?.row, "standard");
     assert.deepEqual(p.rates?.geo, { num: 1n, den: 1n });
   });
@@ -572,53 +586,118 @@ describe("Claude cost (R3.5)", () => {
     assert.equal(usdPico(p), 15_000_000n + 1_500_000n + 18_750_000n + 30_000_000n + 75_000_000n);
   });
 
-  it("unknown-TTL writes are a range from the 5m price to the 1h price (R3.5, R2.1)", () => {
+  it("R3.5: unknown-TTL writes are unpriced bucket_unknown, with no range, and their tokens count as unpriced", () => {
     const p = price(claude({ usage: { i: 10, wu: 1000, o: 5 } }));
-    // low: 10*2e6 + 1000*2.5e6 + 5*1e7 ; high: 1000*4e6 in place of 1000*2.5e6
-    assert.equal(usdPico(p), 20_000_000n + 2_500_000_000n + 50_000_000n);
-    assert.equal(p.cost_hi?.pico, 20_000_000n + 4_000_000_000n + 50_000_000n);
-    assert.equal(p.cost_hi?.usd, "4070000000");
-    assert.ok((p.cost_hi?.pico ?? 0n) > (p.cost.pico ?? 0n));
+    assertUnpriced(p, "unpriced_modifier", "bucket_unknown");
+    assert.equal(p.tokens_unpriced, 10n + 1000n + 5n);
   });
 
-  it("an unknown-TTL write mixed with 5m and 1h writes", () => {
+  it("R3.5: an unknown-TTL write mixed with 5m and 1h writes is unpriced as a whole", () => {
     const p = price(claude({ usage: { w5: 100, w1: 200, wu: 300, o: 0 } }));
-    const lo = 100n * 2_500_000n + 200n * 4_000_000n + 300n * 2_500_000n;
-    const hi = 100n * 2_500_000n + 200n * 4_000_000n + 300n * 4_000_000n;
-    assert.equal(usdPico(p), lo);
-    assert.equal(p.cost_hi?.pico, hi);
+    assertUnpriced(p, "unpriced_modifier", "bucket_unknown");
+    assert.equal(p.tokens_unpriced, 600n);
+    // with geo us the answer is the same: no number exists to multiply
+    assertUnpriced(price(claude({ geo: "us", usage: { wu: 1, o: 0 } })), "unpriced_modifier", "bucket_unknown");
   });
 
-  it("unknown output omits the output term and says so (R2.3); known zero output is not unknown", () => {
-    const unknown = price(claude({ usage: { i: 1000, o: null } }));
-    assert.equal(usdPico(unknown), 2_000_000_000n);
-    assert.equal(unknown.output_excluded, true);
+  it("R3.5: a known zero output is priced; an unknown output has no priced form (no partial output term)", () => {
     const zero = price(claude({ usage: { i: 1000, o: 0 } }));
     assert.equal(usdPico(zero), 2_000_000_000n);
-    assert.equal(zero.output_excluded, false);
-    // output lower bound and thinking tokens are never priced (R2.4)
+    // thinking tokens are never priced separately (R2.4)
     const th = price(claude({ usage: { i: 1000, o: 10, reasoning: 999999 } }));
     assert.equal(usdPico(th), 2_000_000_000n + 100_000_000n);
+    // Without a final copy the output is unknown and the response is modifier_unverified (R3.12), never an input-only price.
+    const unknown = price(claude({ flags: ["no_final_copy", "output_unknown"], speed: null, geo: null, tier: null, usage: { i: 1000, o: null } }));
+    assertUnpriced(unknown, "unpriced_modifier", "modifier_unverified");
+    assert.equal(unknown.tokens_unpriced, 1000n + 7n);
+    // Defence in depth: an unknown output on a response that otherwise passes every gate is refused, not priced without output.
+    const odd = price(claude({ usage: { i: 1000, o: null } }));
+    assertUnpriced(odd, "unpriced_modifier", "modifier_unverified");
+    assert.equal(odd.tokens_unpriced, 1007n);
   });
 
-  it("bucket_mismatch does not stop pricing (R2.1)", () => {
+  it("R2.1: with a clean model source, a bucket_mismatch response is priced by its bucket sum (unit level; the pipeline taints the chain)", () => {
     const p = price(claude({ flags: ["bucket_mismatch"], usage: { w1: 1796, i: 1 } }));
     assert.equal(usdPico(p), 1796n * 4_000_000n + 2_000_000n);
   });
 
+  it("R0.9 effect 2: model_source chain_tainted is unpriced chain_tainted whatever the model, modifiers or conflict flags are", () => {
+    const shape: U = { i: 1000, r: 20, w5: 30, w1: 40, wu: 50, o: 60 };
+    const cases: ClaudeResponse[] = [
+      claude({ source: "chain_tainted", usage: shape }),
+      claude({ source: "chain_tainted", verified: false, model: null, usage: shape }),
+      claude({ source: "chain_tainted", model: "claude-future-9", usage: shape }),
+      claude({ source: "chain_tainted", speed: "other", geo: "other", tier: "other", usage: shape }),
+      claude({ source: "chain_tainted", speed: null, geo: null, tier: null, flags: ["no_final_copy"], usage: shape }),
+      claude({ source: "chain_tainted", flags: ["conflict_modifier", "bucket_mismatch", "conflict_output"], usage: shape }),
+      claude({ source: "chain_tainted", model: "claude-opus-5-5", speed: "fast", geo: "us", usage: shape }),
+      claude({ source: "chain_tainted", usage: { i: 1000, o: null } }),
+    ];
+    for (const r of cases) {
+      const p = price(r);
+      assert.equal(p.cost.pico, null);
+      assert.equal(p.cost.reason, "chain_tainted");
+      assert.equal(p.modifier_reason, null);
+      assert.equal(p.rates, null);
+      assert.equal(p.tokens_unpriced, responseTokens(r.usage!));
+    }
+    assert.equal(price(cases[0]!).tokens_unpriced, 1000n + 20n + 30n + 40n + 50n + 60n);
+    // Codex: the taint gate comes before the tier gate, so the reason is chain_tainted in a default run and under the test parameter
+    const c = codex({ source: "chain_tainted", model: null, verified: false, usage: { i: 300000, o: 5 } });
+    for (const opts of [undefined, { codex_tier_for_test: "standard" as const }]) {
+      const p = priceResponse(c, DEFAULT_BOOK, opts);
+      assertUnpriced(p, "chain_tainted");
+      assert.equal(p.tokens_unpriced, 300005n);
+    }
+    // excluded and replayed responses keep their own reasons before the taint gate
+    assertUnpriced(price(claude({ source: "chain_tainted", exclusion: "conflict_input" })), "excluded");
+    assertUnpriced(price(claude({ source: "chain_tainted", role: "replayed" })), "not_owner");
+  });
+
   it("R3.12: a Claude response without a final copy is unpriced modifier_unverified, whatever the model", () => {
-    const sonnet = price(claude({ flags: ["speed_assumed", "output_unknown"], usage: { w1: 1796, i: 1, o: null } }));
+    const nf = { flags: ["no_final_copy" as const, "output_unknown" as const], speed: null, geo: null, tier: null };
+    const sonnet = price(claude({ ...nf, usage: { w1: 1796, i: 1, o: null } }));
     assertUnpriced(sonnet, "unpriced_modifier", "modifier_unverified");
     assert.equal(sonnet.tokens_unpriced, 1797n + 7n);
-    // fixtures (1) and (2) of R3.12 with a final copy: opus 5.5 priced at the standard, fast and fast-with-geo rows
-    const final = (speed: Speed, geo?: Geo) => price(claude({ model: "claude-opus-5-5", speed, geo: geo ?? null, usage: { w1: 20000, o: 0 } }));
-    assert.equal(usdPico(final("standard")), 160_000_000_000n);
-    assert.equal(usdPico(final("fast")), 320_000_000_000n);
-    assert.equal(usdPico(final("fast", "us")), 352_000_000_000n); // fast_with_geo_us is verified in pt-2026-10-09.1
-    const nofinal = price(claude({ model: "claude-opus-5-5", flags: ["speed_assumed", "output_unknown"], usage: { w1: 20000, o: null } }));
+    // fixture (5): no final copy on a model without a fast row (claude-sonnet-5-5) is modifier_unverified as well
+    assertUnpriced(price(claude({ ...nf, model: "claude-sonnet-5-5", usage: { i: 5, o: null } })), "unpriced_modifier", "modifier_unverified");
+    // fixture (1): the example with C lacking a final copy
+    const nofinal = price(claude({ ...nf, model: "claude-opus-5-5", usage: { w1: 20000, o: null } }));
     assertUnpriced(nofinal, "unpriced_modifier", "modifier_unverified");
-    // an unknown model still reports unknown_model first
-    assertUnpriced(price(claude({ model: "claude-future-9", flags: ["speed_assumed"] })), "unknown_model");
+    assert.equal(nofinal.tokens_unpriced, 20007n);
+    // the flag alone decides, even if the modifier fields look complete
+    assertUnpriced(price(claude({ flags: ["no_final_copy"], usage: { i: 5, o: 1 } })), "unpriced_modifier", "modifier_unverified");
+    // an unknown model still reports unknown_model before the modifier checks
+    assertUnpriced(price(claude({ model: "claude-future-9", flags: ["no_final_copy"] })), "unknown_model");
+  });
+
+  it("R3.12 fixture (2): standard, fast and fast with geo us on claude-opus-5-5 give the exact picodollars of the table", () => {
+    // K_prev = 20000, R = 0, w1 = 20000, U = 0, output 0.
+    const final = (speed: Speed, geo: Geo) => price(claude({ model: "claude-opus-5-5", speed, geo, usage: { w1: 20000, o: 0 } }));
+    const std = final("standard", "not_available");
+    const fast = final("fast", "not_available");
+    const fastGeo = final("fast", "us");
+    assert.equal(usdPico(std), 160_000_000_000n);
+    assert.equal(usdPico(fast), 320_000_000_000n);
+    assert.equal(usdPico(fastGeo), 352_000_000_000n); // fast_with_geo_us is verified in the shipped table
+    assert.deepEqual(fastGeo.rates?.geo, CONSTANTS.GEO_US_MULT);
+    assert.equal(fastGeo.rates?.row, "fast");
+    // the same figures from the table strings, not from literals
+    const e = entryOf(DEFAULT_TABLE as unknown as Json, "claude-opus-5-5");
+    assert.equal(usdPico(std), 20000n * perToken(e.prices_usd_per_mtok.cache_write_1h));
+    assert.equal(usdPico(fast), 20000n * perToken(e.fast.prices_usd_per_mtok.cache_write_1h));
+    assert.equal(usdPico(fastGeo), (20000n * perToken(e.fast.prices_usd_per_mtok.cache_write_1h) * 11n) / 10n);
+  });
+
+  it("R3.12: a final copy that lacks inference_geo, service_tier or speed is modifier_unverified; nothing is defaulted", () => {
+    for (const o of [{ geo: null }, { tier: null }, { speed: null }, { geo: null, tier: null }] as const) {
+      const p = price(claude({ ...o, usage: { i: 1000, o: 1 } }));
+      assertUnpriced(p, "unpriced_modifier", "modifier_unverified");
+      assert.equal(p.tokens_unpriced, 1001n);
+    }
+    assert.notEqual(price(claude({ usage: { i: 1000, o: 1 } })).cost.pico, null);
+    // a disagreement between copies is reported as conflict_modifier, before the unverified check
+    assertUnpriced(price(claude({ flags: ["conflict_modifier"], geo: null, usage: { i: 1 } })), "unpriced_modifier", "conflict_modifier");
   });
 
   it("R3.4 tier gate: a default run prices no Codex response, before R3.10 (reason modifier_unverified)", () => {
@@ -629,9 +708,12 @@ describe("Claude cost (R3.5)", () => {
         assert.equal(p.tokens_unpriced, BigInt(inn) + 5n);
       }
     }
-    // unknown model and unverified attribution are still reported first
-    assertUnpriced(priceResponse(codex({ model: "codex-auto-review" }), DEFAULT_BOOK), "unknown_model");
-    assertUnpriced(priceResponse(codex({ model: "gpt-6-sol", verified: false }), DEFAULT_BOOK), "model_unknown");
+    // The gate comes before the model checks (R3.4: "whatever its model"): in a default run an unknown model or an
+    // unverified attribution is modifier_unverified too. Under the test parameter they are reported as before.
+    assertUnpriced(priceResponse(codex({ model: "codex-auto-review" }), DEFAULT_BOOK), "unpriced_modifier", "modifier_unverified");
+    assertUnpriced(priceResponse(codex({ model: "gpt-6-sol", verified: false }), DEFAULT_BOOK), "unpriced_modifier", "modifier_unverified");
+    assertUnpriced(price(codex({ model: "codex-auto-review" })), "unknown_model");
+    assertUnpriced(price(codex({ model: "gpt-6-sol", verified: false })), "model_unknown");
     // under the test parameter a request-scoped model is priced, a session-scoped one is long_context_scope
     const t = cloneTable();
     withScope(t, "gpt-6-sol", "request");
@@ -677,11 +759,12 @@ describe("Claude cost (R3.5)", () => {
 });
 
 describe("Claude modifiers (R3.4)", () => {
-  it("speed standard or absent: standard price; fast: the fast row (Opus 5.5 fast 8 in, 0.4 read, 40 out)", () => {
+  it("speed standard: standard price; fast: the fast row (Opus 5.5 fast 8 in, 0.4 read, 40 out); absent speed is modifier_unverified (R3.12)", () => {
     const base = { usage: { i: 1000, r: 2000, o: 100 } };
     const std = price(claude({ model: "claude-opus-5-5", ...base }));
     assert.equal(usdPico(std), 1000n * 4_000_000n + 2000n * 200_000n + 100n * 20_000_000n);
     assert.equal(usdPico(price(claude({ model: "claude-opus-5-5", speed: "standard", ...base }))), usdPico(std));
+    assertUnpriced(price(claude({ model: "claude-opus-5-5", speed: null, ...base })), "unpriced_modifier", "modifier_unverified");
     const fast = price(claude({ model: "claude-opus-5-5", speed: "fast", ...base }));
     assert.equal(usdPico(fast), 1000n * 8_000_000n + 2000n * 400_000n + 100n * 40_000_000n);
     assert.equal(fast.rates?.row, "fast");
@@ -702,7 +785,7 @@ describe("Claude modifiers (R3.4)", () => {
     const off = cloneTable();
     off.modifiers.fast_with_geo_us = { ...off.modifiers.fast_with_geo_us, verified: false };
     assertUnpriced(price(r(), book(off)), "unpriced_modifier", "fast_geo_unverified");
-    const p = price(r()); // verified in pt-2026-10-09.1
+    const p = price(r()); // verified in the shipped table
     assert.equal(usdPico(p), 8_800_000_000n); // 1000 * 8e6 * 11/10
     assert.deepEqual(p.rates?.geo, CONSTANTS.GEO_US_MULT);
     assert.equal(p.rates?.row, "fast");
@@ -723,17 +806,13 @@ describe("Claude modifiers (R3.4)", () => {
     assert.equal(usdPico(price(claude({ model: "claude-opus-5-5", geo: "not_available", usage: { i: 1000 } }))), 4_000_000_000n);
   });
 
-  it("geo us applies to the range ends of an unknown-TTL write", () => {
-    const p = price(claude({ geo: "us", usage: { wu: 1000, o: 0 } }));
-    assert.equal(usdPico(p), (1000n * 2_500_000n * 11n) / 10n);
-    assert.equal(p.cost_hi?.pico, (1000n * 4_000_000n * 11n) / 10n);
-  });
-
   it("geo us on a model where the table does not say it applies is unpriced; geo other is unpriced", () => {
     assertUnpriced(price(claude({ model: "claude-opus-4-5", geo: "us" })), "unpriced_modifier", "geo_other");
     assertUnpriced(price(claude({ model: "claude-haiku-4-5", geo: "us" })), "unpriced_modifier", "geo_other");
     assertUnpriced(price(claude({ geo: "other" })), "unpriced_modifier", "geo_other");
     assert.notEqual(price(claude({ model: "claude-opus-4-5", geo: "not_available" })).cost.pico, null);
+    // an absent geo on the final copy is not "no multiplier": it is unverified (R3.12)
+    assertUnpriced(price(claude({ model: "claude-opus-4-5", geo: null })), "unpriced_modifier", "modifier_unverified");
   });
 
   it("the geo division rounds half up when a price has 6 decimals (R3.8)", () => {
@@ -750,9 +829,10 @@ describe("Claude modifiers (R3.4)", () => {
     assert.equal(usdPico(price(claude({ model: "claude-opus-5-5", usage: { r: 5, o: 0 } }), b)), 5n); // no geo, no division
   });
 
-  it("service_tier: standard or absent has no effect; priority, batch and other are unpriced by default", () => {
+  it("service_tier: standard has no effect; absent is modifier_unverified (R3.12); priority, batch and other are unpriced by default", () => {
     const base = { usage: { i: 1000, o: 0 } as U };
     assert.equal(usdPico(price(claude({ tier: "standard", ...base }))), 2_000_000_000n);
+    assertUnpriced(price(claude({ tier: null, ...base })), "unpriced_modifier", "modifier_unverified");
     for (const tier of ["priority", "batch", "other"] as const) {
       assertUnpriced(price(claude({ tier, ...base })), "unpriced_modifier", "service_tier_unpriced");
     }
@@ -827,13 +907,11 @@ describe("model resolution and reasons (R2.10, R3.3, R3.9)", () => {
     const p = price(claude({ model: "claude-future-9", usage: { i: 10, r: 20, w5: 30, w1: 40, wu: 50, o: 60 } }));
     assertUnpriced(p, "unknown_model");
     assert.equal(p.tokens_unpriced, 10n + 20n + 30n + 40n + 50n + 60n);
-    assert.equal(p.output_excluded, false);
   });
 
-  it("unknown model with unknown output: the output lower bound is counted and the output is flagged", () => {
+  it("unknown model with unknown output: the output lower bound is counted (responseTokens)", () => {
     const p = price(claude({ model: "claude-future-9", usage: { i: 10, o: null } }));
     assert.equal(p.tokens_unpriced, 10n + 7n);
-    assert.equal(p.output_excluded, true);
   });
 
   it("verified:false entries (Mythos 5, GPT-5 Codex) are unknown_model, and so are provider mismatches", () => {
@@ -865,9 +943,12 @@ describe("model resolution and reasons (R2.10, R3.3, R3.9)", () => {
     assert.equal(p.tokens_unpriced, 0n);
   });
 
-  it("billedTokens is input side plus the output (the lower bound when the output is unknown)", () => {
+  it("billedTokens equals responseTokens: input side plus the output (the lower bound when the output is unknown)", () => {
     assert.equal(billedTokens(usage({ i: 1, r: 2, w5: 3, w1: 4, wu: 5, cw: 6, o: 7 })), 28n);
     assert.equal(billedTokens(usage({ i: 1, o: null })), 1n + 7n);
+    for (const u of [usage({ i: 1, r: 2, w5: 3, w1: 4, wu: 5, cw: 6, o: 7 }), usage({ i: 9, o: null }), usage({ o: 0 })]) {
+      assert.equal(billedTokens(u), responseTokens(u));
+    }
   });
 
   it("PricedAmount invariant: usd is the decimal string of pico, null together with a reason", () => {
@@ -884,7 +965,7 @@ describe("model resolution and reasons (R2.10, R3.3, R3.9)", () => {
 // Codex pricing: R3.6, R3.10 with its four required fixtures
 // ---------------------------------------------------------------------------
 
-describe("Codex with table pt-2026-10-09.1 (scope per model)", () => {
+describe("Codex with the shipped table (scope per model)", () => {
   it("every model that is not request-scoped is unpriced long_context_scope at any input size (R3.10)", () => {
     for (const mp of DEFAULT_BOOK.models.values()) {
       if (mp.provider !== "openai" || !mp.verified || mp.long_context?.scope === "request") continue;
@@ -1055,6 +1136,82 @@ describe("R3.10 required fixtures", () => {
   });
 });
 
+describe("R3.10 fixtures: every one also has a default run (R3.4 tier gate)", () => {
+  /** Default run: no test parameter. Usd null, reason modifier_unverified, tokens unchanged. */
+  const defaultRun = (r: CodexResponse, b: PriceBook = DEFAULT_BOOK): void => {
+    const p = priceResponse(r, b);
+    assertUnpriced(p, "unpriced_modifier", "modifier_unverified");
+    assert.equal(p.tokens_unpriced, responseTokens(r.usage!));
+  };
+
+  it("(1) three responses at 100000, 300000, 100000: session scope, request scope, unverified long-context prices", () => {
+    const triple = (model: string) => [100000, 300000, 100000].map((n) => codex({ model, usage: { i: n, o: 100 } }));
+    const s = cloneTable();
+    withScope(s, "gpt-6-sol", "session");
+    const rq = cloneTable();
+    withScope(rq, "gpt-6-sol", "request");
+    const un = cloneTable();
+    withScope(un, "gpt-6-sol", "request");
+    entryOf(un, "gpt-6-sol").long_context.verified = false;
+    const rows = (b: PriceBook) => triple("gpt-6-sol").map((r) => price(r, b));
+    // test parameter on clean inputs
+    for (const x of rows(book(s))) assertUnpriced(x, "unpriced_modifier", "long_context_scope");
+    const [a, mid, c] = rows(book(rq));
+    assert.equal(a!.rates?.row, "standard");
+    assert.equal(mid!.rates?.row, "long_context");
+    assert.equal(usdPico(c!), usdPico(a!));
+    const [ua, umid, uc] = rows(book(un));
+    assert.notEqual(ua!.cost.pico, null);
+    assertUnpriced(umid!, "unpriced_modifier", "long_context_unverified");
+    assert.notEqual(uc!.cost.pico, null);
+    // default run on the same inputs: no dollars anywhere, reason modifier_unverified, unchanged tokens
+    for (const b of [book(s), book(rq), book(un)]) for (const r of triple("gpt-6-sol")) defaultRun(r, b);
+  });
+
+  it("(2) a 100000-token response prices alone: request scope priced, session scope unpriced, default run unpriced", () => {
+    const main = codex({ usage: { i: 100000, o: 100 } });
+    const rq = cloneTable();
+    withScope(rq, "gpt-6-sol", "request");
+    const ss = cloneTable();
+    withScope(ss, "gpt-6-sol", "session");
+    assert.equal(usdPico(price(main, book(rq))), 100000n * perToken("2") + 100n * perToken("10"));
+    assertUnpriced(price(main, book(ss)), "unpriced_modifier", "long_context_scope");
+    // the absent sub-thread file or a 300000-token request elsewhere changes nothing: the call has no other input
+    const sub = codex({ usage: { i: 300000, o: 100 } });
+    assert.equal(usdPico(price(main, book(rq))), usdPico(price(main, book(rq))));
+    assert.notEqual(price(sub, book(rq)).cost.pico, null);
+    defaultRun(main, book(rq));
+    defaultRun(main, book(ss));
+    defaultRun(sub, book(rq));
+  });
+
+  it("(5) gpt-5.5 and gpt-6-sol at 100000 and 300000 input tokens, with the shipped table", () => {
+    const row = (id: string) => entryOf(DEFAULT_TABLE as unknown as Json, id);
+    const sol = row("gpt-6-sol");
+    for (const n of [100000, 300000]) {
+      const g55 = codex({ model: "gpt-5.5", usage: { i: n, o: 0 } });
+      const g6 = codex({ model: "gpt-6-sol", usage: { i: n, o: 0 } });
+      assertUnpriced(price(g55), "unpriced_modifier", "long_context_scope");
+      const p = price(g6);
+      const rowKind = n > 272000 ? "long_context" : "standard";
+      const prices = n > 272000 ? sol.long_context.prices_usd_per_mtok : sol.prices_usd_per_mtok;
+      assert.equal(p.rates?.row, rowKind);
+      assert.equal(usdPico(p), BigInt(n) * perToken(prices.input));
+      defaultRun(g55);
+      defaultRun(g6);
+    }
+    // the rows the spec names: standard 2 / 0.2 / 2.5 / 10, long context 4 / 0.4 / 5 / 15
+    assert.deepEqual(
+      [sol.prices_usd_per_mtok.input, sol.prices_usd_per_mtok.cached_input, sol.prices_usd_per_mtok.cache_write, sol.prices_usd_per_mtok.output],
+      ["2", "0.2", "2.5", "10"],
+    );
+    assert.deepEqual(
+      [sol.long_context.prices_usd_per_mtok.input, sol.long_context.prices_usd_per_mtok.cached_input, sol.long_context.prices_usd_per_mtok.cache_write, sol.long_context.prices_usd_per_mtok.output],
+      ["4", "0.4", "5", "15"],
+    );
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Arithmetic (R2.16, R3.8)
 // ---------------------------------------------------------------------------
@@ -1082,7 +1239,7 @@ describe("arithmetic is BigInt only (R2.16, R3.8)", () => {
 
   it("two runs over the same input give byte-identical money (R3.8)", () => {
     const shapes: U[] = [{ i: 1, r: 2, w5: 3 }, { wu: 9, o: 4 }, { i: 999999, o: null }];
-    const run = () => shapes.map((s) => price(claude({ usage: s }))).map((p) => `${p.cost.usd}/${p.cost_hi?.usd}`).join("|");
+    const run = () => shapes.map((s) => price(claude({ usage: s }))).map((p) => `${p.cost.usd}/${p.cost.reason}/${p.modifier_reason}`).join("|");
     assert.equal(run(), run());
   });
 
@@ -1126,5 +1283,133 @@ describe("docs/pricing.md matches the table flags it describes", () => {
     for (const mp of DEFAULT_BOOK.models.values()) {
       if (mp.fast && mp.provider === "anthropic") assert.ok(["claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"].includes(mp.id), mp.id);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R3.5 defence in depth: the unknown-output refusal never fires on a fixture
+// ---------------------------------------------------------------------------
+
+describe("R3.5: the output-null refusal after row selection never fires on any fixture", () => {
+  const NOW_MS = Date.UTC(2026, 5, 1);
+  const OLD_MS = Date.UTC(2026, 0, 2);
+
+  /**
+   * A response with an unknown output must already be refused by a gate before the output check (tainted chain,
+   * no final copy, missing modifier, tier gate). Black-box test: give the response a known zero output. If that
+   * variant is priced, the refusal came from the output check itself, which the spec does not allow to be reached.
+   */
+  async function outputNullRefusalsOf(files: readonly GeneratedFile[], tier: "standard" | undefined): Promise<{ seen: number; reached: number }> {
+    const dir = mkdtempSync(join(tmpdir(), "cw-price-"));
+    try {
+      writeFiles(dir, files.map((f) => ({ ...f, mtimeMs: f.mtimeMs ?? OLD_MS })));
+      const found = await discover({ claudeDirs: [join(dir, "projects")], codexDirs: [dir], env: {}, home: dir });
+      const analysis = await analyze(found.files, { now_ms: NOW_MS, codex_tier_for_test: tier });
+      const opts = tier === "standard" ? ({ codex_tier_for_test: "standard" } as const) : undefined;
+      let seen = 0;
+      let reached = 0;
+      for (const r of analysis.graph.responses) {
+        const u = r.usage;
+        if (u === null || u.output !== null) continue;
+        seen++;
+        const withZero = { ...r, usage: { ...u, output: 0n } } as typeof r;
+        const p = priceResponse(withZero, analysis.book, opts);
+        if (p.cost.pico !== null) reached++;
+      }
+      return { seen, reached };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("on the committed scenarios and the stored R0.9 / R2.17 fixtures, in the default run and under the tier test parameter", async () => {
+    const sets: Array<{ name: string; files: GeneratedFile[] }> = [
+      ...scenarios.map((sc) => ({ name: sc.name, files: sc.build() })),
+      ...allR09Fixtures().map((fx) => ({ name: fx.name, files: fx.files })),
+    ];
+    // Output-null shapes the committed trees do not hold: no final copy, and two final copies that disagree on the output.
+    const p = new ClaudeProject();
+    const sess = p.session({ sessionId: "synthetic-session-out", version: "2.1.293", model: "claude-sonnet-5-5", startMs: Date.UTC(2026, 0, 1) });
+    sess.main.user();
+    sess.main.request({ requestId: "ok", usage: { input: 5, output: 20 } });
+    sess.main.request({ requestId: "nf", finalSpeed: null, usage: { input: 5, write5m: 100, output: 7 }, blocks: [{ type: "text" }, { type: "text" }] });
+    const co = sess.main.request({ requestId: "co", usage: { input: 5, output: 90 }, blocks: [{ type: "text" }, { type: "text" }] });
+    ((co.records[0] as ClaudeRecord).message as { usage: { speed: string } }).usage.speed = "standard";
+    sets.push({ name: "synthetic output-null shapes", files: p.files() });
+    let seen = 0;
+    for (const set of sets) {
+      for (const tier of [undefined, "standard"] as const) {
+        const r = await outputNullRefusalsOf(set.files, tier);
+        assert.equal(r.reached, 0, `${set.name} (${tier ?? "default"}): an unknown-output response passed every gate`);
+        seen += r.seen;
+      }
+    }
+    assert.ok(seen > 0, "the fixtures contain responses with an unknown output, so the check is not vacuous");
+  });
+});
+
+describe("R3.2 the effective multiplier object of a row, and the stored copies", () => {
+  const findings = (t: Json) => auditTable(t as PricingTable).filter((f) => f.fatal).map((f) => `${f.code}@${f.path}`);
+
+  it("the shipped table stores fast.multipliers and tiers.high_multipliers equal to the entry's, and passes", () => {
+    const t = cloneTable();
+    const opus = entryOf(t, "claude-opus-5-5");
+    assert.deepEqual(opus.fast.multipliers, opus.multipliers);
+    assert.deepEqual(entryOf(t, "claude-haiku-5-5").tiers.high_multipliers, entryOf(t, "claude-haiku-5-5").multipliers);
+    assert.deepEqual(findings(t), []);
+  });
+
+  it("a corrupted stored fast.multipliers or tiers.high_multipliers is a fatal schema finding", () => {
+    const f = cloneTable();
+    entryOf(f, "claude-opus-5-5").fast.multipliers.cache_read = "0.5";
+    assert.ok(findings(f).some((x) => x.startsWith("schema@models[") && x.endsWith(".fast.multipliers")), findings(f).join(","));
+    assert.throws(() => book(f), PriceTableError);
+    const h = cloneTable();
+    entryOf(h, "claude-haiku-5-5").tiers.high_multipliers.cache_read = "0.5";
+    assert.ok(findings(h).some((x) => x.startsWith("schema@models[") && x.endsWith(".tiers.high_multipliers")), findings(h).join(","));
+    assert.throws(() => book(h), PriceTableError);
+    // a missing key is a difference too
+    const m = cloneTable();
+    delete entryOf(m, "claude-opus-5-5").fast.multipliers.cache_write_1h;
+    assert.ok(findings(m).length > 0);
+  });
+
+  it("the ratio test of a long-context row uses the multipliers stored in that row", () => {
+    const t = cloneTable();
+    const sol = entryOf(t, "gpt-6-sol");
+    assert.ok(sol.long_context.multipliers, "the row stores its own object");
+    // changing the stored object alone (the prices stay) breaks the ratio of the row against its own multipliers
+    sol.long_context.multipliers.cached_input = "0.5";
+    assert.ok(findings(t).some((x) => x.startsWith("ratio@") && x.includes(".long_context.")), findings(t).join(","));
+    // a row that stores a different object than its entry, consistent with its own prices, is accepted
+    const u = cloneTable();
+    const e = entryOf(u, "gpt-6-sol");
+    e.long_context.multipliers = { cached_input: "0.2", cache_write: "1.25" };
+    e.long_context.prices_usd_per_mtok.cached_input = String((Number(e.long_context.prices_usd_per_mtok.input) * 0.2));
+    assert.deepEqual(findings(u), []);
+  });
+});
+
+describe("R3.4 fast with geo us needs geo_us_applies on the fast row", () => {
+  const r = () => claude({ model: "claude-opus-5-5", speed: "fast", geo: "us", usage: { i: 1000, o: 1 } });
+  it("fast.geo_us_applies false or absent, or the entry geo_us not applying: fast_geo_unverified", () => {
+    for (const how of ["false", "absent", "entry"] as const) {
+      const t = cloneTable();
+      const e = entryOf(t, "claude-opus-5-5");
+      if (how === "false") e.fast.geo_us_applies = false;
+      else if (how === "absent") delete e.fast.geo_us_applies;
+      else e.geo_us.applies = false;
+      assertUnpriced(price(r(), book(t)), "unpriced_modifier", "fast_geo_unverified");
+    }
+    assert.equal(usdPico(price(r())), 8_844_000_000n);
+  });
+});
+
+describe("R3.11 an effective verified_at is an ISO date", () => {
+  it("a placeholder string is no date: the entry is unverified, and a scope date is no scope date", () => {
+    const t = cloneTable();
+    entryOf(t, "claude-opus-5-5").verified_at = "n/a";
+    assert.ok(auditTable(t as PricingTable).some((f) => f.code === "r311_effective_date" && !f.fatal));
+    assertUnpriced(price(claude({ model: "claude-opus-5-5" }), book(t)), "unknown_model");
   });
 });

@@ -16,6 +16,7 @@ import {
   CONSTANTS,
   contextTokens,
   pricedAmount,
+  responseTokens,
   type LoadPriceBook,
   type LongContextPrice,
   type ModelPrice,
@@ -248,6 +249,32 @@ function ratioTest(
   }
 }
 
+/**
+ * R3.2: a multiplier object a row stores beside itself (`fast.multipliers`, `tiers.high_multipliers`) must equal the
+ * object of its entry: the same keys and, key by key, the same decimal value.
+ */
+function sameMultipliers(
+  a: Readonly<Record<string, string | null>> | null | undefined,
+  b: Readonly<Record<string, string | null>> | null | undefined,
+): boolean {
+  if (a === null || a === undefined || b === null || b === undefined) return (a ?? null) === (b ?? null);
+  const ka = Object.keys(a).sort();
+  const kb = Object.keys(b).sort();
+  if (ka.length !== kb.length || ka.some((k, i) => k !== kb[i])) return false;
+  for (const k of ka) {
+    const x = a[k];
+    const y = b[k];
+    if (x === null || y === null) {
+      if (x !== y) return false;
+      continue;
+    }
+    const dx = parseDecimal(x);
+    const dy = parseDecimal(y);
+    if (dx === null || dy === null || dx.num * dy.den !== dy.num * dx.den) return false;
+  }
+  return true;
+}
+
 function rational(num: number, den: number): Rational {
   return { num: BigInt(num), den: BigInt(den) };
 }
@@ -358,7 +385,12 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
     if (entry.fast !== null && entry.fast !== undefined) {
       auditVerified(entry.fast, entry, `${path}.fast`, ctx);
       const f = parseRow(provider, entry.fast.prices_usd_per_mtok);
-      if (f.row !== null) ratioTest(entry.multipliers, f.row, `${path}.fast`, ctx);
+      // R3.2: the effective multipliers of a fast row are the ones stored beside it, else the entry's.
+      const fastMult = entry.fast.multipliers ?? entry.multipliers;
+      if (entry.fast.multipliers !== undefined && entry.fast.multipliers !== null && !sameMultipliers(entry.fast.multipliers, entry.multipliers)) {
+        c.add("schema", `${path}.fast.multipliers`, "the stored fast multipliers differ from the multipliers of the entry (R3.2)");
+      }
+      if (f.row !== null) ratioTest(fastMult, f.row, `${path}.fast`, ctx);
       if (isVerified(entry.fast, entry, ctx)) {
         if (f.row === null) c.add("schema", `${path}.fast`, f.error ?? "verified fast object without prices");
         else fast = f.row;
@@ -375,7 +407,15 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
       }
       tierSplit = CONSTANTS.HAIKU_TIER_SPLIT;
       const t = parseRow(provider, entry.tiers.high);
-      if (t.row !== null) ratioTest(entry.multipliers, t.row, `${path}.tiers.high`, ctx);
+      const highMult = entry.tiers.high_multipliers ?? entry.multipliers;
+      if (
+        entry.tiers.high_multipliers !== undefined &&
+        entry.tiers.high_multipliers !== null &&
+        !sameMultipliers(entry.tiers.high_multipliers, entry.multipliers)
+      ) {
+        c.add("schema", `${path}.tiers.high_multipliers`, "the stored high tier multipliers differ from the multipliers of the entry (R3.2)");
+      }
+      if (t.row !== null) ratioTest(highMult, t.row, `${path}.tiers.high`, ctx);
       if (isVerified(entry.tiers, entry, ctx)) {
         if (t.row === null) c.add("schema", `${path}.tiers.high`, t.error ?? "verified tiers object without a high row");
         else tierHigh = t.row;
@@ -399,7 +439,8 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
         let lcRow: PriceRow | null = null;
         if (lc.prices_usd_per_mtok !== null && lc.prices_usd_per_mtok !== undefined) {
           const l = parseRow(provider, lc.prices_usd_per_mtok);
-          if (l.row !== null && lc.verified === true) ratioTest(entry.multipliers, l.row, `${path}.long_context`, ctx);
+          // R3.2: a long-context row stores its own multiplier object; an absent one falls back to the entry's.
+          if (l.row !== null && lc.verified === true) ratioTest(lc.multipliers ?? entry.multipliers, l.row, `${path}.long_context`, ctx);
           if (pricesVerified) {
             if (l.row === null) c.add("schema", `${path}.long_context`, l.error ?? "verified long_context without prices");
             else lcRow = l.row;
@@ -449,6 +490,7 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
       tier_split: tierSplit,
       long_context: longContext,
       geo_us_applies: entryVerified && geoApplies,
+      fast_geo_us_applies: entryVerified && fast !== null && entry.fast?.geo_us_applies === true,
       service_tier_rows: entryVerified ? serviceRows : {},
     };
 
@@ -524,14 +566,12 @@ export function lookupModel(book: PriceBook, modelId: string): ModelPrice | null
 // ---------------------------------------------------------------------------
 
 /**
- * The tokens of a response that R3.9 counts in `tokens_unpriced` when it is unpriced: every token bucket
- * of the response (input side `ctx` plus the known output). Unknown output adds 0 (R2.3, it is reported
- * as `output_excluded`).
+ * The tokens of a response that R3.9 counts in `tokens_unpriced` when it is unpriced. This is the single
+ * per-response token measure of the model (`responseTokens`): the input side plus the output, or the observed
+ * output lower bound when the output is unknown (R2.3). It is the same measure as the headline denominator.
  */
 export function billedTokens(u: UsageBuckets): bigint {
-  // `output_lower_bound` equals `output` when the output is known (types.ts), and is the observed minimum otherwise,
-  // so the unpriced share (R3.9) is measured against the same total as the headline denominator.
-  return contextTokens(u) + u.output_lower_bound;
+  return responseTokens(u);
 }
 
 interface Selected {
@@ -545,13 +585,18 @@ interface Refusal {
 
 const NO_GEO: Rational = { num: 1n, den: 1n };
 
-/** Claude row selection (R3.4). A modifier is never guessed. */
+/** Claude row selection (R3.4, R3.12). A modifier is never guessed and never defaulted. */
 function selectClaudeRow(r: Response, mp: ModelPrice, u: UsageBuckets, book: PriceBook): Selected | Refusal {
   const speed = r.modifiers.speed;
   const geo = r.modifiers.inference_geo;
   const tier = r.modifiers.service_tier;
 
   if (r.flags.includes("conflict_modifier")) return { modifier: "conflict_modifier" }; // R4.2
+  // R3.12: all three modifiers are read from a final copy that carries them. Nothing is defaulted: an absent value
+  // (or no final copy at all) is unverified, never a standard price and never a range.
+  if (r.flags.includes("no_final_copy") || speed === null || geo === null || tier === null) {
+    return { modifier: "modifier_unverified" };
+  }
   if (speed === "other") return { modifier: "speed_other" };
   if (geo === "other") return { modifier: "geo_other" };
 
@@ -572,7 +617,9 @@ function selectClaudeRow(r: Response, mp: ModelPrice, u: UsageBuckets, book: Pri
     row = tr;
   } else if (speed === "fast") {
     if (mp.fast === null) return { modifier: "speed_fast_no_row" };
-    if (geoUs && !book.fast_with_geo_us_verified) return { modifier: "fast_geo_unverified" };
+    // R3.4: the geo multiplier applies to a fast row only when the table modifier fast_with_geo_us is verified, the
+    // fast row of the model carries geo_us_applies: true and the model's geo_us is verified and applies.
+    if (geoUs && !(book.fast_with_geo_us_verified && mp.fast_geo_us_applies && mp.geo_us_applies)) return { modifier: "fast_geo_unverified" };
     if (aboveSplit) return { modifier: "tier_unverified" };
     kind = "fast";
     row = mp.fast;
@@ -596,36 +643,28 @@ function selectCodexRow(mp: ModelPrice, u: UsageBuckets): Selected | Refusal {
   return { kind: "long_context", row: lc.row, geo: NO_GEO };
 }
 
-interface Cost {
-  readonly lo: bigint;
-  /** Non-null iff the response has unknown-TTL write tokens (R3.5). */
-  readonly hi: bigint | null;
-}
-
-/** R3.5, R3.6. Null means a needed price is `n/a` (cache write). */
-function computeCost(u: UsageBuckets, row: PriceRow): Cost | "write_na" | "row_incomplete" {
+/**
+ * R3.5, R3.6. `bucket_unknown`: the write price depends on a TTL class the log does not show, so no single number
+ * exists and no range is produced. `write_na`: a needed price is `n/a` (cache write). The output term is never omitted:
+ * the caller has already refused a response whose output is unknown.
+ */
+function computeCost(u: UsageBuckets, row: PriceRow, output: bigint): bigint | "bucket_unknown" | "write_na" | "row_incomplete" {
   if (row.input === null || row.output === null || row.cache_read === null) return "row_incomplete";
-  let lo = u.input_uncached * row.input + u.cache_read * row.cache_read;
-  if (u.output !== null) lo += u.output * row.output;
+  if (u.cache_write_unknown_ttl > 0n) return "bucket_unknown";
+  let cost = u.input_uncached * row.input + u.cache_read * row.cache_read + output * row.output;
   if (u.cache_write_5m > 0n) {
     if (row.cache_write_5m === null) return "write_na";
-    lo += u.cache_write_5m * row.cache_write_5m;
+    cost += u.cache_write_5m * row.cache_write_5m;
   }
   if (u.cache_write_1h > 0n) {
     if (row.cache_write_1h === null) return "write_na";
-    lo += u.cache_write_1h * row.cache_write_1h;
+    cost += u.cache_write_1h * row.cache_write_1h;
   }
   if (u.cache_write > 0n) {
     if (row.cache_write === null) return "write_na"; // R3.6: cw > 0 and p_write n/a
-    lo += u.cache_write * row.cache_write;
+    cost += u.cache_write * row.cache_write;
   }
-  let hi: bigint | null = null;
-  if (u.cache_write_unknown_ttl > 0n) {
-    if (row.cache_write_5m === null || row.cache_write_1h === null) return "write_na";
-    hi = lo + u.cache_write_unknown_ttl * row.cache_write_1h; // R3.5: range from p_w5 to p_w1
-    lo += u.cache_write_unknown_ttl * row.cache_write_5m;
-  }
-  return { lo, hi };
+  return cost;
 }
 
 /** Multiply by `g` and divide by its denominator once, half up (R3.8). Exact for every price of at most 5 decimals. */
@@ -639,9 +678,10 @@ function isRefusal(x: Selected | Refusal): x is Refusal {
 }
 
 /**
- * R3.1 to R3.10. Prices one response from the response alone (no neighbour, file, session or other response
- * can change the result). Never throws. Reasons, in order: excluded, not_owner, model_unknown,
- * unknown_model, unpriced_modifier.
+ * R3.1 to R3.12. Prices one response from the response alone (no neighbour, file, session or other response
+ * can change the result). Never throws. Gate order, first match wins: excluded, not_owner, chain_tainted (R0.9
+ * effect 2), the Codex tier gate (R3.4, before R3.10), model_unknown, unknown_model, then the modifier and row
+ * checks (unpriced_modifier).
  */
 export const priceResponse: PriceResponse = (response, book, opts): PricedResponse => {
   const u = response.usage;
@@ -654,43 +694,43 @@ export const priceResponse: PriceResponse = (response, book, opts): PricedRespon
   const unpriced = (reason: UnpricedReason, modifier: UnpricedModifierReason | null): PricedResponse => ({
     ...base,
     cost: pricedAmount(null, reason),
-    cost_hi: null,
-    output_excluded: u !== null && u.output === null,
     modifier_reason: modifier,
     rates: null,
-    tokens_unpriced: u === null ? 0n : billedTokens(u),
+    tokens_unpriced: u === null ? 0n : responseTokens(u),
   });
 
-  if (response.exclusion !== null || u === null) {
-    return { ...unpriced("excluded", null), output_excluded: false, tokens_unpriced: 0n };
+  // 1. Excluded: no usable counters, adds nothing.
+  if (response.exclusion !== null || u === null) return { ...unpriced("excluded", null), tokens_unpriced: 0n };
+  // 2. R4.7: a replayed copy counts zero tokens, zero dollars.
+  if (response.ownership.role === "replayed") return { ...unpriced("not_owner", null), tokens_unpriced: 0n };
+  // 3. R0.9 effect 2: a response of a tainted chain keeps its buckets, has no verified model and no dollars. No other
+  //    reason is reported for it, whatever its modifiers, its model or a conflict flag are.
+  if (response.model.source === "chain_tainted") return unpriced("chain_tainted", null);
+  // 4. R3.4 tier gate: no retained field shows the Codex service tier, so a default run prices no Codex response,
+  //    whatever its model, `in` and scope, before R3.10 is looked at.
+  if (response.provider === "codex" && opts?.codex_tier_for_test !== "standard") {
+    return unpriced("unpriced_modifier", "modifier_unverified");
   }
-  // R4.7: a replayed copy counts zero tokens, zero dollars.
-  if (response.ownership.role === "replayed") {
-    return { ...unpriced("not_owner", null), output_excluded: false, tokens_unpriced: 0n };
-  }
-  // R2.10: an unverified model yields no dollars and takes part in no other response's pricing.
+  // 5. R2.10: an unverified model yields no dollars and takes part in no other response's pricing.
   const modelId = response.model.verified ? response.model.model : null;
   if (modelId === null) return unpriced("model_unknown", null);
 
-  // R3.3: no row, a row of the other provider, or a verified:false entry is `unknown_model`.
+  // 6. R3.3: no row, a row of the other provider, or a verified:false entry is `unknown_model`.
   const mp = lookupModel(book, modelId);
   const wantProvider: TableProvider = response.provider === "claude" ? "anthropic" : "openai";
   if (mp === null || mp.provider !== wantProvider || !mp.verified) return unpriced("unknown_model", null);
 
-  // R3.12: a Claude response without a final copy has no verified speed, geo or tier. R3.4 tier gate: no retained
-  // field shows the Codex service tier, so a default run prices no Codex response, before R3.10 is looked at.
-  if (response.provider === "claude" && response.flags.includes("speed_assumed")) {
-    return unpriced("unpriced_modifier", "modifier_unverified");
-  }
-  if (response.provider === "codex" && opts?.codex_tier_for_test !== "standard") {
-    return unpriced("unpriced_modifier", "modifier_unverified");
-  }
-
+  // 7. Modifier and row checks.
   const sel = response.provider === "claude" ? selectClaudeRow(response, mp, u, book) : selectCodexRow(mp, u);
   if (isRefusal(sel)) return unpriced("unpriced_modifier", sel.modifier);
+  // R3.5: an unknown output has no priced form, because no partial output term exists. It occurs only without a final
+  // copy (R2.3), where the modifiers are already unverified (R3.12); a response that reaches this line with an unknown
+  // output is refused the same way.
+  if (u.output === null) return unpriced("unpriced_modifier", "modifier_unverified");
 
-  const cost = computeCost(u, sel.row);
+  const cost = computeCost(u, sel.row, u.output);
   if (cost === "row_incomplete") return unpriced("unknown_model", null);
+  if (cost === "bucket_unknown") return unpriced("unpriced_modifier", "bucket_unknown");
   if (cost === "write_na") return unpriced("unpriced_modifier", "cache_write_price_na");
 
   const rates: ResolvedRates = {
@@ -705,9 +745,7 @@ export const priceResponse: PriceResponse = (response, book, opts): PricedRespon
   };
   return {
     ...base,
-    cost: pricedAmount(applyGeo(cost.lo, sel.geo)),
-    cost_hi: cost.hi === null ? null : pricedAmount(applyGeo(cost.hi, sel.geo)),
-    output_excluded: u.output === null,
+    cost: pricedAmount(applyGeo(cost, sel.geo)),
     modifier_reason: null,
     rates,
     tokens_unpriced: 0n,

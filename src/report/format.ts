@@ -130,11 +130,16 @@ export function formatPercentBig(num: bigint, den: bigint): string {
   return `${tenths / 10n}.${tenths % 10n}%`;
 }
 
-/** Picodollars to "$1,234.5678" (four decimals, rounded half up at 1e-4 USD). Display only (R3.8). */
+/**
+ * Picodollars to "$1,234.5678" (four decimals, rounded half up at 1e-4 USD). Display only (R3.8): the exact value is
+ * in the JSON report. A nonzero amount that rounds to zero prints as "<$0.0001", never as "$0.0000", so a priced
+ * response is not read as free. Zero prints "$0.0000".
+ */
 export function formatUsdPico(pico: bigint, decimals = 4): string {
   const scale = 10n ** BigInt(12 - decimals);
   const units = (pico * 2n + scale) / (2n * scale);
   const unitsPerUsd = 10n ** BigInt(decimals);
+  if (pico > 0n && units === 0n) return `<$0.${"0".repeat(decimals - 1)}1`;
   const whole = units / unitsPerUsd;
   const frac = (units % unitsPerUsd).toString().padStart(decimals, "0");
   return `$${formatBig(whole)}.${frac}`;

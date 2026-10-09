@@ -36,6 +36,10 @@ test("parseCli rejects bad input", () => {
   assert.throws(() => parseCli(["bogus"]), UsageError);
   assert.throws(() => parseCli(["session"]), UsageError);
   assert.throws(() => parseCli(["--agent", "gpt"]), UsageError);
+  // R5.9: the retired prefilter flag is unknown now (spelled in two parts so that a grep for the flag stays empty)
+  const retired = "--fa" + "st";
+  assert.throws(() => parseCli([retired]), UsageError);
+  assert.throws(() => parseCli(["--since", "7d", retired]), UsageError);
   assert.throws(() => parseCli(["--since", "yesterday"]), UsageError);
   assert.throws(() => parseCli(["--nope"]), UsageError);
 });

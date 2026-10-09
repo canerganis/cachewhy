@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildGraph, countedByKind, countedResponseIndices, summarizeLinks } from "../../src/graph/index.js";
-import { chainKeyString, emptyCoverage } from "../../src/model/types.js";
+import { chainIdOf, chainKeyString, emptyCoverage, responseTokens } from "../../src/model/types.js";
 import type {
   ChainKey,
   ClaudeParseResult,
@@ -12,8 +12,10 @@ import type {
   CodexResponse,
   ExcludedRecord,
   ExclusionReason,
+  FileFacts,
   FileInfo,
   Graph,
+  IntegrityFacts,
   Link,
   ParseResult,
   RequestKind,
@@ -29,6 +31,9 @@ import type {
 const T0 = Date.UTC(2026, 0, 1);
 const sec = (s: number): number => T0 + s * 1000;
 const WIDE = { since_ms: T0 - 1e12, until_ms: T0 + 1e12 };
+/** Run start far after every file mtime used here (R0.9): no file is live unless a test sets its mtime. */
+const RUN = T0 + 10 * 86_400_000;
+const OPT = { window: WIDE, run_start_ms: RUN };
 
 function usage(o: { i?: bigint; r?: bigint; w5?: bigint; w1?: bigint; wu?: bigint; cw?: bigint } = {}): UsageBuckets {
   return {
@@ -144,8 +149,6 @@ function mkStream(chain: ChainKey, o: Partial<Stream> = {}): Stream {
     files: [0],
     start_ms: T0,
     ordinal_verified: chain.provider === "codex" ? true : null,
-    integrity_unverified: false,
-    integrity_reasons: [],
     fork: null,
     has_settings_marker: false,
     ...o,
@@ -172,8 +175,17 @@ function fileInfo(index: number, provider: "claude" | "codex", o: Partial<FileIn
     copy_exposed: false,
     without_response_id: false,
     lines: 1,
+    mtime_ms: T0,
     ...o,
   };
+}
+
+/** Integrity facts for a hand-built parse result: every chain it holds, no links, no triggers, no unparsed lines. */
+function integrityOf(provider: "claude" | "codex", responses: readonly Response[], streams: readonly Stream[], over: Partial<IntegrityFacts> = {}): IntegrityFacts {
+  const ids = new Set<string>();
+  for (const r of responses) ids.add(chainIdOf(r.chain));
+  for (const st of streams) ids.add(chainIdOf(st.chain));
+  return { provider, chains: [...ids].sort(), family_groups: [], triggers: [], files: [], ...over };
 }
 
 function claudeResult(o: {
@@ -183,8 +195,10 @@ function claudeResult(o: {
   links?: Link[];
   files?: FileInfo[];
   uuids?: [string, ClaudeUuidNode][];
+  integrity?: Partial<IntegrityFacts>;
 }): ClaudeParseResult {
   const responses = o.responses ?? [];
+  const streams = o.streams === undefined || o.streams === "auto" ? autoStreams(responses) : o.streams;
   return {
     provider: "claude",
     responses,
@@ -192,9 +206,11 @@ function claudeResult(o: {
     coverage: emptyCoverage(),
     conflicts: [],
     links: o.links ?? [],
-    streams: o.streams === undefined || o.streams === "auto" ? autoStreams(responses) : o.streams,
+    streams,
     files: o.files ?? [fileInfo(0, "claude")],
     assumptions: [],
+    integrity: integrityOf("claude", responses, streams, o.integrity),
+    ledger: [],
     uuid_index: new Map(o.uuids ?? []),
     compact_boundaries: [],
     prefix_hints: [],
@@ -208,8 +224,10 @@ function codexResult(o: {
   streams?: Stream[] | "auto";
   links?: Link[];
   files?: FileInfo[];
+  integrity?: Partial<IntegrityFacts>;
 }): CodexParseResult {
   const responses = o.responses ?? [];
+  const streams = o.streams === undefined || o.streams === "auto" ? autoStreams(responses) : o.streams;
   return {
     provider: "codex",
     responses,
@@ -217,9 +235,11 @@ function codexResult(o: {
     coverage: emptyCoverage(),
     conflicts: [],
     links: o.links ?? [],
-    streams: o.streams === undefined || o.streams === "auto" ? autoStreams(responses) : o.streams,
+    streams,
     files: o.files ?? [fileInfo(0, "codex")],
     assumptions: [],
+    integrity: integrityOf("codex", responses, streams, o.integrity),
+    ledger: [],
     compactions: [],
     thread_totals: [],
     forked_from_ids: new Set(),
@@ -277,7 +297,7 @@ function shuffled<T>(xs: readonly T[], rand: () => number): T[] {
 
 test("R6.1 chain order is (event time, key) and P is the immediately preceding request", () => {
   const rs = [claude({ key: "c", t: 30 }), claude({ key: "a", t: 10 }), claude({ key: "b", t: 20 })];
-  const g = buildGraph([claudeResult({ responses: rs })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: rs })], OPT);
   assert.deepEqual(g.responses.map((r) => r.key), ["a", "b", "c"]);
   assert.equal(g.chains.length, 1);
   assert.deepEqual(g.chains[0]?.order, [0, 1, 2]);
@@ -287,7 +307,7 @@ test("R6.1 chain order is (event time, key) and P is the immediately preceding r
 
 test("R6.1 equal event time orders by key and marks both requests as a tie", () => {
   const rs = [claude({ key: "b", t: 10 }), claude({ key: "a", t: 10 }), claude({ key: "c", t: 20 }), claude({ key: "z", t: 5 })];
-  const g = buildGraph([claudeResult({ responses: rs })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: rs })], OPT);
   assert.deepEqual(g.responses.map((r) => r.key), ["z", "a", "b", "c"]);
   assert.deepEqual(g.nodes.map((n) => n.order_tie), [false, true, true, false]);
   assert.equal(at(g, "c").n.prev, at(g, "b").i);
@@ -295,7 +315,7 @@ test("R6.1 equal event time orders by key and marks both requests as a tie", () 
 
 test("R6.1 a tie with a keyless excluded record also makes the request a tie", () => {
   const rs = [claude({ key: "a", t: 10 }), claude({ key: "b", t: 20 })];
-  const g = buildGraph([claudeResult({ responses: rs, excluded: [excludedRec(MAIN, 20, "unkeyed")] })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: rs, excluded: [excludedRec(MAIN, 20, "unkeyed")] })], OPT);
   assert.equal(at(g, "a").n.order_tie, false);
   assert.equal(at(g, "b").n.order_tie, true);
 });
@@ -307,7 +327,7 @@ test("R6.2 removed requests are skipped as P and flagged as excluded between", (
     claude({ key: "k2", t: 30 }),
     claude({ key: "k3", t: 40 }),
   ];
-  const g = buildGraph([claudeResult({ responses: rs })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: rs })], OPT);
   const k2 = at(g, "k2");
   assert.equal(k2.n.prev, at(g, "k1").i, "the removed request is not P");
   assert.equal(k2.n.excluded_between, true);
@@ -321,7 +341,7 @@ test("R6.2 removed requests are skipped as P and flagged as excluded between", (
 test("R6.2 keyless, api-error and unverified-version records sit between P and C", () => {
   for (const reason of ["unkeyed", "api_error", "unverified_version"] as const) {
     const rs = [claude({ key: "k1", t: 10 }), claude({ key: "k2", t: 30 })];
-    const g = buildGraph([claudeResult({ responses: rs, excluded: [excludedRec(MAIN, 20, reason)] })], { window: WIDE });
+    const g = buildGraph([claudeResult({ responses: rs, excluded: [excludedRec(MAIN, 20, reason)] })], OPT);
     assert.equal(at(g, "k2").n.excluded_between, true, reason);
     assert.equal(at(g, "k1").n.excluded_between, false, reason);
     assert.equal(g.excluded.length, 1);
@@ -330,7 +350,7 @@ test("R6.2 keyless, api-error and unverified-version records sit between P and C
 
 test("R6.2 an excluded record before the first kept request marks it (its first-ness cannot be asserted)", () => {
   const rs = [claude({ key: "k1", t: 30 })];
-  const g = buildGraph([claudeResult({ responses: rs, excluded: [excludedRec(MAIN, 10)] })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: rs, excluded: [excludedRec(MAIN, 10)] })], OPT);
   const n = at(g, "k1").n;
   assert.equal(n.prev, null);
   assert.equal(n.excluded_between, true);
@@ -338,7 +358,7 @@ test("R6.2 an excluded record before the first kept request marks it (its first-
 
 test("R6.2, R4.7 a replayed request stays in the history and can be P", () => {
   const rs = [claude({ key: "rep", t: 10, role: "replayed" }), claude({ key: "own", t: 20 })];
-  const g = buildGraph([claudeResult({ responses: rs })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: rs })], OPT);
   const own = at(g, "own");
   assert.equal(own.n.prev, at(g, "rep").i);
   assert.equal(own.n.prev_is_replayed, true);
@@ -347,7 +367,7 @@ test("R6.2, R4.7 a replayed request stays in the history and can be P", () => {
 
 test("a response from a codex chain keeps ordering and ties but has no TTL set (R9.6)", () => {
   const rs = [codex({ key: "x2", t: 20, w5: 5n }), codex({ key: "x1", t: 10 })];
-  const g = buildGraph([codexResult({ responses: rs })], { window: WIDE });
+  const g = buildGraph([codexResult({ responses: rs })], OPT);
   assert.deepEqual(g.responses.map((r) => r.key), ["x1", "x2"]);
   assert.equal(at(g, "x2").n.ttl_set, null);
   assert.equal(at(g, "x2").n.prev, 0);
@@ -365,7 +385,7 @@ test("R5.9, R5.10 window is half-open on event time; baseline requests stay as P
     claude({ key: "out1", t: 200, r: 100n }),
     claude({ key: "out2", t: 300, r: 100n }),
   ];
-  const g = buildGraph([claudeResult({ responses: rs })], { window: { since_ms: sec(100), until_ms: sec(200) } });
+  const g = buildGraph([claudeResult({ responses: rs })], { window: { since_ms: sec(100), until_ms: sec(200) }, run_start_ms: RUN });
   assert.deepEqual(g.nodes.map((n) => n.in_window), [false, true, true, false, false]);
   const in1 = at(g, "in1");
   assert.equal(in1.n.prev, at(g, "base").i, "P may lie before the window");
@@ -378,6 +398,7 @@ test("R5.9 event time alone decides: file position and provenance do not matter"
   const b = claude({ key: "b", t: 150, files: [7, 3] });
   const g = buildGraph([claudeResult({ responses: [b, a], files: [fileInfo(0, "claude"), fileInfo(3, "claude"), fileInfo(7, "claude")] })], {
     window: { since_ms: sec(100), until_ms: sec(200) },
+    run_start_ms: RUN,
   });
   assert.deepEqual(g.nodes.map((n) => n.in_window), [false, true]);
 });
@@ -387,7 +408,7 @@ test("R5.9 event time alone decides: file position and provenance do not matter"
 // ---------------------------------------------------------------------------
 
 function ttlOf(rs: ClaudeResponse[], key: string, excluded: ExcludedRecord[] = []) {
-  const g = buildGraph([claudeResult({ responses: rs, excluded })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: rs, excluded })], OPT);
   return at(g, key).n.ttl_set;
 }
 
@@ -455,28 +476,28 @@ test("R9.2 mixed buckets in one request are both recorded", () => {
 
 test("R6.6 gap_min = start_lo(C) - start_hi(P), gap_max = start_hi(C) - start_lo(P), unknown ends are null", () => {
   const rs = [claude({ key: "p", t: 100 }), claude({ key: "c", t: 500, asm: 150 })];
-  const g = buildGraph([claudeResult({ responses: rs })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: rs })], OPT);
   assert.deepEqual(at(g, "c").n.gap, { min_ms: 50_000, max_ms: null, basis: "parent_record" });
 
   const both = [claude({ key: "p", t: 100, asm: 90 }), claude({ key: "c", t: 500, asm: 150 })];
-  const g2 = buildGraph([claudeResult({ responses: both })], { window: WIDE });
+  const g2 = buildGraph([claudeResult({ responses: both })], OPT);
   assert.deepEqual(at(g2, "c").n.gap, { min_ms: 50_000, max_ms: 410_000, basis: "parent_record" });
 
   const none = [claude({ key: "p", t: 100 }), claude({ key: "c", t: 500 })];
-  const g3 = buildGraph([claudeResult({ responses: none })], { window: WIDE });
+  const g3 = buildGraph([claudeResult({ responses: none })], OPT);
   assert.deepEqual(at(g3, "c").n.gap, { min_ms: null, max_ms: null, basis: "none" });
   assert.equal(at(g3, "p").n.gap, null);
 });
 
 test("R6.6 a negative gap_min is clamped to 0", () => {
   const rs = [claude({ key: "p", t: 100 }), claude({ key: "c", t: 500, asm: 80 })];
-  const g = buildGraph([claudeResult({ responses: rs })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: rs })], OPT);
   assert.equal(at(g, "c").n.gap?.min_ms, 0);
 });
 
 test("R6.4 a parent record later than t_first is no bound", () => {
   const rs = [claude({ key: "p", t: 100 }), claude({ key: "c", t: 500, asm: 600 })];
-  const g = buildGraph([claudeResult({ responses: rs })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: rs })], OPT);
   assert.equal(at(g, "c").n.gap?.min_ms, null);
 });
 
@@ -489,16 +510,56 @@ test("R6.3 t_asm is resolved through the global uuid index when the parser left 
     is_compact_summary: false,
     is_compact_boundary: false,
     chain: MAIN,
+    unresolved: false,
   };
   const rs = [claude({ key: "p", t: 100 }), claude({ key: "c", t: 500, parent_uuid: "up" })];
-  const g = buildGraph([claudeResult({ responses: rs, uuids: [["up", node]] })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: rs, uuids: [["up", node]] })], OPT);
   assert.equal(at(g, "c").n.gap?.min_ms, 150_000);
   assert.equal(g.claude.uuid_index.get("up")?.ts_ms, sec(250));
 });
 
+test("R6.3 an unresolved uuid gives no t_asm, even when the response carries one", () => {
+  const node: ClaudeUuidNode = {
+    uuid: "up",
+    parent_uuid: null,
+    logical_parent_uuid: null,
+    ts_ms: null,
+    is_compact_summary: false,
+    is_compact_boundary: false,
+    chain: MAIN,
+    unresolved: true,
+  };
+  const rs = [claude({ key: "p", t: 100 }), claude({ key: "c", t: 500, parent_uuid: "up", asm: 250 })];
+  const g = buildGraph([claudeResult({ responses: rs, uuids: [["up", node]] })], OPT);
+  assert.equal(at(g, "c").n.gap?.min_ms, null);
+});
+
+test("R6.3 copies of one uuid in different parse results that disagree make the uuid unresolved", () => {
+  const mk = (ts: number, parent: string | null): ClaudeUuidNode => ({
+    uuid: "up",
+    parent_uuid: parent,
+    logical_parent_uuid: null,
+    ts_ms: sec(ts),
+    is_compact_summary: false,
+    is_compact_boundary: false,
+    chain: MAIN,
+    unresolved: false,
+  });
+  const rs = [claude({ key: "p", t: 100 }), claude({ key: "c", t: 500, parent_uuid: "up" })];
+  const byTs = buildGraph([claudeResult({ responses: rs, uuids: [["up", mk(250, null)]] }), claudeResult({ uuids: [["up", mk(300, null)]] })], OPT);
+  assert.equal(byTs.claude.uuid_index.get("up")?.unresolved, true);
+  assert.equal(byTs.claude.uuid_index.get("up")?.ts_ms, null);
+  assert.equal(at(byTs, "c").n.gap?.min_ms, null);
+  const byParent = buildGraph([claudeResult({ uuids: [["up", mk(250, "a")]] }), claudeResult({ uuids: [["up", mk(250, "b")]] })], OPT);
+  assert.equal(byParent.claude.uuid_index.get("up")?.unresolved, true);
+  const same = buildGraph([claudeResult({ uuids: [["up", mk(250, "a")]] }), claudeResult({ uuids: [["up", mk(250, "a")]] })], OPT);
+  assert.equal(same.claude.uuid_index.get("up")?.unresolved, false);
+  assert.equal(same.claude.uuid_index.get("up")?.ts_ms, sec(250));
+});
+
 test("R6.5 Codex gap bounds are always unknown with basis none", () => {
   const rs = [codex({ key: "x1", t: 10 }), codex({ key: "x2", t: 4000 })];
-  const g = buildGraph([codexResult({ responses: rs })], { window: WIDE });
+  const g = buildGraph([codexResult({ responses: rs })], OPT);
   assert.deepEqual(at(g, "x2").n.gap, { min_ms: null, max_ms: null, basis: "none" });
 });
 
@@ -509,7 +570,7 @@ test("R6.5 Codex gap bounds are always unknown with basis none", () => {
 test("R5.8 one owner keeps counting, the replayed copy counts zero", () => {
   const mainA = claude({ key: "dup", t: 10, session: "sA" });
   const mainB = claude({ key: "dup", t: 10, session: "sB", role: "replayed" });
-  const g = buildGraph([claudeResult({ responses: [mainA, mainB] })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: [mainA, mainB] })], OPT);
   assert.equal(g.responses.length, 2);
   assert.equal(countedResponseIndices(g).length, 1);
   assert.equal(((g.responses[countedResponseIndices(g)[0] as number]) as Response).chain.root_session, "sA");
@@ -519,7 +580,7 @@ test("R4.6 two owners of a key: the earlier stream_start owns, the other is demo
   const a = claude({ key: "dup", t: 10, session: "sA" });
   const b = claude({ key: "dup", t: 10, session: "sB" });
   const streams = [mkStream(a.chain, { start_ms: sec(100) }), mkStream(b.chain, { start_ms: sec(50) })];
-  const g = buildGraph([claudeResult({ responses: [a, b], streams })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: [a, b], streams })], OPT);
   const counted = countedResponseIndices(g).map((i) => g.responses[i] as Response);
   assert.equal(counted.length, 1);
   assert.equal(counted[0]?.chain.root_session, "sB");
@@ -530,7 +591,7 @@ test("R4.6 a tie on stream_start makes ownership ambiguous; the smaller sessionI
   const a = claude({ key: "dup", t: 10, session: "sB" });
   const b = claude({ key: "dup", t: 10, session: "sA" });
   const streams = [mkStream(a.chain, { start_ms: sec(5) }), mkStream(b.chain, { start_ms: sec(5) })];
-  const g = buildGraph([claudeResult({ responses: [a, b], streams })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: [a, b], streams })], OPT);
   const counted = countedResponseIndices(g).map((i) => g.responses[i] as Response);
   assert.equal(counted.length, 1);
   assert.equal(counted[0]?.chain.root_session, "sA");
@@ -543,12 +604,12 @@ test("R4.6 a tie on stream_start makes ownership ambiguous; the smaller sessionI
 test("R4.4 the same Codex response_id owned by two threads is a conflict and counts nowhere", () => {
   const a = codex({ key: "resp", t: 10, thread: "t1", root: "r" });
   const b = codex({ key: "resp", t: 10, thread: "t2", root: "r" });
-  const g = buildGraph([codexResult({ responses: [a, b] })], { window: WIDE });
+  const g = buildGraph([codexResult({ responses: [a, b] })], OPT);
   assert.equal(countedResponseIndices(g).length, 0);
   assert.ok(g.responses.every((r) => r.exclusion === "conflict_attribution" && r.usage === null));
   const c = codex({ key: "resp2", t: 10, thread: "t1", root: "r", i: 1n });
   const d = codex({ key: "resp2", t: 10, thread: "t2", root: "r", i: 2n });
-  const g2 = buildGraph([codexResult({ responses: [c, d] })], { window: WIDE });
+  const g2 = buildGraph([codexResult({ responses: [c, d] })], OPT);
   assert.ok(g2.responses.every((r) => r.exclusion === "conflict_usage"));
 });
 
@@ -557,6 +618,7 @@ test("feeding the same key twice into one chain collapses it and unions provenan
   const b = claude({ key: "k", t: 10, files: [0] });
   const g = buildGraph([claudeResult({ responses: [a], files: [fileInfo(0, "claude")] }), claudeResult({ responses: [b], files: [fileInfo(0, "claude")] })], {
     window: WIDE,
+    run_start_ms: RUN,
   });
   // overlapping indices, so the second result is shifted: files [0] and [1]
   assert.equal(g.responses.length, 1);
@@ -564,13 +626,13 @@ test("feeding the same key twice into one chain collapses it and unions provenan
   assert.equal(countedResponseIndices(g).length, 1);
   // the very same object twice is the same input
   const r = claudeResult({ responses: [a] });
-  assert.equal(canon(buildGraph([r, r], { window: WIDE })), canon(buildGraph([r], { window: WIDE })));
+  assert.equal(canon(buildGraph([r, r], OPT)), canon(buildGraph([r], OPT)));
 });
 
 test("unequal counters for one key in one chain are a conflict, not a coin flip", () => {
   const a = claude({ key: "k", t: 10, i: 1n });
   const b = claude({ key: "k", t: 10, i: 2n, files: [1] });
-  const g = buildGraph([claudeResult({ responses: [a] }), claudeResult({ responses: [b] })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: [a] }), claudeResult({ responses: [b] })], OPT);
   assert.equal(g.responses.length, 1);
   assert.equal(g.responses[0]?.exclusion, "conflict_input");
   assert.equal(g.responses[0]?.usage, null);
@@ -589,7 +651,7 @@ test("R5.8 per-kind subtotals sum to the grand total", () => {
     claude({ key: "bad", t: 60, excl: "conflict_input" }),
   ];
   const links = [link(sub, "subagent", "verified", { parent: MAIN, depth: 1 }), link(wf, "workflow_agent", "directory")];
-  const g = buildGraph([claudeResult({ responses: rs, links })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: rs, links })], OPT);
   const byKind = countedByKind(g);
   const total = countedResponseIndices(g).length;
   assert.equal(total, 4);
@@ -609,7 +671,7 @@ function linkState(links: Link[], extraMain = true, o: { session?: string } = {}
   let t = 1;
   for (const k of keys.values()) rs.push(claude({ key: `r${t}`, t: t++, session: k.root_session, thread: k.thread, kind: k.thread === "main" ? "main" : "subagent" }));
   void o;
-  return buildGraph([claudeResult({ responses: rs, links })], { window: WIDE });
+  return buildGraph([claudeResult({ responses: rs, links })], OPT);
 }
 
 function linkOf(g: Graph, thread: string): Link {
@@ -656,7 +718,7 @@ test("R5.3 a parent in another session is session_mismatch", () => {
   const a = agentKey("a1", "s1");
   const otherMain: ChainKey = { provider: "claude", root_session: "s2", thread: "main" };
   const rs = [claude({ key: "p", t: 1, session: "s2" }), claude({ key: "c", t: 2, session: "s1", thread: "a1" })];
-  const g = buildGraph([claudeResult({ responses: rs, links: [link(a, "subagent", "verified", { parent: otherMain, depth: 1 })] })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: rs, links: [link(a, "subagent", "verified", { parent: otherMain, depth: 1 })] })], OPT);
   assert.equal(linkOf(g, "a1").reason, "session_mismatch");
 });
 
@@ -667,7 +729,7 @@ test("R5.3 an unlinked subagent keeps its parser reason; a missing link is unlin
   assert.equal(linkOf(g, "a1").reason, "tool_use_not_found");
   // no Link record at all for a subagent chain
   const rs = [claude({ key: "m", t: 1 }), claude({ key: "s", t: 2, thread: b.thread })];
-  const g2 = buildGraph([claudeResult({ responses: rs })], { window: WIDE });
+  const g2 = buildGraph([claudeResult({ responses: rs })], OPT);
   const l = linkOf(g2, "b1");
   assert.deepEqual([l.state, l.reason, l.kind], ["unlinked", "no_meta", "subagent"]);
   // a reasonless unlinked record gets the default reason; `directory` does not exist for subagents
@@ -685,7 +747,7 @@ test("R5.4 workflow agents are never verified; directory is the best; no link me
   const g2 = linkState([link(w2, "workflow_agent", "unlinked", { reason: "no_run_file" })]);
   assert.deepEqual([linkOf(g2, "w2").state, linkOf(g2, "w2").reason], ["unlinked", "no_run_file"]);
   const rs = [claude({ key: "m", t: 1 }), claude({ key: "x", t: 2, thread: "w3", kind: "workflow_agent" })];
-  const g3 = buildGraph([claudeResult({ responses: rs })], { window: WIDE });
+  const g3 = buildGraph([claudeResult({ responses: rs })], OPT);
   assert.deepEqual([linkOf(g3, "w3").state, linkOf(g3, "w3").reason, linkOf(g3, "w3").kind], ["unlinked", "no_journal_entry", "workflow_agent"]);
   assert.equal(g3.chains.find((c) => c.key.thread === "w3")?.kind, "workflow_agent");
 });
@@ -702,7 +764,7 @@ test("R5.6 Codex: verified needs the parent stream in the scan, the same session
           links: [l],
         }),
       ],
-      { window: WIDE },
+      OPT,
     );
   const ok = mk([], link(child, "subagent", "verified", { parent, depth: 1 }));
   assert.equal(linkOf(ok, "c").state, "verified");
@@ -719,7 +781,7 @@ test("R5.6 Codex: verified needs the parent stream in the scan, the same session
         links: [link(child, "subagent", "verified", { parent: otherRoot })],
       }),
     ],
-    { window: WIDE },
+    OPT,
   );
   assert.equal(linkOf(g, "c").reason, "root_mismatch");
 
@@ -732,7 +794,7 @@ test("R5.6 Codex: verified needs the parent stream in the scan, the same session
 
 test("R5.6 a Codex subagent without a link record is unlinked no_parent_id; a main thread has no link", () => {
   const rs = [codex({ key: "m", t: 1, thread: "t0", root: "r" }), codex({ key: "s", t: 2, thread: "t1", root: "r", kind: "subagent" })];
-  const g = buildGraph([codexResult({ responses: rs })], { window: WIDE });
+  const g = buildGraph([codexResult({ responses: rs })], OPT);
   assert.equal(g.chains.find((c) => c.key.thread === "t0")?.link, null);
   assert.deepEqual([linkOf(g, "t1").state, linkOf(g, "t1").reason], ["unlinked", "no_parent_id"]);
 });
@@ -767,50 +829,229 @@ test("R4.11 a chain is one logical stream however its records arrive: split Stre
   const r2 = codex({ key: "b", t: 20, thread: "t", root: "r", files: [0] });
   const half1 = codexResult({ responses: [r1], streams: [mkStream(chain, { files: [0], start_ms: sec(10), ordinal_verified: true })] });
   const half2 = codexResult({ responses: [r2], streams: [mkStream(chain, { files: [0], start_ms: sec(5), ordinal_verified: true })] });
-  const g = buildGraph([half1, half2], { window: WIDE });
+  const g = buildGraph([half1, half2], OPT);
   assert.equal(g.chains.length, 1);
   const s = g.chains[0]?.stream as Stream;
   assert.deepEqual(s.files, [0, 1]);
   assert.equal(s.start_ms, sec(5));
   assert.equal(s.ordinal_verified, true);
-  assert.equal(s.integrity_unverified, false);
   assert.equal(at(g, "b").n.prev, at(g, "a").i);
-  // one half failing ordinal verification fails the whole stream; integrity is an OR
-  const bad = codexResult({
-    responses: [r2],
-    streams: [mkStream(chain, { ordinal_verified: false, integrity_unverified: true, integrity_reasons: ["file_stream_conflict"] })],
-  });
-  const g2 = buildGraph([half1, bad], { window: WIDE });
-  const s2 = g2.chains[0]?.stream as Stream;
-  assert.equal(s2.ordinal_verified, false);
-  assert.equal(s2.integrity_unverified, true);
-  assert.deepEqual(s2.integrity_reasons, ["file_stream_conflict"]);
+  // one half failing ordinal verification fails the whole stream (the parser reports the taint, R4.12)
+  const bad = codexResult({ responses: [r2], streams: [mkStream(chain, { ordinal_verified: false })] });
+  const g2 = buildGraph([half1, bad], OPT);
+  assert.equal((g2.chains[0]?.stream as Stream).ordinal_verified, false);
 });
 
-test("R4.13 a copy-exposed file makes its stream integrity_unverified even if the Stream record forgot it", () => {
-  const chain: ChainKey = { provider: "codex", root_session: "r", thread: "t" };
-  const rs = [codex({ key: "a", t: 10, thread: "t", root: "r" })];
-  const g = buildGraph([codexResult({ responses: rs, streams: [mkStream(chain)], files: [fileInfo(0, "codex", { copy_exposed: true })] })], { window: WIDE });
-  const s = g.chains[0]?.stream as Stream;
-  assert.equal(s.integrity_unverified, true);
-  assert.deepEqual(s.integrity_reasons, ["copy_exposed_file"]);
-});
-
-test("R4.11 divergent fork facts across Stream records make the stream unverified", () => {
+test("R4.11 divergent fork facts across Stream records leave a stream that cannot cut its prefix (the taint is the parser's)", () => {
   const chain: ChainKey = { provider: "codex", root_session: "r", thread: "t" };
   const rs = [codex({ key: "a", t: 10, thread: "t", root: "r" })];
   const f = (from: string) => mkStream(chain, { fork: { forked_from_id: from, history_start_ordinal: 2, prefix_resolved: true } });
-  const g = buildGraph([codexResult({ responses: rs, streams: [f("x")] }), codexResult({ streams: [f("y")] })], { window: WIDE });
+  const g = buildGraph([codexResult({ responses: rs, streams: [f("x")] }), codexResult({ streams: [f("y")] })], OPT);
   const s = g.chains[0]?.stream as Stream;
-  assert.equal(s.integrity_unverified, true);
-  assert.deepEqual(s.integrity_reasons, ["divergent_session_meta"]);
+  assert.equal(s.fork?.prefix_resolved, false);
+  assert.equal(g.chains[0]?.tainted, false, "no integrity fact, so the graph invents no taint");
 });
 
-test("R4.11 no guessing: responses without any Stream record are an unresolved stream", () => {
-  const g = buildGraph([claudeResult({ responses: [claude({ key: "a", t: 1 })], streams: [] }), codexResult({ responses: [codex({ key: "b", t: 1 })], streams: [] })], { window: WIDE });
-  for (const c of g.chains) assert.equal(c.stream.integrity_unverified, true);
+test("R4.11 no guessing: responses without any Stream record have an unverified ordinal state", () => {
+  const g = buildGraph([claudeResult({ responses: [claude({ key: "a", t: 1 })], streams: [] }), codexResult({ responses: [codex({ key: "b", t: 1 })], streams: [] })], OPT);
   assert.equal(g.chains.find((c) => c.key.provider === "codex")?.stream.ordinal_verified, false);
   assert.equal(g.chains.find((c) => c.key.provider === "claude")?.stream.ordinal_verified, null);
+  // A stream that cannot be checked fails R4.12: the Codex chain is tainted ordinal_unverified, the Claude one is not.
+  const cx = g.chains.find((c) => c.key.provider === "codex") as Graph["chains"][number];
+  assert.equal(cx.tainted, true);
+  assert.deepEqual(cx.taint_reasons, ["ordinal_unverified"]);
+  assert.equal(g.chains.find((c) => c.key.provider === "claude")?.tainted, false);
+  assert.equal(g.coverage_by_provider.codex.chains_tainted_by_reason.ordinal_unverified, 1);
+});
+
+test("R4.11 the stream-less ordinal_unverified taint counts once per chain when the parser also reports it", () => {
+  const chain: ChainKey = { provider: "codex", root_session: "r", thread: "t" };
+  const rs = [codex({ key: "a", t: 10, thread: "t", root: "r" })];
+  const g = buildGraph(
+    [codexResult({ responses: rs, streams: [], integrity: { triggers: [{ reason: "ordinal_unverified", names: [chainIdOf(chain)] }] } })],
+    OPT,
+  );
+  assert.deepEqual(g.chains[0]?.taint_reasons, ["ordinal_unverified"]);
+  assert.equal(g.coverage_by_provider.codex.chains_tainted_by_reason.ordinal_unverified, 1);
+  assert.equal(g.coverage_by_provider.codex.chains_tainted, 1);
+});
+
+test("R4.11 a chain with responses and a Stream record gets no stream-less taint", () => {
+  const rs = [codex({ key: "a", t: 10, thread: "t", root: "r" })];
+  const g = buildGraph([codexResult({ responses: rs })], OPT);
+  assert.equal(g.chains[0]?.tainted, false);
+});
+
+// ---------------------------------------------------------------------------
+// R0.9 taint, families, live families
+// ---------------------------------------------------------------------------
+
+const CX = (session: string, thread = "main"): ChainKey => ({ provider: "claude", root_session: session, thread });
+const CXC = (thread: string): ChainKey => ({ provider: "codex", root_session: "ignored", thread });
+const ff = (index: number, provider: "claude" | "codex", named: ChainKey[], o: Partial<FileFacts> = {}): FileFacts => ({
+  index,
+  provider,
+  mtime_ms: T0,
+  named_chains: named.map(chainIdOf).sort(),
+  unparsed_lines: 0,
+  readable: true,
+  ...o,
+});
+
+test("R0.9 effect 1 and 2: a tainted chain keeps its tokens and counts in totals, with model_source chain_tainted", () => {
+  const a = claude({ key: "a", t: 1, session: "s1" });
+  const b = claude({ key: "b", t: 2, session: "s2" });
+  const g = buildGraph(
+    [claudeResult({ responses: [a, b], integrity: { triggers: [{ reason: "request_anomaly", names: [chainIdOf(CX("s1"))] }] } })],
+    OPT,
+  );
+  const ra = at(g, "a").r;
+  assert.equal(ra.model.source, "chain_tainted");
+  assert.equal(ra.model.verified, false);
+  assert.equal(ra.model.model, null);
+  assert.equal(ra.model.candidate, "m", "Claude keeps the candidate for token breakdowns");
+  assert.equal(at(g, "b").r.model.source, "claude_explicit", "another family is untouched");
+  assert.equal(at(g, "b").r.model.verified, true);
+  assert.deepEqual(g.chains.map((c) => [c.key.root_session, c.tainted, c.taint_reasons]), [["s1", true, ["request_anomaly"]], ["s2", false, []]]);
+  assert.equal(countedResponseIndices(g).length, 2, "tainted responses stay in the totals set (R5.8)");
+  assert.equal(countedByKind(g).main, 2);
+  assert.equal(g.coverage_by_provider.claude.chains_total, 2);
+  assert.equal(g.coverage_by_provider.claude.chains_tainted, 1);
+  assert.equal(g.coverage_by_provider.claude.chains_tainted_by_reason.request_anomaly, 1);
+  assert.equal(g.coverage_by_provider.claude.families_total, 2);
+  assert.equal(g.coverage_by_provider.claude.families_tainted, 1);
+});
+
+test("R0.9 effect 1: a tainted Codex response has no candidate model", () => {
+  const x = codex({ key: "x", t: 1, thread: "th" });
+  const g = buildGraph([codexResult({ responses: [x], integrity: { triggers: [{ reason: "stream_unresolved", names: [chainIdOf(CXC("th"))] }] } })], OPT);
+  const m = at(g, "x").r.model;
+  assert.deepEqual(m, { candidate: null, verified: false, source: "chain_tainted", model: null });
+});
+
+test("R0.9 family: a reason taints every chain of the family of each chain it names, through links (i), (ii) and (iii)", () => {
+  const rs = [
+    claude({ key: "m", t: 1, session: "s1", thread: "main" }),
+    claude({ key: "g", t: 2, session: "s1", thread: "ag1", kind: "subagent" }),
+    claude({ key: "o", t: 3, session: "s2", thread: "main" }),
+    claude({ key: "r", t: 4, session: "s3", thread: "main" }),
+    claude({ key: "q", t: 5, session: "s9", thread: "main" }),
+  ];
+  const id = (s: string, t = "main") => chainIdOf(CX(s, t));
+  const g = buildGraph(
+    [
+      claudeResult({
+        responses: rs,
+        integrity: {
+          // (i) one root session: s1 main and ag1. (iii) s2 and s3 share a replayed request key.
+          family_groups: [[id("s1"), id("s1", "ag1")], [id("s2"), id("s3")]],
+          triggers: [
+            { reason: "version_unverified", names: [id("s1", "ag1")] },
+            { reason: "ownership_ambiguous", names: [id("s3")] },
+          ],
+        },
+      }),
+    ],
+    OPT,
+  );
+  const tainted = g.chains.filter((c) => c.tainted).map((c) => c.key.root_session + "/" + c.key.thread).sort();
+  assert.deepEqual(tainted, ["s1/ag1", "s1/main", "s2/main", "s3/main"]);
+  assert.equal(g.chains.find((c) => c.key.root_session === "s9")?.tainted, false);
+  assert.deepEqual(g.chains.find((c) => c.key.root_session === "s1" && c.key.thread === "main")?.taint_reasons, ["version_unverified"]);
+  assert.equal(g.coverage_by_provider.claude.families_total, 3);
+  assert.equal(g.coverage_by_provider.claude.families_tainted, 2);
+  assert.equal(g.coverage_by_provider.claude.chains_tainted, 4);
+});
+
+test("R0.9 a reason that names no chain taints every chain of the provider and no chain of the other", () => {
+  const g = buildGraph(
+    [
+      claudeResult({
+        responses: [claude({ key: "a", t: 1, session: "s1" }), claude({ key: "b", t: 2, session: "s2" })],
+        integrity: { triggers: [{ reason: "file_unreadable", names: "provider" }] },
+      }),
+      codexResult({ responses: [codex({ key: "x", t: 1 })] }),
+    ],
+    OPT,
+  );
+  assert.deepEqual(g.chains.map((c) => [c.key.provider, c.tainted]), [["claude", true], ["claude", true], ["codex", false]]);
+  assert.deepEqual(g.taint.claude.provider_wide_reasons, ["file_unreadable"]);
+  assert.deepEqual(g.taint.codex.provider_wide_reasons, []);
+});
+
+test("R0.9 live: a live file's family is removed, counted over the totals set, and the other family is unchanged", () => {
+  const live = CX("s1");
+  const other = CX("s2");
+  const rs = [
+    claude({ key: "a", t: 10, session: "s1" }),
+    claude({ key: "b", t: 20, session: "s1", role: "replayed" }),
+    claude({ key: "c", t: 30, session: "s1", excl: "conflict_input" }),
+    claude({ key: "d", t: 500, session: "s1" }),
+    claude({ key: "e", t: 40, session: "s2" }),
+  ];
+  const mk = (mtime: number) =>
+    buildGraph(
+      [claudeResult({ responses: rs, files: [fileInfo(0, "claude")], integrity: { files: [ff(0, "claude", [live], { unparsed_lines: 1, mtime_ms: mtime })] } })],
+      { window: { since_ms: sec(0), until_ms: sec(100) }, run_start_ms: RUN },
+    );
+  const g = mk(RUN - 600_000);
+  assert.deepEqual(g.responses.map((r) => r.key), ["e"]);
+  assert.deepEqual(g.chains.map((c) => c.key.root_session), ["s2"]);
+  const cov = g.coverage_by_provider.claude;
+  assert.equal(cov.families_live_skipped, 1);
+  assert.equal(cov.responses_live_skipped, 1, "only the owner, kept, in-window response a (b is replayed, c excluded, d outside the window)");
+  assert.equal(cov.tokens_live_skipped, responseTokens((rs[0] as ClaudeResponse).usage as UsageBuckets));
+  assert.equal(cov.chains_total, 1);
+  assert.equal(cov.families_total, 1);
+  assert.ok(g.assumptions.includes("live_session_skipped"));
+  assert.equal(g.taint.claude.chains.get(chainIdOf(live))?.live, true);
+  assert.equal(g.taint.claude.chains.get(chainIdOf(other))?.live, false);
+  assert.equal(g.chains[0]?.tainted, false, "a live file gives no unparsed_line taint");
+  // one millisecond older than C35 is not live: the family stays and is tainted by unparsed_line
+  const g2 = mk(RUN - 600_001);
+  assert.deepEqual(g2.chains.map((c) => c.key.root_session), ["s1", "s2"]);
+  assert.equal(g2.coverage_by_provider.claude.families_live_skipped, 0);
+  assert.deepEqual(g2.chains[0]?.taint_reasons, ["unparsed_line"]);
+  assert.ok(!g2.assumptions.includes("live_session_skipped"));
+});
+
+test("R0.9 links are still computed and counted for tainted chains, per provider", () => {
+  const parent = MAIN;
+  const child = agentKey("ag1");
+  const rs = [claude({ key: "p", t: 1 }), claude({ key: "c", t: 2, thread: "ag1", kind: "subagent" })];
+  const g = buildGraph(
+    [
+      claudeResult({
+        responses: rs,
+        links: [link(child, "subagent", "verified", { parent, depth: 1 })],
+        integrity: { triggers: [{ reason: "request_anomaly", names: [chainIdOf(parent)] }], family_groups: [[chainIdOf(parent), chainIdOf(child)]] },
+      }),
+    ],
+    OPT,
+  );
+  assert.equal(g.chains.every((c) => c.tainted), true);
+  assert.equal(g.chains.find((c) => c.key.thread === "ag1")?.link?.state, "verified");
+  assert.equal(g.coverage_by_provider.claude.links_verified, 1);
+  assert.equal(g.coverage_by_provider.codex.links_verified, 0);
+});
+
+test("R0.9 family numbers and taint do not depend on the order of parse results, chains, groups or triggers", () => {
+  const id = (s: string) => chainIdOf(CX(s));
+  const rs = ["s1", "s2", "s3", "s4"].map((s, i) => claude({ key: "k" + s, t: i + 1, session: s }));
+  const groups = [[id("s1"), id("s3")], [id("s4"), id("s2")]];
+  const trig: IntegrityFacts["triggers"] = [
+    { reason: "request_anomaly", names: [id("s2")] },
+    { reason: "copy_exposed", names: [id("s1")] },
+  ];
+  const facts = (flip: boolean): Partial<IntegrityFacts> =>
+    flip
+      ? { family_groups: [...groups].reverse().map((g) => [...g].reverse()), triggers: [...trig].reverse(), chains: [id("s4"), id("s3"), id("s2"), id("s1")] }
+      : { family_groups: groups, triggers: trig, chains: [id("s1"), id("s2"), id("s3"), id("s4")] };
+  const g1 = buildGraph([claudeResult({ responses: rs, integrity: facts(false) })], OPT);
+  const g2 = buildGraph([claudeResult({ responses: [...rs].reverse(), integrity: facts(true) })], OPT);
+  assert.equal(canon(g1, true), canon(g2, true));
+  assert.deepEqual(g1.chains.map((c) => c.family), [0, 1, 0, 1]);
+  assert.deepEqual(g1.chains.map((c) => c.taint_reasons), [["copy_exposed"], ["request_anomaly"], ["copy_exposed"], ["request_anomaly"]]);
 });
 
 // ---------------------------------------------------------------------------
@@ -820,7 +1061,7 @@ test("R4.11 no guessing: responses without any Stream record are an unresolved s
 test("file indices: overlapping local indices are shifted, disjoint (shared list) indices are kept", () => {
   const c = claude({ key: "c1", t: 1, files: [0] });
   const x = codex({ key: "x1", t: 1, files: [0] });
-  const g = buildGraph([claudeResult({ responses: [c] }), codexResult({ responses: [x] })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: [c] }), codexResult({ responses: [x] })], OPT);
   assert.deepEqual(g.files.map((f) => [f.index, f.provider]), [[0, "claude"], [1, "codex"]]);
   assert.deepEqual(at(g, "x1").r.provenance.files, [1]);
   assert.deepEqual(g.chains.find((k) => k.key.provider === "codex")?.stream.files, [1]);
@@ -832,7 +1073,7 @@ test("file indices: overlapping local indices are shifted, disjoint (shared list
       claudeResult({ responses: [c2], files: [fileInfo(0, "claude"), fileInfo(2, "claude")], streams: [mkStream(c2.chain, { files: [0, 2] })] }),
       codexResult({ responses: [x2], files: [fileInfo(1, "codex")], streams: [mkStream(x2.chain, { files: [1] })] }),
     ],
-    { window: WIDE },
+    OPT,
   );
   assert.deepEqual(g2.files.map((f) => f.index), [0, 1, 2]);
   assert.deepEqual(at(g2, "x1").r.provenance.files, [1]);
@@ -844,12 +1085,12 @@ test("chain kind comes from the link, then from its responses, then from the cha
     claude({ key: "h", t: 2, thread: "helper", kind: "helper" }),
     claude({ key: "s", t: 3, thread: "a1" }),
   ];
-  const g = buildGraph([claudeResult({ responses: rs, links: [link(agentKey("a1"), "subagent", "unlinked", { reason: "no_meta" })] })], { window: WIDE });
+  const g = buildGraph([claudeResult({ responses: rs, links: [link(agentKey("a1"), "subagent", "unlinked", { reason: "no_meta" })] })], OPT);
   const kinds = Object.fromEntries(g.chains.map((c) => [c.key.thread, c.kind]));
   assert.deepEqual(kinds, { a1: "subagent", helper: "helper", main: "main" });
   assert.equal(g.chains.find((c) => c.key.thread === "helper")?.link, null, "helper chains are not agent links");
   // a chain that only has a removed record
-  const g2 = buildGraph([claudeResult({ responses: [], excluded: [excludedRec(agentKey("zz"), 5)], streams: [] })], { window: WIDE });
+  const g2 = buildGraph([claudeResult({ responses: [], excluded: [excludedRec(agentKey("zz"), 5)], streams: [] })], OPT);
   assert.equal(g2.chains[0]?.kind, "subagent");
 });
 
@@ -878,7 +1119,7 @@ test("graph invariants hold on random scenarios", () => {
       }
       if (rand() < 0.3) exc.push(excludedRec({ provider: "claude", root_session: "s1", thread }, Math.floor(rand() * 8)));
     }
-    const g = buildGraph([claudeResult({ responses: rs, excluded: exc })], { window: { since_ms: sec(2), until_ms: sec(6) } });
+    const g = buildGraph([claudeResult({ responses: rs, excluded: exc })], { window: { since_ms: sec(2), until_ms: sec(6) }, run_start_ms: RUN });
     assert.equal(g.nodes.length, g.responses.length);
     assert.equal(g.responses.length, rs.length);
     const seen = new Set<number>();
@@ -947,7 +1188,7 @@ function scenario(): { c: ClaudeParseResult; x: CodexParseResult } {
 
 test("R4.10 shuffling responses, records, streams and parse result order does not change the graph", () => {
   const { c, x } = scenario();
-  const base = canon(buildGraph([c, x], { window: { since_ms: sec(8), until_ms: sec(200) } }));
+  const base = canon(buildGraph([c, x], { window: { since_ms: sec(8), until_ms: sec(200) }, run_start_ms: RUN }));
   const rand = rng(99);
   for (let i = 0; i < 25; i++) {
     const c2: ClaudeParseResult = {
@@ -960,13 +1201,13 @@ test("R4.10 shuffling responses, records, streams and parse result order does no
     };
     const x2: CodexParseResult = { ...x, responses: shuffled(x.responses, rand), streams: shuffled(x.streams, rand) };
     const order = rand() < 0.5 ? [c2, x2] : [x2, c2];
-    assert.equal(canon(buildGraph(order, { window: { since_ms: sec(8), until_ms: sec(200) } })), base);
+    assert.equal(canon(buildGraph(order, { window: { since_ms: sec(8), until_ms: sec(200) }, run_start_ms: RUN })), base);
   }
 });
 
 test("R4.10 splitting a chain across parse results (each half with its own file) gives the same graph", () => {
   const { c } = scenario();
-  const whole = buildGraph([c], { window: WIDE });
+  const whole = buildGraph([c], OPT);
   const rand = rng(5);
   for (let i = 0; i < 15; i++) {
     const left: ClaudeResponse[] = [];
@@ -981,7 +1222,7 @@ test("R4.10 splitting a chain across parse results (each half with its own file)
         excluded: f === 0 ? c.excluded.map((e) => ({ ...e, files: [0] })) : [],
         links: f === 0 ? [...c.links] : [],
       });
-    const split = buildGraph([mk(left, 0), mk(right, 1)], { window: WIDE });
+    const split = buildGraph([mk(left, 0), mk(right, 1)], OPT);
     assert.equal(canon(split, true), canon(whole, true));
   }
 });
@@ -990,17 +1231,51 @@ test("a thread over several files of one result and the same thread in one file 
   const rs1 = [claude({ key: "a", t: 1, files: [0] }), claude({ key: "b", t: 2, files: [1] }), claude({ key: "c", t: 3, files: [2] })];
   const multi = buildGraph(
     [claudeResult({ responses: rs1, files: [fileInfo(0, "claude"), fileInfo(1, "claude"), fileInfo(2, "claude")], streams: [mkStream(MAIN, { files: [0, 1, 2] })] })],
-    { window: WIDE },
+    OPT,
   );
   const rs2 = rs1.map((r) => ({ ...r, provenance: { files: [0], from_copy_exposed_file: false } }));
-  const single = buildGraph([claudeResult({ responses: rs2 })], { window: WIDE });
+  const single = buildGraph([claudeResult({ responses: rs2 })], OPT);
   assert.equal(canon(multi, true), canon(single, true));
   assert.equal(multi.chains.length, 1);
 });
 
 test("assumptions from the parsers are carried, deduplicated, in the spec order", () => {
-  const a = { ...claudeResult({}), assumptions: ["mtime_prefilter_on", "no_batch_assumed"] as ParseResult["assumptions"] };
-  const b = { ...codexResult({}), assumptions: ["no_batch_assumed", "unverified_version"] as ParseResult["assumptions"] };
-  const g = buildGraph([b, a], { window: WIDE });
-  assert.deepEqual(g.assumptions, ["no_batch_assumed", "unverified_version", "mtime_prefilter_on"]);
+  const a = { ...claudeResult({}), assumptions: ["codex_cached_prefix_lower_bound_only", "no_regional_surcharge_assumed"] as ParseResult["assumptions"] };
+  const b = { ...codexResult({}), assumptions: ["no_regional_surcharge_assumed", "unverified_version"] as ParseResult["assumptions"] };
+  const g = buildGraph([b, a], OPT);
+  assert.deepEqual(g.assumptions, ["no_regional_surcharge_assumed", "codex_cached_prefix_lower_bound_only", "unverified_version"]);
+});
+
+test("R0.9 integrity facts of several parse results of one provider merge, with their file indices shifted like the files", () => {
+  const a = claude({ key: "a", t: 1, session: "s1", files: [0] });
+  const b = claude({ key: "b", t: 2, session: "s2", files: [0] });
+  const fileFacts = (named: ChainKey, o: Partial<FileFacts> = {}): FileFacts => ({
+    index: 0,
+    provider: "claude",
+    mtime_ms: T0,
+    named_chains: [chainIdOf(named)],
+    unparsed_lines: 0,
+    readable: true,
+    ...o,
+  });
+  // Both results use the local file index 0, so the second one is shifted to 1. The second file is live.
+  const g = buildGraph(
+    [
+      claudeResult({ responses: [a], integrity: { files: [fileFacts(CX("s1"), { unparsed_lines: 1, mtime_ms: RUN - 5 * 86_400_000 })] } }),
+      claudeResult({ responses: [b], integrity: { files: [fileFacts(CX("s2"), { unparsed_lines: 1, mtime_ms: RUN - 1000 })] } }),
+    ],
+    OPT,
+  );
+  assert.deepEqual(g.chains.map((c) => [c.key.root_session, c.taint_reasons]), [["s1", ["unparsed_line"]]], "s1 is tainted by its old file, s2 is live and gone");
+  assert.equal(g.coverage_by_provider.claude.families_live_skipped, 1);
+  assert.equal(g.coverage_by_provider.claude.chains_total, 1);
+});
+
+test("R0.9 a parse result that carries no integrity facts asserts nothing: no taint is invented", () => {
+  const r = claude({ key: "a", t: 1 });
+  const { integrity: _omitted, ...res } = claudeResult({ responses: [r] });
+  void _omitted;
+  const g = buildGraph([res as unknown as ClaudeParseResult], OPT);
+  assert.equal(g.chains[0]?.tainted, false);
+  assert.equal(g.coverage_by_provider.claude.chains_total, 1);
 });

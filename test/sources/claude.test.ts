@@ -1,7 +1,7 @@
 // Tests for src/sources/claude.ts. All data is synthetic (test/fixtures/builder.ts). Rule ids cite docs/methodology.md.
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,7 +9,7 @@ import { after, describe, test } from "node:test";
 import { discover } from "../../src/discover.ts";
 import type { DiscoveredFile } from "../../src/discover.ts";
 import { parseClaude } from "../../src/sources/claude.ts";
-import { PHYSICAL_COVERAGE_COUNTERS, contextTokens, countsInTotals, writeTokens, cachedPrefix } from "../../src/model/types.ts";
+import { PHYSICAL_COVERAGE_COUNTERS, chainIdOf, contextTokens, countsInTotals, writeTokens, cachedPrefix } from "../../src/model/types.ts";
 import type { ClaudeParseResult, ClaudeResponse, CoverageCountField } from "../../src/model/types.ts";
 import { BASE_TIME_MS, ClaudeProject, writeFiles } from "../fixtures/builder.ts";
 import type { ClaudeRecord, GeneratedFile } from "../fixtures/builder.ts";
@@ -28,9 +28,17 @@ function tmp(): string {
   return d;
 }
 
-async function load(files: readonly GeneratedFile[]): Promise<DiscoveredFile[]> {
+/** One modification time for every file, so a split or a shuffle keeps it (R0.9 liveness, R4.10). Test-only. */
+const FIXED_MTIME_MS = BASE_TIME_MS + 30 * 86_400_000;
+
+async function load(files: readonly GeneratedFile[], mtimeMs: number | ((path: string) => number) = FIXED_MTIME_MS): Promise<DiscoveredFile[]> {
   const dir = tmp();
   writeFiles(dir, files as GeneratedFile[]);
+  for (const f of files) {
+    if (f.unavailable) continue;
+    const t = new Date(typeof mtimeMs === "function" ? mtimeMs(f.path) : mtimeMs);
+    utimesSync(join(dir, ...f.path.split("/")), t, t);
+  }
   const d = await discover({ claudeDirs: [join(dir, "projects")], codexDirs: [join(dir, "none")], env: {}, home: dir });
   return d.files;
 }
@@ -93,8 +101,18 @@ function canon(r: ClaudeParseResult, o: { physical?: boolean; provenance?: boole
     compact_boundaries: r.compact_boundaries,
     prefix_hints: r.prefix_hints,
     cost_state: r.cost_state,
+    integrity: { chains: r.integrity.chains, family_groups: r.integrity.family_groups, triggers: r.integrity.triggers, files: o.physical ? r.integrity.files : [] },
   });
 }
+
+/** The reasons (and what they name) of a result's triggers, as a plain sorted list for assertions. */
+function trig(res: ClaudeParseResult): Array<[string, string[] | "provider"]> {
+  return res.integrity.triggers.map((t) => [t.reason, t.names === "provider" ? "provider" : [...t.names]]);
+}
+function triggersOf(res: ClaudeParseResult, reason: string): Array<string[] | "provider"> {
+  return trig(res).filter((t) => t[0] === reason).map((t) => t[1]);
+}
+const cid = (session: string, thread = "main"): string => chainIdOf({ provider: "claude", root_session: session, thread });
 
 /** Compare two canonical strings; on mismatch report where they first differ. */
 function same(actual: string, expected: string, msg: string): void {
@@ -165,7 +183,7 @@ describe("usage normalization (R2.1, R2.2, R2.3, R2.5)", () => {
     assert.equal(r.exclusion, null, "kept: excluded from detection later, not from accounting");
   });
 
-  test("no final copy: output unknown with lower bound max(o), speed assumed (R2.3, R3.4)", async () => {
+  test("no final copy: output unknown with lower bound max(o), nothing assumed (R2.3, R3.12)", async () => {
     const res = await run(
       sessionProject((s) => {
         s.main.request({ requestId: "r1", finalSpeed: null, usage: { output: 50 }, blocks: [{ type: "text" }, { type: "text" }, { type: "text" }], partialOutputs: [3, 70] });
@@ -174,12 +192,15 @@ describe("usage normalization (R2.1, R2.2, R2.3, R2.5)", () => {
     const r = one(res, "r1");
     assert.equal(usageOf(r).output, null);
     assert.equal(usageOf(r).output_lower_bound, 70n);
-    assert.deepEqual(r.flags, ["output_unknown", "speed_assumed"]);
-    assert.equal(r.modifiers.speed, null);
+    assert.deepEqual(r.flags, ["output_unknown", "no_final_copy"]);
+    // R3.12 / R4.2: speed, geo and tier are read from the final copy only, so with no final copy all three stay null
+    // (partial copies carry geo and tier in the builder, and none of them is used).
+    assert.deepEqual(r.modifiers, { speed: null, inference_geo: null, service_tier: null });
     assert.equal(r.stop_reason, null);
     assert.equal(res.coverage.output_unknown_requests, 1);
-    assert.equal(res.coverage.responses_speed_assumed, 1);
     assert.equal(res.coverage.requests_with_final_marker, 0);
+    // R0.9: no final copy is no anomaly. The response yields tokens and is unpriced by R3.12, not tainted.
+    assert.deepEqual(triggersOf(res, "request_anomaly"), []);
   });
 
   test("final copy first in the file gives the same result as last (R4.3)", async () => {
@@ -406,7 +427,9 @@ describe("more copy-selection edge cases", () => {
     assert.equal(one(res, "r1").exclusion, "conflict_input");
     assert.deepEqual(res.conflicts.map((c) => c.kind).sort(), ["conflict_input", "conflict_model"]);
     assert.equal(res.coverage.responses_total, 1);
-    assert.equal(res.coverage.requests_conflict, 2, "counted per kind; the by-kind counts sum to the total");
+    assert.equal(res.coverage.requests_conflict, 1, "R17.1: one per request, not one per code");
+    assert.equal(res.coverage.requests_conflict_by_kind.conflict_input, 1);
+    assert.equal(res.coverage.requests_conflict_by_kind.conflict_model, 1, "the by-kind counts keep one per code");
   });
 
   test("a usage copy without a parseable timestamp makes the request incomplete (no position, no event time)", async () => {
@@ -419,20 +442,38 @@ describe("more copy-selection edge cases", () => {
     assert.equal(res.coverage.records_usage_unmappable, 1);
   });
 
-  test("copies of one key in a supported and an unverified version: only supported copies are used (R15.7)", async () => {
+  test("copies of one key in a supported and an unverified version: the key is unverified and not accounted (R15.7, R0.9)", async () => {
     const p = new ClaudeProject();
     const s = p.session({ sessionId: "synthetic-session-t", version: V });
+    s.main.request({ requestId: "ok", usage: { cacheRead: 5, output: 40 } });
     const a = s.main.request({ requestId: "r1", usage: { cacheRead: 5, output: 40 }, blocks: [{ type: "text" }, { type: "text" }] });
     (a.records[0] as ClaudeRecord).version = "2.1.290";
-    msg(a.records[0] as ClaudeRecord).usage.cache_read_input_tokens = 999; // would be a conflict if it were read
+    msg(a.records[0] as ClaudeRecord).usage.cache_read_input_tokens = 999; // never compared: the key is not analyzed
     const res = await parseClaude(await load(p.files()));
-    const r = one(res, "r1");
-    assert.equal(r.exclusion, null);
-    assert.equal(usageOf(r).cache_read, 5n);
-    assert.equal(r.copies, 1);
-    assert.equal(res.coverage.requests_unverified_version, 1, "the key also has an unverified copy");
-    assert.equal(res.coverage.requests_total, 1);
-    assert.equal(res.excluded.length, 0);
+    assert.deepEqual(res.responses.map((r) => r.key), ["ok"], "R15.7: a key is supported iff every copy of it is");
+    assert.equal(res.coverage.requests_unverified_version, 1, "distinct keys, counted without selecting copies");
+    assert.equal(res.coverage.lines_unverified_version, 1, "records whose version lacks full support");
+    assert.equal(res.coverage.requests_total, 2);
+    assert.equal(res.coverage.responses_total, 1);
+    assert.equal(res.coverage.requests_conflict, 0, "no copy selection happens for an unverified key");
+    assert.deepEqual(res.excluded.map((e) => e.reason), ["unverified_version"]);
+    // R0.9 version_unverified names the chain that holds a copy.
+    assert.deepEqual(triggersOf(res, "version_unverified"), [[cid("synthetic-session-t")]]);
+    // The chain is still read structurally.
+    assert.deepEqual(res.integrity.chains, [cid("synthetic-session-t")]);
+  });
+
+  test("a key held by a supported and an unverified copy in two chains taints both chains (R15.7, R0.9 link iii)", async () => {
+    const T0 = Date.UTC(2026, 0, 1);
+    const p = new ClaudeProject();
+    const a = p.session({ sessionId: "synthetic-session-a", version: V, startMs: T0 });
+    const ra = a.main.request({ requestId: "shared", usage: { input: 5, write5m: 100, output: 10 } });
+    const b = p.session({ sessionId: "synthetic-session-b", version: V, startMs: T0 + 3_600_000 });
+    b.main.replay(ra.records.map((r) => ({ ...structuredClone(r), sessionId: "synthetic-session-b", version: "2.1.290" })));
+    const res = await parseClaude(await load(p.files()));
+    assert.equal(res.responses.length, 0);
+    assert.deepEqual(triggersOf(res, "version_unverified"), [[cid("synthetic-session-a"), cid("synthetic-session-b")]]);
+    assert.deepEqual(res.integrity.family_groups, [[cid("synthetic-session-a"), cid("synthetic-session-b")]]);
   });
 
   test("a stop_reason of null on the final copy is reported as null, an unknown one as other (R1.2)", async () => {
@@ -886,27 +927,30 @@ describe("parse failures and line shapes (R1.3, R1.4)", () => {
 });
 
 // ---------------------------------------------------------------------------
-describe("window and prefilter (R5.9, R5.10)", () => {
-  test("the parser loads everything; baseline requests are counted, never dropped", async () => {
+describe("every file is read (R5.9, R5.10)", () => {
+  test("the parser loads everything, whatever the event time: nothing is dropped by the parser", async () => {
     const files = sessionProject((s) => {
       s.main.request({ requestId: "old", dtMs: 1000 });
       s.main.request({ requestId: "new", dtMs: 86_400_000 });
     });
-    const res = await run(files, { window: { since_ms: BASE_TIME_MS + 3_600_000, until_ms: BASE_TIME_MS + 10 * 86_400_000 } });
+    const res = await run(files);
     assert.equal(res.responses.length, 2);
-    assert.equal(res.coverage.baseline_requests_loaded, 1);
-    assert.ok(!res.assumptions.includes("mtime_prefilter_on"));
+    assert.ok(!(res.assumptions as string[]).includes("mtime_prefilter_on"));
   });
 
-  test("--fast skips old files by mtime and prints the assumption", async () => {
-    const files = await load(sessionProject((s) => void s.main.request({ requestId: "a" })));
-    const old = files.map((f) => ({ ...f, mtimeMs: 1000 }));
-    const since = Date.now();
-    const res = await parseClaude(old, { fastPrefilter: true, window: { since_ms: since, until_ms: since + 1 } });
-    assert.equal(res.responses.length, 0);
-    assert.ok(res.assumptions.includes("mtime_prefilter_on"));
-    const res2 = await parseClaude(old, { window: { since_ms: since, until_ms: since + 1 } });
-    assert.equal(res2.responses.length, 1, "without --fast the mtime never matters");
+  test("no prefilter exists: an old file is read and accounted, the modification time only travels in FileFacts (R5.9, R0.9)", async () => {
+    const gen = sessionProject((s) => void s.main.request({ requestId: "a" }));
+    const old = await parseClaude(await load(gen, 1000));
+    const fresh = await parseClaude(await load(gen, Date.now()));
+    assert.equal(old.responses.length, 1, "a file of 1970 is read");
+    assert.ok(!(old.assumptions as string[]).includes("mtime_prefilter_on"), "no mtime_prefilter_on assumption exists any more");
+    assert.equal(canon(old), canon(fresh), "the modification time changes no accounting");
+    assert.deepEqual(old.integrity.files.map((f) => f.mtime_ms), [1000]);
+    assert.deepEqual(old.files.map((f) => f.mtime_ms), [1000]);
+    // The options bag is empty: a window or a fast flag is not a parser concept.
+    const files = await load(gen, 1000);
+    const viaOpts = await parseClaude(files, { fastPrefilter: true, window: { since_ms: Date.now(), until_ms: Date.now() + 1 } } as never);
+    assert.equal(viaOpts.responses.length, 1, "unknown options are ignored: every file is read");
   });
 });
 
@@ -1125,6 +1169,16 @@ describe("metamorphic: order, duplication, splitting, re-serialization (R4.10, R
     assert.equal(res.coverage.links_verified, 1);
     assert.equal(res.coverage.links_directory_only, 1);
     assert.equal(res.coverage.links_unlinked, 1);
+    // R0.9: the scenario carries a version_unverified and a request_anomaly trigger (unkeyed, bucket_mismatch), one
+    // family (one session) and a parse error that belongs to the main file.
+    const main = cid("synthetic-session-big");
+    assert.deepEqual(trig(res), [
+      ["request_anomaly", [main]],
+      ["version_unverified", [main]],
+    ]);
+    assert.equal(res.integrity.family_groups.length, 1);
+    assert.deepEqual(res.integrity.family_groups[0], res.integrity.chains);
+    assert.equal(res.integrity.files.reduce((n, f) => n + f.unparsed_lines, 0), 1);
   });
 
   test("shuffling the order of files does not change anything", async () => {
@@ -1205,6 +1259,11 @@ describe("metamorphic: order, duplication, splitting, re-serialization (R4.10, R
           const want = (base.coverage[f] as number) + (exp[f as CoverageCountField] ?? 0);
           assert.equal(res.coverage[f], want, `line ${i} x${k}: ${String(f)}`);
         }
+        // R0.9 / R1.3: the triggers and the partition are logical (canon above). Only the unparsed lines of the
+        // file facts grow, and only when the duplicated line is the one that does not parse.
+        const sumUnparsed = (r: ClaudeParseResult): number => r.integrity.files.reduce((n, f) => n + f.unparsed_lines, 0);
+        assert.equal(sumUnparsed(res), sumUnparsed(base) + (parsed === null ? k : 0), `line ${i} x${k}: unparsed_lines`);
+        assert.deepEqual(res.integrity.files.map((f) => f.named_chains), base.integrity.files.map((f) => f.named_chains), `line ${i} x${k}: named chains`);
       }
     }
   });
@@ -1219,10 +1278,21 @@ describe("metamorphic: order, duplication, splitting, re-serialization (R4.10, R
       const second: GeneratedFile = { path: main.path.replace("projects/synthetic-project/", "projects/synthetic-project-b/"), content: lines.slice(cut).join("\n") + "\n" };
       const files = [...gen.map((f) => (f === main ? { ...f, content: lines.slice(0, cut).join("\n") + "\n" } : f)), second];
       const res = await run(files);
-      assert.equal(canon(res), baseLogical, `cut ${cut}`);
+      assert.equal(canon(res), baseLogical, `cut ${cut}: chains, triggers and the family partition are record-set facts (R0.9)`);
       assert.equal(res.coverage.files_total, base.coverage.files_total + 1);
       assert.equal(res.coverage.lines_total, base.coverage.lines_total);
       assert.equal(res.coverage.lines_duplicate_collapsed, base.coverage.lines_duplicate_collapsed);
+      // R4.10 op 5: the halves keep the modification time, together they name what the file named, and the unparsed
+      // lines of the file are split between them (the line is not lost).
+      const mains = res.files.filter((f) => f.source_kind === "claude-main");
+      assert.equal(mains.length, 2, `cut ${cut}`);
+      const baseMain = base.integrity.files.find((f) => f.named_chains.length > 0 && f.unparsed_lines > 0) as (typeof base.integrity.files)[number];
+      const halves = mains.map((m) => res.integrity.files.find((f) => f.index === m.index));
+      assert.ok(halves.every((h) => h?.mtime_ms === FIXED_MTIME_MS));
+      assert.equal(halves.reduce((n, h) => n + (h?.unparsed_lines ?? 0), 0), baseMain.unparsed_lines);
+      const union = new Set(halves.flatMap((h) => h?.named_chains ?? []));
+      assert.deepEqual([...union].sort(), [...baseMain.named_chains].sort(), `cut ${cut}: only the files of the chains change`);
+      for (const h of halves) for (const n of h?.named_chains ?? []) assert.ok(baseMain.named_chains.includes(n));
     }
   });
 
@@ -1286,5 +1356,522 @@ describe("metamorphic: order, duplication, splitting, re-serialization (R4.10, R
   test("the whole result is a pure function of the files (two runs, byte equal)", async () => {
     const files = await load(bigScenario());
     assert.equal(canon(await parseClaude(files), { physical: true, provenance: true }), canon(await parseClaude(files), { physical: true, provenance: true }));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Integrity facts (R0.9, R4.11, R15.7). The parser only reports chains, family groups, triggers and file facts;
+// the taint itself is computed by the graph. Everything below is synthetic.
+// ---------------------------------------------------------------------------
+describe("integrity facts: identity and unattributed records (R4.11, R0.9)", () => {
+  const SESSION = "synthetic-session-t";
+
+  test("identity is read per record: a file whose records name another session is that session's chain, not the path's", async () => {
+    const files = mapContent(
+      sessionProject((s) => void s.main.request({ requestId: "a" })),
+      `${SESSION}.jsonl`,
+      (t) => t.replaceAll(`"sessionId":"${SESSION}"`, '"sessionId":"synthetic-session-moved"'),
+    );
+    const res = await run(files);
+    assert.deepEqual(res.responses.map((r) => r.chain.root_session), ["synthetic-session-moved"]);
+    assert.deepEqual(res.integrity.chains, [cid("synthetic-session-moved")]);
+    const f = res.integrity.files.find((x) => x.named_chains.length > 0);
+    assert.deepEqual(f?.named_chains, [cid("synthetic-session-moved")], "R0.9 named chains come from the records, never from the path");
+  });
+
+  test("a record without a string sessionId gives a provider trigger and contributes nothing; the chain does not come from the path", async () => {
+    for (const variant of ["missing", "number", "empty"] as const) {
+      const p = new ClaudeProject();
+      const s = p.session({ sessionId: SESSION, version: V });
+      const lost = s.main.request({ requestId: "lost", usage: { input: 11, cacheRead: 22, write5m: 33, output: 44 } });
+      s.main.request({ requestId: "kept", usage: { input: 1, cacheRead: 2, write5m: 3, output: 4 } });
+      for (const r of lost.records) {
+        if (variant === "missing") delete r.sessionId;
+        else if (variant === "number") r.sessionId = 42;
+        else r.sessionId = "";
+      }
+      const res = await parseClaude(await load(p.files()));
+      assert.deepEqual(res.responses.map((r) => r.key), ["kept"], variant);
+      assert.deepEqual(trig(res), [["unattributed_record", "provider"]], variant);
+      assert.equal(res.coverage.responses_total, 1, variant);
+      assert.equal(res.coverage.requests_total, 1, variant);
+      assert.deepEqual(res.integrity.chains, [cid(SESSION)], variant);
+    }
+  });
+
+  test("every record type that carries a chain key counts: user, system and attachment without a sessionId are unattributed too", async () => {
+    for (const make of ["user", "attachment", "compact"] as const) {
+      const p = new ClaudeProject();
+      const s = p.session({ sessionId: SESSION, version: V });
+      s.main.request({ requestId: "a" });
+      if (make === "user") s.main.user();
+      else if (make === "attachment") s.main.attachment();
+      else s.main.compactBoundary({ trigger: "manual", preTokens: 10, postTokens: 5 });
+      const last = s.main.records[s.main.records.length - 1] as ClaudeRecord;
+      delete last.sessionId;
+      const res = await parseClaude(await load(p.files()));
+      assert.deepEqual(trig(res), [["unattributed_record", "provider"]], make);
+      assert.equal(res.responses.length, 1, make);
+      assert.equal(res.compact_boundaries.length, 0, `${make}: the record joins no uuid index`);
+    }
+  });
+
+  test("a record of an unlisted type, a bare number and a cost-state record without a sessionId are no trigger (R0.9 lists four types)", async () => {
+    const files = mapContent(
+      sessionProject((s) => void s.main.request({ requestId: "a" })),
+      `${SESSION}.jsonl`,
+      (t) => `${t}{"type":"summary","uuid":"synthetic-leaf"}\n42\n{"type":"cost-state","timestamp":"2026-01-01T00:00:00.000Z","modelUsage":{}}\n`,
+    );
+    const res = await run(files);
+    assert.deepEqual(trig(res), []);
+    assert.equal(res.responses.length, 1);
+  });
+
+  test("an agent record without agentId is a record of the session's main chain: no fallback to the file name (R4.11)", async () => {
+    const p = new ClaudeProject();
+    const s = p.session({ sessionId: SESSION, version: V });
+    s.main.request({ requestId: "m1" });
+    const { agent } = s.spawnAgent({ agentId: "synthetic-agent-x", spawnDepth: 1 });
+    const a1 = agent.thread.request({ requestId: "x1" });
+    for (const r of a1.records) delete r.agentId;
+    const res = await parseClaude(await load(p.files()));
+    assert.equal(one(res, "x1").chain.thread, "main");
+    assert.equal(res.links.find((l) => l.chain.thread === "synthetic-agent-x"), undefined, "no agent chain exists, so no link is made up from the path");
+    assert.deepEqual(res.integrity.chains, [cid(SESSION)]);
+  });
+});
+
+describe("integrity facts: request anomalies name every chain with a copy (R0.9 request_anomaly, R4.2, R2.12, R2.15, R2.1, R2.13)", () => {
+  const SESSION = "synthetic-session-t";
+  const only = [[cid(SESSION)]];
+
+  async function one1(build: (s: ReturnType<ClaudeProject["session"]>) => void): Promise<ClaudeParseResult> {
+    const p = new ClaudeProject();
+    const s = p.session({ sessionId: SESSION, version: V });
+    s.main.request({ requestId: "clean", usage: { input: 1, cacheRead: 2, write5m: 3, output: 4 } });
+    build(s);
+    return parseClaude(await load(p.files()));
+  }
+  const two = { blocks: [{ type: "text" }, { type: "text" }] } as const;
+
+  test("key_conflict taints and excludes", async () => {
+    const res = await one1((s) => {
+      s.main.request({ requestId: "k1", messageId: "m1" });
+      s.main.request({ requestId: "k1", messageId: "m2" });
+    });
+    assert.equal(one(res, "k1").exclusion, "key_conflict");
+    assert.deepEqual(triggersOf(res, "request_anomaly"), only);
+  });
+
+  test("conflict_input taints and excludes", async () => {
+    const res = await one1((s) => {
+      const a = s.main.request({ requestId: "r1", ...two });
+      msg(a.records[0] as ClaudeRecord).usage.cache_read_input_tokens = 7;
+    });
+    assert.equal(one(res, "r1").exclusion, "conflict_input");
+    assert.deepEqual(triggersOf(res, "request_anomaly"), only);
+  });
+
+  test("conflict_model taints and excludes", async () => {
+    const res = await one1((s) => {
+      const a = s.main.request({ requestId: "r1", ...two });
+      msg(a.records[0] as ClaudeRecord).model = "claude-opus-5-5";
+    });
+    assert.equal(one(res, "r1").exclusion, "conflict_model");
+    assert.deepEqual(triggersOf(res, "request_anomaly"), only);
+  });
+
+  test("conflict_output taints, tokens are kept and the output is unknown (R4.2)", async () => {
+    const res = await one1((s) => {
+      const a = s.main.request({ requestId: "r1", usage: { output: 90, cacheRead: 5 }, ...two });
+      msg(a.records[0] as ClaudeRecord).usage.speed = "standard";
+    });
+    const r = one(res, "r1");
+    assert.equal(r.exclusion, null);
+    assert.equal(usageOf(r).output, null);
+    assert.equal(usageOf(r).cache_read, 5n);
+    assert.deepEqual(triggersOf(res, "request_anomaly"), only);
+  });
+
+  test("conflict_iterations taints, tokens are kept and the output is unknown (R4.2)", async () => {
+    const res = await one1((s) => {
+      const a = s.main.request({ requestId: "r1", usage: { input: 4, iterations: true, output: 33 } });
+      msg(a.records[0] as ClaudeRecord).usage.iterations[0].input_tokens = 5;
+    });
+    const r = one(res, "r1");
+    assert.equal(r.exclusion, null);
+    assert.equal(usageOf(r).output, null);
+    assert.deepEqual(triggersOf(res, "request_anomaly"), only);
+  });
+
+  test("conflict_modifier taints, tokens are kept (R4.2, R3.12 fixture 3)", async () => {
+    const res = await one1((s) => {
+      // the final copy carries geo not_available, a partial copy carries us
+      const a = s.main.request({ requestId: "r1", usage: { inferenceGeo: "not_available" }, ...two });
+      msg(a.records[0] as ClaudeRecord).usage.inference_geo = "us";
+    });
+    const r = one(res, "r1");
+    assert.equal(r.exclusion, null);
+    assert.ok(r.flags.includes("conflict_modifier"));
+    assert.deepEqual(triggersOf(res, "request_anomaly"), only);
+  });
+
+  test("two final copies, one with inference_geo and one without, is conflict_modifier (orchestrator answer 4)", async () => {
+    const res = await one1((s) => {
+      const a = s.main.request({ requestId: "r1", usage: { inferenceGeo: "us" }, ...two });
+      const first = msg(a.records[0] as ClaudeRecord).usage;
+      first.speed = "standard";
+      delete first.inference_geo;
+    });
+    const r = one(res, "r1");
+    assert.ok(r.flags.includes("conflict_modifier"));
+    assert.equal(r.modifiers.inference_geo, null);
+    assert.equal(r.exclusion, null);
+    assert.deepEqual(triggersOf(res, "request_anomaly"), only);
+  });
+
+  test("a final copy that lacks inference_geo and service_tier leaves both null, never defaulted", async () => {
+    const res = await one1((s) => {
+      const a = s.main.request({ requestId: "r1" });
+      const u = msg(a.records[0] as ClaudeRecord).usage;
+      delete u.inference_geo;
+      delete u.service_tier;
+    });
+    const r = one(res, "r1");
+    assert.equal(r.modifiers.speed, "standard");
+    assert.equal(r.modifiers.inference_geo, null);
+    assert.equal(r.modifiers.service_tier, null);
+    assert.ok(!r.flags.includes("no_final_copy"));
+  });
+
+  test("an unkeyed assistant record without usage still taints its chain, records_unkeyed counts usage only (orchestrator answer 1)", async () => {
+    const res = await one1((s) => {
+      const a = s.main.request({ requestId: "x" });
+      const rec = a.records[0] as ClaudeRecord;
+      delete rec.requestId;
+      delete msg(rec).usage;
+    });
+    assert.equal(res.coverage.records_unkeyed, 0);
+    assert.deepEqual(triggersOf(res, "request_anomaly"), only);
+  });
+
+  test("usage_incomplete taints and excludes, the present fields are reported (R2.12)", async () => {
+    const res = await one1((s) => {
+      const a = s.main.request({ requestId: "r1", usage: { input: 7 } });
+      delete msg(a.records[0] as ClaudeRecord).usage.cache_creation_input_tokens;
+    });
+    assert.equal(one(res, "r1").exclusion, "usage_incomplete");
+    assert.ok(res.coverage.tokens_in_incomplete_responses > 0n);
+    assert.deepEqual(triggersOf(res, "request_anomaly"), only);
+  });
+
+  test("usage_range_failed taints and excludes (R2.15)", async () => {
+    const res = await one1((s) => void s.main.request({ requestId: "r1", usage: { input: -1 } }));
+    assert.equal(one(res, "r1").exclusion, "usage_range_failed");
+    assert.deepEqual(triggersOf(res, "request_anomaly"), only);
+  });
+
+  test("bucket_mismatch taints, the bucket sum is used (R2.1)", async () => {
+    const res = await one1((s) => void s.main.request({ requestId: "r1", usage: { write1h: 1796, writeTotal: 0, cacheRead: 4500 } }));
+    const r = one(res, "r1");
+    assert.equal(r.exclusion, null);
+    assert.equal(usageOf(r).cache_write_1h, 1796n);
+    assert.deepEqual(triggersOf(res, "request_anomaly"), only);
+  });
+
+  test("an unkeyed record with a string sessionId taints its chain (R2.13)", async () => {
+    const res = await one1((s) => {
+      const a = s.main.request({ requestId: "x" });
+      delete (a.records[0] as ClaudeRecord).requestId;
+    });
+    assert.equal(res.coverage.records_unkeyed, 1);
+    assert.deepEqual(triggersOf(res, "request_anomaly"), only);
+  });
+
+  test("an unkeyed record of an unverified version taints its chain too (the chain is known, R2.13), counted nowhere else", async () => {
+    const res = await one1((s) => {
+      const a = s.main.request({ requestId: "x" });
+      delete (a.records[0] as ClaudeRecord).requestId;
+      (a.records[0] as ClaudeRecord).version = "2.1.290";
+    });
+    assert.equal(res.coverage.records_unkeyed, 0, "an unverified record adds nothing to a counter other than the version ones");
+    assert.deepEqual(triggersOf(res, "request_anomaly"), only);
+  });
+
+  test("not anomalies: conflict_diagnostics, no final copy and an api error record (R0.9 excludes conflict_diagnostics)", async () => {
+    const res = await one1((s) => {
+      const c = s.main.request({ requestId: "d3", diagnostics: { type: "tools_changed" }, ...two });
+      msg(c.records[0] as ClaudeRecord).diagnostics = { cache_miss_reason: { type: "messages_changed" } };
+      s.main.request({ requestId: "nf", finalSpeed: null, partialOutputs: [3, 70], blocks: [{ type: "text" }, { type: "text" }] });
+      s.main.request({ requestId: "err", apiError: true });
+    });
+    assert.ok(one(res, "d3").flags.includes("conflict_diagnostics"));
+    assert.ok(one(res, "nf").flags.includes("no_final_copy"));
+    assert.deepEqual(trig(res), []);
+  });
+
+  test("a replayed request with a conflict names every chain that holds a copy, and links the chains (R0.9 link iii)", async () => {
+    const T0 = Date.UTC(2026, 0, 1);
+    const p = new ClaudeProject();
+    const a = p.session({ sessionId: "synthetic-session-a", version: V, startMs: T0 });
+    const ra = a.main.request({ requestId: "shared", usage: { input: 5, write5m: 100, output: 10 }, ...two });
+    const b = p.session({ sessionId: "synthetic-session-b", version: V, startMs: T0 + 3_600_000 });
+    const clones = ra.records.map((r) => ({ ...structuredClone(r), sessionId: "synthetic-session-b" }));
+    msg(clones[0] as ClaudeRecord).usage.cache_read_input_tokens = 999;
+    b.main.replay(clones);
+    const c = p.session({ sessionId: "synthetic-session-c", version: V, startMs: T0 + 7_200_000 });
+    c.main.request({ requestId: "alone" });
+    const res = await parseClaude(await load(p.files()));
+    assert.ok(byKey(res, "shared").every((r) => r.exclusion === "conflict_input"), "all copies of a key are compared across chains (R4.2)");
+    assert.deepEqual(triggersOf(res, "request_anomaly"), [[cid("synthetic-session-a"), cid("synthetic-session-b")]]);
+    // Links (i) and (iii): a and b are one group through the shared key, c is alone and is in no group.
+    assert.deepEqual(res.integrity.family_groups, [[cid("synthetic-session-a"), cid("synthetic-session-b")]]);
+    assert.deepEqual(res.integrity.chains, [cid("synthetic-session-a"), cid("synthetic-session-b"), cid("synthetic-session-c")]);
+  });
+
+  test("an ownership tie names every chain that holds a copy (R4.6, R0.9 ownership_ambiguous)", async () => {
+    const T0 = Date.UTC(2026, 0, 1);
+    const p = new ClaudeProject();
+    const a = p.session({ sessionId: "synthetic-session-a", version: V, startMs: T0 });
+    a.main.user();
+    a.main.request({ requestId: "ra1", usage: { input: 5, write5m: 10000 } });
+    const b = p.session({ sessionId: "synthetic-session-0", version: V, startMs: T0 + 3_600_000 });
+    b.main.replay(a.main.records);
+    const res = await parseClaude(await load(p.files()));
+    assert.equal(res.coverage.replay_ownership_ambiguous, 1);
+    assert.deepEqual(triggersOf(res, "ownership_ambiguous"), [[cid("synthetic-session-0"), cid("synthetic-session-a")]]);
+    assert.deepEqual(triggersOf(res, "request_anomaly"), [], "an ownership tie is not a request anomaly");
+  });
+
+  test("a clean replay (owner is not a tie) gives no trigger, only the family link", async () => {
+    const T0 = Date.UTC(2026, 0, 1);
+    const p = new ClaudeProject();
+    const a = p.session({ sessionId: "synthetic-session-a", version: V, startMs: T0 });
+    a.main.user();
+    a.main.request({ requestId: "ra1", usage: { input: 5, write5m: 10000 } });
+    const b = p.session({ sessionId: "synthetic-session-b", version: V, startMs: T0 + 3_600_000 });
+    b.main.replay(a.main.records.slice(1));
+    const res = await parseClaude(await load(p.files()));
+    assert.deepEqual(trig(res), []);
+    assert.deepEqual(res.integrity.family_groups, [[cid("synthetic-session-a"), cid("synthetic-session-b")]]);
+  });
+});
+
+describe("integrity facts: versions, families and the R0.9 fixture (2) at parser level (R15.7)", () => {
+  const SESSION = "synthetic-session-t";
+
+  test("R0.9 fixture (2): 2.1.293, an unlisted version, 2.1.293 again in one main chain", async () => {
+    const p = new ClaudeProject();
+    const s = p.session({ sessionId: SESSION, version: V });
+    s.main.request({ requestId: "before", usage: { input: 5, cacheRead: 100, write5m: 10, output: 7 } });
+    s.main.request({ requestId: "unlisted", version: "2.1.299", usage: { input: 9, cacheRead: 9, write5m: 9, output: 9 } });
+    s.main.request({ requestId: "after", usage: { input: 6, cacheRead: 200, write5m: 20, output: 8 } });
+    const res = await parseClaude(await load(p.files()));
+    assert.deepEqual(res.responses.map((r) => r.key), ["after", "before"], "the supported keys are accounted");
+    assert.ok(res.responses.every((r) => r.exclusion === null));
+    assert.equal(res.coverage.requests_unverified_version, 1);
+    assert.deepEqual(trig(res), [["version_unverified", [cid(SESSION)]]]);
+  });
+
+  test("a session with two agents: the sessionId groups all chains (link i), a lone session is in no group", async () => {
+    const p = new ClaudeProject();
+    const s = p.session({ sessionId: SESSION, version: V });
+    s.main.request({ requestId: "m1" });
+    s.spawnAgent({ agentId: "synthetic-agent-a", spawnDepth: 1 }).agent.thread.request({ requestId: "a1" });
+    s.spawnAgent({ agentId: "synthetic-agent-b", spawnDepth: 1 }).agent.thread.request({ requestId: "b1" });
+    const o = p.session({ sessionId: "synthetic-session-other", version: V });
+    o.main.request({ requestId: "o1" });
+    const res = await parseClaude(await load(p.files()));
+    assert.deepEqual(res.integrity.family_groups, [[cid(SESSION), cid(SESSION, "synthetic-agent-a"), cid(SESSION, "synthetic-agent-b")]]);
+    assert.deepEqual(res.integrity.chains.length, 4);
+    assert.deepEqual(trig(res), []);
+  });
+
+  test("an unverified chain is a chain for the family relation, and its request is never accounted (R15.7)", async () => {
+    const p = new ClaudeProject();
+    const s = p.session({ sessionId: SESSION, version: V });
+    s.main.request({ requestId: "m1" });
+    const { agent } = s.spawnAgent({ agentId: "synthetic-agent-old", spawnDepth: 1 });
+    agent.thread.request({ requestId: "old-1", version: "2.1.290" });
+    const res = await parseClaude(await load(p.files()));
+    assert.ok(res.responses.some((r) => r.key === "m1"));
+    assert.ok(!res.responses.some((r) => r.key === "old-1"), "the request of an unverified version adds nothing");
+    assert.ok(res.integrity.chains.includes(cid(SESSION, "synthetic-agent-old")));
+    assert.deepEqual(triggersOf(res, "version_unverified"), [[cid(SESSION, "synthetic-agent-old")]]);
+  });
+});
+
+describe("integrity facts: file facts (R0.9, R1.3, R17.1)", () => {
+  const SESSION = "synthetic-session-t";
+  const MAIN = `${SESSION}.jsonl`;
+
+  test("a parse error line, a truncated tail and an unreadable file: unparsed_lines, readable and the provider trigger", async () => {
+    const withErr = mapContent(
+      sessionProject((s) => void s.main.request({ requestId: "a" })),
+      MAIN,
+      (t) => {
+        const lines = t.trimEnd().split("\n");
+        lines.splice(1, 0, "{not json");
+        return `${lines.join("\n")}\n{"type":"assistant","mess`;
+      },
+    );
+    const files = await load(withErr, 12_345);
+    const res = await parseClaude(files);
+    const f = res.integrity.files.find((x) => x.named_chains.length > 0) as (typeof res.integrity.files)[number];
+    assert.equal(f.unparsed_lines, 2, "one parse error plus the truncated tail");
+    assert.equal(f.mtime_ms, 12_345);
+    assert.equal(f.readable, true);
+    assert.equal(f.provider, "claude");
+    assert.equal(res.coverage.lines_parse_error + res.coverage.lines_truncated_tail, 2);
+    assert.deepEqual(trig(res), [], "unparsed_line is derived by the graph from the file facts, so it is no trigger here");
+    assert.deepEqual(f.named_chains, [cid(SESSION)]);
+
+    const ghost: DiscoveredFile = { ...(files[0] as DiscoveredFile), path: join(tmp(), "missing.jsonl"), relPath: "zz/missing.jsonl", mtimeMs: 7 };
+    const res2 = await parseClaude([...files, ghost]);
+    assert.deepEqual(trig(res2), [["file_unreadable", "provider"]]);
+    const g = res2.integrity.files.find((x) => x.mtime_ms === 7) as (typeof res2.integrity.files)[number];
+    assert.equal(g.readable, false);
+    assert.deepEqual(g.named_chains, []);
+    assert.equal(g.index, res2.files.find((x) => x.mtime_ms === 7)?.index, "FileFacts.index is FileInfo.index");
+  });
+
+  test("a sidecar that fails to parse has one unparsed line and names no chain, so it taints the provider by the graph (conservative)", async () => {
+    const p = new ClaudeProject();
+    const s = p.session({ sessionId: SESSION, version: V });
+    s.main.request({ requestId: "m1" });
+    const { agent } = s.spawnAgent({ agentId: "synthetic-agent-a", spawnDepth: 1 });
+    agent.thread.request({ requestId: "a1" });
+    const good = await parseClaude(await load(p.files()));
+    const broken = mapContent(p.files(), "agent-synthetic-agent-a.meta.json", () => "{ not json CANARY_zzzz");
+    const res = await parseClaude(await load(broken));
+    const metaFacts = res.integrity.files.filter((f) => f.unparsed_lines === 1 && f.named_chains.length === 0);
+    assert.equal(metaFacts.length, 1);
+    assert.equal(res.coverage.lines_parse_error, 1);
+    assert.equal(good.integrity.files.filter((f) => f.unparsed_lines > 0).length, 0);
+    assert.equal(res.links.find((l) => l.chain.thread === "synthetic-agent-a")?.reason, "no_meta");
+    assert.ok(!jsonStr(res).includes("CANARY"));
+  });
+
+  test("sidecar readability: an empty sidecar is unreadable, a line-duplicated one-line sidecar is readable, a broken duplicate is not", async () => {
+    const p = new ClaudeProject();
+    const s = p.session({ sessionId: SESSION, version: V });
+    s.main.request({ requestId: "m1" });
+    const { agent } = s.spawnAgent({ agentId: "synthetic-agent-a", spawnDepth: 1 });
+    agent.thread.request({ requestId: "a1" });
+    const unparsedOf = async (fn: (t: string) => string): Promise<number> => {
+      const res = await parseClaude(await load(mapContent(p.files(), "agent-synthetic-agent-a.meta.json", fn)));
+      return res.integrity.files.filter((f) => f.unparsed_lines > 0 && f.named_chains.length === 0).length;
+    };
+    assert.equal(await unparsedOf((t) => t), 0, "the untouched sidecar");
+    assert.equal(await unparsedOf(() => ""), 1, "empty");
+    assert.equal(await unparsedOf(() => "  \n\n"), 1, "whitespace only");
+    assert.equal(await unparsedOf((t) => `${t.trim()}\n${t.trim()}\n`), 0, "line-duplicated one-line sidecar");
+    assert.equal(await unparsedOf((t) => `${t.trim()}\n{broken\n`), 1, "one line that does not parse");
+  });
+
+  test("FileFacts of a journal and a run file: a bad journal line is an unparsed line of the journal, naming no chain", async () => {
+    const p = new ClaudeProject();
+    const s = p.session({ sessionId: SESSION, version: V });
+    s.main.request({ requestId: "m1" });
+    s.workflowRun({ runId: "synthetic-run-1", journal: [{ type: "started", agentId: "synthetic-agent-wf" }] });
+    s.agent({ agentId: "synthetic-agent-wf", workflowRunId: "synthetic-run-1", omitMeta: true }).thread.request({ requestId: "w1" });
+    const files = mapContent(p.files(), "journal.jsonl", (t) => `${t}{broken`);
+    const res = await parseClaude(await load(files));
+    const bad = res.integrity.files.filter((f) => f.unparsed_lines > 0);
+    assert.equal(bad.length, 1);
+    assert.deepEqual(bad[0]?.named_chains, []);
+    assert.equal(res.coverage.lines_truncated_tail + res.coverage.lines_parse_error, 1);
+  });
+
+  test("named chains: every parsed record with a string sessionId of any version, an unlisted type included", async () => {
+    const p = new ClaudeProject();
+    const s = p.session({ sessionId: SESSION, version: V });
+    s.main.request({ requestId: "m1" });
+    s.main.request({ requestId: "old", version: "2.1.290" });
+    const { agent } = s.spawnAgent({ agentId: "synthetic-agent-a", spawnDepth: 1 });
+    agent.thread.request({ requestId: "a1" });
+    const files = mapContent(p.files(), "agent-synthetic-agent-a.jsonl", (t) => `${t}{"type":"summary","sessionId":"synthetic-session-elsewhere","agentId":"synthetic-agent-z","uuid":"synthetic-leaf"}\n`);
+    const res = await parseClaude(await load(files));
+    const byFile = res.integrity.files.filter((f) => f.named_chains.length > 0).map((f) => f.named_chains);
+    assert.ok(byFile.some((n) => n.includes(cid(SESSION)) && n.includes(cid(SESSION, "synthetic-agent-a")) === false));
+    assert.ok(byFile.some((n) => n.includes(cid(SESSION, "synthetic-agent-a")) && n.includes(cid("synthetic-session-elsewhere", "synthetic-agent-z"))));
+    assert.ok(res.integrity.chains.includes(cid("synthetic-session-elsewhere", "synthetic-agent-z")));
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe("G1 round 1 (Sol audit): incomplete output, every final copy, copies without a sessionId", () => {
+  const SESSION = "synthetic-session-t";
+  const only = [[cid(SESSION)]];
+  const two = { blocks: [{ type: "text" }, { type: "text" }] } as const;
+
+  test("R2.12: a final copy without output_tokens is usage_incomplete, its present fields are reported, the chain is tainted", async () => {
+    const p = new ClaudeProject();
+    const s = p.session({ sessionId: SESSION, version: V });
+    s.main.request({ requestId: "clean", usage: { input: 1, cacheRead: 2, write5m: 3, output: 4 } });
+    const a = s.main.request({ requestId: "r1", usage: { input: 7, cacheRead: 11, write5m: 13, output: 17 }, ...two });
+    delete msg(a.records[1] as ClaudeRecord).usage.output_tokens; // the final copy (it carries speed)
+    const res = await parseClaude(await load(p.files()));
+    const r = one(res, "r1");
+    assert.equal(r.exclusion, "usage_incomplete");
+    assert.equal(r.usage, null, "a missing output is never read as 0");
+    // present integer fields still count as incomplete tokens: i + r + w from either copy, the partial output of the other copy
+    assert.ok(res.coverage.tokens_in_incomplete_responses >= 7n + 11n + 13n);
+    assert.deepEqual(triggersOf(res, "request_anomaly"), only);
+    assert.equal(res.coverage.records_usage_unmappable, 1, "a record that cannot be mapped to the required integer fields (R17.3)");
+  });
+
+  test("R4.2: iterations[0] is compared on every final copy, whatever the order of the copies", async () => {
+    for (const bad of [0, 1]) {
+      const p = new ClaudeProject();
+      const s = p.session({ sessionId: SESSION, version: V });
+      const a = s.main.request({ requestId: "r1", usage: { input: 4, output: 33, iterations: true }, ...two });
+      const [c0, c1] = a.records as [ClaudeRecord, ClaudeRecord];
+      // two final copies with equal outputs; the iterations block of the copy `bad` disagrees with its top level
+      msg(c0).usage.output_tokens = 33;
+      msg(c0).usage.speed = "standard";
+      msg(c0).usage.iterations = structuredClone(msg(c1).usage.iterations);
+      msg(bad === 0 ? c0 : c1).usage.iterations[0].input_tokens = 5;
+      const res = await parseClaude(await load(p.files()));
+      const r = one(res, "r1");
+      assert.equal(r.exclusion, null, `bad=${bad}`);
+      assert.equal(usageOf(r).output, null, `bad=${bad}: output unknown`);
+      assert.ok(r.flags.includes("conflict_iterations"), `bad=${bad}`);
+      assert.deepEqual(triggersOf(res, "request_anomaly"), only, `bad=${bad}`);
+    }
+  });
+
+  test("R15.7: a copy without a sessionId and of an unverified version makes the key unverified, a supported peer is not accounted", async () => {
+    const build = (version: string) => {
+      const p = new ClaudeProject();
+      const s = p.session({ sessionId: SESSION, version: V });
+      s.main.request({ requestId: "clean", usage: { input: 1, cacheRead: 2, write5m: 3, output: 4 } });
+      const a = s.main.request({ requestId: "r1", usage: { input: 5, write5m: 100, output: 10 }, ...two });
+      const stray = structuredClone(a.records[1] as ClaudeRecord);
+      delete stray.sessionId;
+      stray.version = version;
+      s.main.records.push(stray);
+      return p.files();
+    };
+    const bad = await parseClaude(await load(build("2.1.290")));
+    assert.deepEqual(bad.responses.map((r) => r.key), ["clean"], "the key has an unsupported copy, so no copy of it enters the totals");
+    assert.equal(bad.coverage.requests_unverified_version, 1);
+    assert.deepEqual(triggersOf(bad, "version_unverified"), only, "the chain that holds a supported copy is tainted");
+    assert.deepEqual(triggersOf(bad, "unattributed_record"), ["provider"]);
+    // control: the same stray copy of a supported version is only unattributed, the key keeps its supported copies
+    const ok = await parseClaude(await load(build(V)));
+    assert.deepEqual(ok.responses.map((r) => r.key).sort(), ["clean", "r1"]);
+    assert.equal(ok.coverage.requests_unverified_version, 0);
+  });
+
+  test("R15.7: a key whose only copy has no sessionId and an unverified version is counted, never accounted", async () => {
+    const p = new ClaudeProject();
+    const s = p.session({ sessionId: SESSION, version: V });
+    s.main.request({ requestId: "clean" });
+    const a = s.main.request({ requestId: "lonely", version: "2.1.290" });
+    delete (a.records[0] as ClaudeRecord).sessionId;
+    const res = await parseClaude(await load(p.files()));
+    assert.deepEqual(res.responses.map((r) => r.key), ["clean"]);
+    assert.equal(res.coverage.requests_unverified_version, 1);
   });
 });

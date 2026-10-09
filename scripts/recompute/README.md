@@ -1,86 +1,95 @@
 # scripts/recompute
 
-An independent second implementation of the accounting part of `docs/methodology.md`, for reconciliation (R13.1 to R13.3). It reads raw Claude Code and Codex logs plus the pricing table JSON and produces unique responses, token buckets and the list-price equivalent per provider, model, kind and bucket.
+An independent second implementation of the accounting part of `docs/methodology.md` (spec-1, revision 11), for reconciliation (R13.1 to R13.3). It reads raw Claude Code and Codex logs plus the pricing table JSON and produces unique responses, token buckets, the global integrity abstention of R0.9 (families, taint, live families) and the list-price equivalent per provider, model, kind and bucket.
 
-It does not import anything from `src/`. It is plain Node ESM with no dependencies, written from the spec text. It does not detect events, boundaries or causes (sections 7 to 11); the main implementation is checked against it on accounting only.
+It does not import anything from `src/`. It is plain Node ESM with no dependencies, written from the spec text. It does not detect events, boundaries or causes (sections 6 to 11); the main implementation is checked against it on accounting and on R0.9 only.
 
 ## Use
 
 ```
 node scripts/recompute/index.mjs --claude-dir <dir> [--claude-dir <dir>] --codex-dir <dir>
      [--since <ISO instant | YYYY-MM-DD>] [--until <ISO instant | YYYY-MM-DD>]
-     [--table <table.json>] [--version-policy strict|all]
-     [--per-response [--raw-keys]] [--out <file>]
+     [--table <table.json>] [--per-response] [--out <file>]
 ```
 
 * `--claude-dir` takes a Claude config dir (containing `projects/`) or a `projects/` dir. `--codex-dir` takes a Codex home (`sessions/`, `archived_sessions/`) or one of those dirs. Nothing is read from the home directory unless you pass it.
-* The window is `[since, until)` on event time in UTC (R5.9). Requests before `since` are loaded and add nothing (R5.10).
+* Every file under the roots is read, whatever the window says (R5.9). The window is `[since, until)` on event time in UTC. Requests before `since` are loaded and add nothing (R5.10).
 * `--table` defaults to `src/pricing/table.json` of the repository (read as data).
-* `--version-policy strict` (default) applies R15.7: a product version outside section 0.2 is only counted. `all` treats every version as supported. It is only useful for synthetic data written with a version outside the table; the builder default is now `2.1.293`.
-* `--per-response` adds one row per response with its buckets and picodollars. Ids are `h_` plus a 16 hex prefix of a SHA-256 of the key. `--raw-keys` prints raw keys and is for synthetic data only.
-* Errors print one short code on stderr (`recompute: no_input_dir`), never an exception message (R14.6). Exit code 2.
+* `--per-response` adds one row per response with its buckets, taint and picodollars. Ids are `req_` plus the first 8 hex characters of `sha256(salt || provider || key)`, with a salt of 16 random bytes drawn per run and never stored (R14.4), so ids differ between runs and rows are ordered by the raw key before hashing. There is no CLI flag for raw keys: `--raw-keys` is refused (`recompute: raw_keys_rejected`) whether the output goes to stdout or to `--out`.
+* The clock is read once per run (the run start of R0.9) and the modification time of each file is statted at discovery. Both are used for the live test only (R5.9); a missing mtime, an mtime of 0 and a failed stat mean never live. There is no flag or environment variable for the run start, a modification time, the Codex tier or a version policy.
+* A directory or a file under a root that cannot be resolved, listed or statted stays in the scan as one entry that cannot be read (R0.9 `file_unreadable`, counted in `files_unreadable`): it names no chain, is never live and taints every chain of that root's provider. A root that does not exist is not an error. Errors print one short code on stderr (`recompute: no_input_dir`), never an exception message (R14.6). Exit code 2.
 
-There is deliberately no Codex tier flag. R3.4 says no retained field shows the Codex service tier, so a normal run gives every Codex response the reason `modifier_unverified` and no dollars. Tests exercise the row selection through the API parameter `codexTierForTest: "standard"` (spec name `codex_tier_for_test`), which is not a CLI flag or an environment variable.
+There is deliberately no Codex tier flag. R3.4 says no retained field shows the Codex service tier, so a normal run gives every Codex response of an untainted chain the reason `modifier_unverified` and no dollars. Tests exercise the row selection through the API parameter `codexTierForTest: "standard"` (spec name `codex_tier_for_test`), and the live test through `runStartMs` and the `mtimeMs` of in-memory files. These are function parameters only.
 
 ## API
 
 ```js
 import { recompute, recomputeFiles, toJson } from "./index.mjs";
 
-const r = recompute({ claudeDirs, codexDirs, since, until, table, versionPolicy, codexTierForTest });
-const r2 = recomputeFiles([{ path: "projects/p/s.jsonl", content }, { path: "sessions/2026/01/01/rollout-x.jsonl", content }], opts);
-const doc = toJson(r, { perResponse: true, rawKeys: true });
+const r = recompute({ claudeDirs, codexDirs, since, until, table, codexTierForTest, runStartMs });
+const r2 = recomputeFiles([{ path: "projects/p/s.jsonl", content, mtimeMs }, { path: "sessions/2026/01/01/rollout-x.jsonl", content }], opts);
+const doc = toJson(r, { perResponse: true, rawKeys: true }); // rawKeys and salt are in-process parameters only
 ```
 
-`r.responses` holds every keyed response with BigInt buckets (`input_uncached`, `cache_read`, `cache_write_5m`, `cache_write_1h`, `cache_write_unknown_ttl`, `cache_write`, `output` or null, `output_lower_bound`, `reasoning`) and either `{ priced: true, lo, hi }` in picodollars or `{ priced: false, reason }`. `lo` and `hi` differ only for an unknown TTL write (R3.5). The raw keys are for in-process comparison with `src/`. `toJson` hashes them unless asked not to.
+`r.responses` holds every keyed response with BigInt buckets (`input_uncached`, `cache_read`, `cache_write_5m`, `cache_write_1h`, `cache_write_unknown_ttl`, `cache_write`, `output` or null, `output_lower_bound`, `reasoning`), its chain id, `tainted`, `taint_reasons` and `live_skipped`, and either `{ priced: true, pico }` or `{ priced: false, reason }`. A response of a live family has `counted: false` and `status: "live_skipped"`. The raw keys are for in-process comparison with `src/`. `toJson` replaces them by salted opaque ids unless the in-process option `rawKeys` is set.
 
 ## Output
 
 ```
-schema, spec, table_version, version_policy, window, price_mode
+schema, spec, table_version, window, price_mode
 providers.<claude|codex>:
   totals, by_model, by_kind      responses, responses_priced, responses_unpriced,
                                  tokens{input_uncached, cache_read, cache_write_5m, cache_write_1h,
                                         cache_write_unknown_ttl, cache_write, output,
                                         output_lower_bound_unknown_output},
                                  context_tokens, tokens_total, tokens_unpriced,
-                                 unpriced_share_exceeds_c24, usd_pico_lo, usd_pico_hi
+                                 unpriced_share_exceeds_c24, usd_pico
   unpriced_by_reason
-coverage.<claude|codex>          counters, token amounts as decimal strings
+coverage.<claude|codex>          counters, token amounts as decimal strings; chains_total, chains_tainted,
+                                 chains_tainted_by_reason (all twelve reasons), families_total, families_tainted,
+                                 families_live_skipped, responses_in_tainted_chains, tokens_in_tainted_chains,
+                                 requests_unpriced_tainted, responses_live_skipped, tokens_live_skipped, taint_warn
 ```
 
-All token amounts and money are decimal strings. Money is picodollars (1e-12 USD, R3.8). `by_kind` sums to the totals (R5.8). A model that is not in the table, or whose id does not match R14.3, is reported as `unlisted`; a Codex response without a verified model as `model_unknown`.
+All token amounts and money are decimal strings. Money is picodollars (1e-12 USD, R3.8). `by_kind` sums to the totals (R5.8), tainted responses included. A model that is not in the table, or whose id does not match R14.3, is reported as `unlisted`; a Codex response without a verified model as `model_unknown`. A tainted Claude response keeps the model id of its record for the token breakdown (R0.9 effect 1), a tainted Codex response has none.
 
 Definitions used where the spec leaves a choice:
 
-* `tokens_total` of a response is `input_uncached + cache_read + all cache writes + output`, with `output_lower_bound` when output is unknown. `tokens_unpriced` is the `tokens_total` of the unpriced responses. R3.9 uses the cross-multiplication `10 * tokens_unpriced > tokens_total`.
-* `usd_pico_lo` and `usd_pico_hi` are the sums over priced responses only. A priced response with an unusable output (`conflict_output`, `conflict_iterations`) carries no output term (R2.3).
+* `tokens_total` of a response is `input_uncached + cache_read + all cache writes + output`, with `output_lower_bound` when output is unknown. `tokens_unpriced` is the `tokens_total` of the unpriced responses, tainted ones included (R0.9 effect 2). R3.9 uses the cross-multiplication `10 * tokens_unpriced > tokens_total`. `taint_warn` is the same cross-multiplication for C36: `10 * families_tainted > 3 * families_total` or `10 * tokens_in_tainted_chains > 3 * tokens_total`.
+* `usd_pico` is the sum over priced responses only. There is no range and no output term for an unknown output: such a response is not priced (R3.5, R3.12).
 
 ## Rules implemented
 
 | Area | Rules |
 |---|---|
-| Reading | R1.2 (only counters, enums and ids are kept), R1.3 (BOM, CRLF, truncated tail, no error text kept), R14.3 (model labels), R14.6 |
-| Claude | R2.1 to R2.3, R2.5, R2.12 to R2.16, R3.12, R4.1 to R4.3, R4.5 to R4.8, R5.2, R5.8 to R5.10, R15.7 |
-| Codex | R2.6 to R2.11, R2.13 to R2.17, R4.4, R4.9 to R4.13 (as far as accounting reads them), R5.2, R15.7 |
-| Pricing | R3.1 to R3.8, R3.10 to R3.12 (tier gate, long-context scope, modifier verification), R3.9 |
+| Reading | R1.2 (only counters, enums and ids are kept), R1.3 (BOM, CRLF, truncated tail, no error text kept, sidecar files), R14.3 (model labels), R14.6 |
+| Global abstention | R0.9 in full: families by links (i), (ii) and (iii), live files and live families (C35), the twelve taint reasons, effects 1 and 2, the coverage counters |
+| Claude | R2.1 to R2.3, R2.5, R2.12 to R2.16, R3.12, R4.1 to R4.3, R4.5 to R4.8, R5.2, R5.8 to R5.10, R15.7 (per request key, over every copy) |
+| Codex | R2.6 to R2.11, R2.13 to R2.17, R4.4, R4.9 to R4.13, R5.2, R15.7 (per thread, over every `session_meta`) |
+| Pricing | R3.1 to R3.8, R3.10 to R3.12 (tier gate, long-context scope, modifier verification), R3.9, R3.5 (`bucket_unknown`, one number or none) |
 
-Claude details. Copies are keyed by `requestId` across all files. The output comes from the final copy (a copy with `usage.speed`). Speed, geo and service tier come from the final copy alone; a response without one is `modifier_unverified` and tokens only (R3.12). `requestId` and `message.id` must be 1 to 1 (`key_conflict`). Input and cache counters must be equal over copies (`conflict_input`), models too (`conflict_model`). Counters outside `0..MAX_SAFE_INTEGER` remove the response (`usage_range_failed`), a missing counter makes it `usage_incomplete`. Ownership of a key seen in several logical streams goes to the stream with the earliest `stream_start` (R4.6); it changes the kind attribution only, never the totals.
+Claude details. Copies are keyed by `requestId` across all files. Identity is read per record from `(sessionId, agentId or main)`, never from the path; a record of a graph type without a string `sessionId` is `unattributed_record` and contributes nothing. The output comes from the final copy (a copy with `usage.speed`). Speed, geo and service tier come from the final copy alone; a response without a final copy, or whose final copy lacks geo or tier, is `modifier_unverified` and tokens only (R3.12). `requestId` and `message.id` must be 1 to 1 (`key_conflict`). Input and cache counters must be equal over copies (`conflict_input`), models too (`conflict_model`). Counters outside `0..MAX_SAFE_INTEGER` remove the response (`usage_range_failed`), a missing counter makes it `usage_incomplete`. Every request anomaly (R0.9 `request_anomaly`, including `bucket_mismatch`, `conflict_output`, `conflict_iterations` and `conflict_modifier`) taints every chain that holds a copy, and with them the family. A keyless non-error assistant record with a string `sessionId` taints its own chain whether or not it has usage and whatever its version; `records_unkeyed` counts only the supported ones that carry usage (the trigger and the counter differ in scope). Ownership of a key seen in several logical streams goes to the stream with the earliest `stream_start` (R4.6); a tie taints (`ownership_ambiguous`). A key with a copy of a version without full support is unverified as a whole and adds nothing (R15.7).
 
-Codex details. A `token_usage_record` is accounted by its own `thread_id` and `response_id`. Stream identity sets, copy-exposed files, `FS`, `prefix_exposed`, `ordinal_verified`, the overlap guards and the model sources of R2.10 are all recomputed from the raw records. An `integrity_unverified` stream verifies no model through any row. Duplicate `response_id` values are accepted only when every retained field and the attribution are equal (R4.4).
+Codex details. A `token_usage_record` is accounted by its own `thread_id` and `response_id`. Stream identity sets, copy-exposed files, `FS`, `ordinal_verified`, the overlap guards, `TM(T)` and the model sources of R2.10 are all recomputed from the raw records and then judged by R0.9: a stream conflict, a copy-exposed file, a conflicting turn model, an unverifiable ordinal or fork prefix, an anomalous request, an unverified version, an unlogged-usage file, an unattributed record or an unreadable file taints. Duplicate `response_id` values are accepted only when every retained field and the attribution are equal (R4.4).
 
 ## Spec ambiguities hit
 
 These are choices made here, listed so the other implementation can be compared on them. None of them changes anything on a clean log.
 
-1. (Resolved) The builder default Claude version is now `2.1.293`, inside the section 0.2 table, so the committed Claude fixtures are accounted under `strict`.
-2. (Resolved) The builder `replay()` now writes the copying session id, so a replay is a second logical stream under R4.11 and the copies are `replayed` (R4.6, R4.7).
-3. R2.12 and R2.15 both name fractional values. Here a value that is not a JSON number is "missing" and a JSON number that fails the range or is fractional is a range failure. Range failure wins over incomplete.
-4. Claude `cache_creation_input_tokens` is required even when the `cache_creation` object exists (a missing field is never 0).
-5. Geo multiplication can leave a fraction of a picodollar. It is rounded half up once per response and counted in `coverage.claude.geo_rounded_responses`. The spec fixes no rounding at that level.
-6. Several final copies with different modifier values are treated as `conflict_modifier`.
-7. Codex support under R15.7 is decided per stream from the `cli_version` of its own `session_meta` records. A usage record whose thread has none, or no `thread_id`, is not accounted.
-8. Codex kind: `thread_source` values other than the listed ones are reported as `unclassified`. `source.subagent.other` alone does not make a subagent, following the table of R5.2 literally.
-9. A `turn_context` without a model is not a candidate. Settings markers of a copy-exposed file still count as markers (the conservative direction).
-10. The unreliable-order case for R2.10: with markers present and the stream `ordinal_verified` but `integrity_unverified`, the row is `stream_unverified` (revision 9 settles this).
-11. Reason labels of `unpriced_modifier` are chosen here when several apply. The order is table row, tier gate, then modifiers. Dollars do not depend on the order; reason counts do.
+1. R2.12 and R2.15 both name fractional values. Here a value that is not a JSON number is "missing" and a JSON number that fails the range or is fractional is a range failure. Range failure wins over incomplete.
+2. Claude `cache_creation_input_tokens` is required even when the `cache_creation` object exists (a missing field is never 0).
+3. Geo multiplication can leave a fraction of a picodollar. It is rounded half up once per response and counted in `coverage.claude.geo_rounded_responses`. The spec fixes no rounding at that level.
+4. Several final copies with different modifier values are treated as `conflict_modifier`.
+5. Codex kind: `thread_source` values other than the listed ones are reported as `unclassified`. `source.subagent.other` alone does not make a subagent, following the table of R5.2 literally.
+6. A `turn_context` without a usable model is not a candidate for the position rules, but it is a null member of `TM(T)`: model A plus a null member is `turn_model_conflicted` (R2.17 (d)). The guard context set `G(S)` is every context of the files assigned to the stream, copied prefix included (R2.17 (c)), and a settings marker of any assigned file counts as a marker.
+7. Reason labels of `unpriced_modifier` when several apply. The order is the tier gate (Codex), a missing model row, then the modifiers (conflict, `modifier_unverified`, speed, geo, row selection), then `bucket_unknown`. Dollars do not depend on the order; reason counts do. A service-tier row combined with fast or with the geo multiplier is not defined by the table, so it is `service_tier_unpriced`.
+8. A sidecar JSON file (`meta.json`, `prefix.json`, `wf_*.json`) or a `journal.jsonl` line that fails to parse is one unparsed line that names no chain, so it is never live and is `unparsed_line` provider taint. The readability test: an empty (or blank) sidecar is unreadable; otherwise the whole text is parsed, and if that fails the sidecar is readable only when every non-empty line parses on its own, so a line-duplicated one-line sidecar stays readable. A truncated `journal.jsonl` therefore taints every Claude chain, even when it is being written right now (revision 12 reviews this).
+9. R0.9 does not say whether the response-level counters (`responses_in_tainted_chains`, `tokens_in_tainted_chains`, `requests_unpriced_tainted`, `responses_live_skipped`, `tokens_live_skipped`) are windowed. They are taken over the totals set (owner, non-excluded, inside the window). Chain and family counters are scan-wide. The logical request and record counters that feed the drift codes of R17.3 follow the window ("for a provider in the window") and leave out live families (R0.9: removed from the analysis entirely): `requests_conflict` (once per request with any conflict code; `_by_kind` once per code), `responses_usage_range_failed`, `responses_usage_incomplete`, `tokens_in_incomplete_by_field`, `responses_usage_invariant_failed`, `tokens_in_invalid_responses`, `responses_bucket_mismatch` and `records_unkeyed`. A record or response without an event time is in every window (it abstains, it is never dropped silently). `conflict_diagnostics` is not read by this implementation, so it is in no count here. Still scan-wide: `requests_total` (the count of keys), `replay_ownership_ambiguous`, `requests_unverified_version`, `lines_unverified_version`. The counters about a kept response (`output_unknown_requests`, `requests_no_final_copy`, `replay_requests_excluded`) and the totals follow the window.
+10. Chains. Claude: every parsed record of any type with a string `sessionId` names its chain, so a chain can exist with no request. Codex: every `session_meta` id and every usage `thread_id` is a chain; an id that is only named as `forked_from_id` or as a spawn parent, with no record of its own, is not a chain and adds no link.
+11. A Claude record of a graph type without a string `sessionId` is unattributed whatever its version. A request key whose copy has an unsupported version is unverified even when that copy has no `sessionId`.
+12. `stream_start` (R4.6) is taken over records of supported versions only.
+13. The logical counters `records_unkeyed` and `api_error_records` of Claude collapse equal records by `uuid` (R17.6); a record without one is identified by its timestamp, session and message id.
+14. A file with a missing modification time, a time of 0 or a failed stat is never live. A directory or file that cannot be resolved, listed or statted counts as a file that cannot be read (`file_unreadable`, provider taint, no chain named).
+15. Fork fixtures. A copied prefix record keeps every envelope field of its parent record (timestamp and ordinal), as the fixture builder does. A copy next to its original is therefore an equal record (a duplicate, R4.12) and no collision, and the half of a split fork file that holds the copied parent `session_meta` alone is `copy_exposed` only, as the stored R2.17 (5) fixtures list. Only the `copy_differs` variant at position 2 also has `ordinal_unverified`.
+16. Codex request-level triggers (`request_anomaly` for a record without a response id, for bad usage and for conflicting duplicates) exist only for threads of a supported version. A record of an unverified thread adds to `lines_unverified_version` (keyed or not), its key to `requests_unverified_version`, and the thread gets `version_unverified` only; it is not counted in `records_unkeyed`. A usage record without a `thread_id` counts in `records_unkeyed` and taints every Codex chain with `unattributed_record`.
+17. R4.11 compares own `session_meta` records of one id on `(session_id, forked_from_id, subagent_history_start_ordinal)`. A missing value is a value of its own, so missing versus present is `stream_unresolved`.

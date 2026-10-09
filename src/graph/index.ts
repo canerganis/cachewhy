@@ -1,8 +1,9 @@
-// Conversation graph (spec sections 4.11, 5, 6 and the structural half of 9.2).
+// Conversation graph (spec sections 0.9, 4.11, 5, 6 and the structural half of 9.2).
 //
-// buildGraph merges parse results into one Graph: chains keyed by R5.1, one logical stream per chain (R4.11),
-// chain order (R6.1), previous request P(C) (R6.2), ties, excluded-between, the TTL set (R9.2), gap bounds
-// (R6.4 to R6.6), the report window (R5.9, R5.10) and the cross-chain checks of the linkage rules (R5.3 to R5.7).
+// buildGraph merges parse results into one Graph: global integrity abstention (R0.9: families, live families, chain
+// taint), chains keyed by R5.1, one logical stream per chain (R4.11), chain order (R6.1), previous request P(C) (R6.2),
+// ties, excluded-between, the TTL set (R9.2), gap bounds (R6.4 to R6.6), the report window (R5.9, R5.10) and the
+// cross-chain checks of the linkage rules (R5.3 to R5.7).
 // It makes no eligibility, boundary or numeric decision (that is section 7) and reads no file.
 //
 // Inputs are plain parse results. Everything is keyed by identity (chain key, response key), never by physical file
@@ -12,11 +13,13 @@
 import {
   ASSUMPTIONS,
   PROVIDERS,
-  STREAM_INTEGRITY_REASONS,
   UNLINKED_REASONS,
   cachedPrefix,
+  chainIdOf,
   chainKeyString,
   countsInTotals,
+  emptyCoverage,
+  responseTokens,
 } from "../model/types.js";
 import type {
   Assumption,
@@ -28,24 +31,31 @@ import type {
   ClaudeUuidNode,
   CodexCompaction,
   EpochMs,
+  ChainId,
+  ChainTaint,
+  CoverageCounters,
   ExcludedRecord,
+  FileFacts,
   FileIndex,
   FileInfo,
   GapBounds,
   Graph,
   GraphNode,
   GraphOptions,
+  IntegrityFacts,
   Link,
+  ModelAttribution,
   ParseResult,
   Provider,
+  ProviderTaint,
   RequestKind,
   Response,
   Stream,
-  StreamIntegrityReason,
   TtlSet,
   UnlinkedReason,
   UsageBuckets,
 } from "../model/types.js";
+import { computeTaint, emptyIntegrityFacts } from "./taint.js";
 
 // ---------------------------------------------------------------------------
 // small helpers
@@ -186,17 +196,12 @@ function tri(values: readonly (boolean | null)[]): boolean | null {
   return null;
 }
 
-function orderedReasons(set: ReadonlySet<StreamIntegrityReason>): StreamIntegrityReason[] {
-  return STREAM_INTEGRITY_REASONS.filter((r) => set.has(r));
-}
-
 /**
  * One Stream per chain (R4.11): all Stream records and all files of the same identity form one logical stream.
- * A chain with responses but no Stream record is never trusted: it is treated as unresolved (no guessing, R4.11).
+ * Integrity is not decided here any more: a stream that cannot be trusted taints its family (R0.9), which the parsers
+ * report as integrity facts. A chain with responses but no Stream record gets an unverified ordinal state (no guessing).
  */
-function mergeStreams(key: ChainKey, records: readonly Stream[], fileInfo: ReadonlyMap<number, FileInfo>, responses: readonly Response[]): Stream {
-  const reasons = new Set<StreamIntegrityReason>();
-  let unverified = false;
+function mergeStreams(key: ChainKey, records: readonly Stream[], responses: readonly Response[]): Stream {
   let files: number[];
   let start: number | null;
   let ordinal: boolean | null;
@@ -208,8 +213,6 @@ function mergeStreams(key: ChainKey, records: readonly Stream[], fileInfo: Reado
     const starts = responses.map((r) => r.ownership.owner_stream_start_ms).filter((x): x is EpochMs => x !== null);
     start = starts.length > 0 ? Math.min(...starts) : null;
     ordinal = key.provider === "codex" ? false : null;
-    unverified = responses.length > 0;
-    if (unverified) reasons.add("stream_missing");
   } else {
     const sorted = [...records].sort(
       (a, b) =>
@@ -221,41 +224,22 @@ function mergeStreams(key: ChainKey, records: readonly Stream[], fileInfo: Reado
     start = starts.length > 0 ? Math.min(...starts) : null;
     ordinal = key.provider === "claude" ? null : tri(sorted.map((s) => s.ordinal_verified));
     for (const s of sorted) {
-      if (s.integrity_unverified) unverified = true;
-      for (const r of s.integrity_reasons) reasons.add(r);
       if (s.has_settings_marker) settings = true;
       if (s.fork !== null) {
         if (fork === null) {
           fork = s.fork;
         } else if (
           fork.forked_from_id !== s.fork.forked_from_id ||
-          fork.history_start_ordinal !== s.fork.history_start_ordinal
+          fork.history_start_ordinal !== s.fork.history_start_ordinal ||
+          !s.fork.prefix_resolved
         ) {
-          // R4.11: two own session_meta records with the same id that differ in forked_from_id or history start.
-          unverified = true;
-          reasons.add("divergent_session_meta");
-        } else if (!s.fork.prefix_resolved) {
+          // Two own session_meta records of one id that disagree are a stream_unresolved taint (R4.11, R0.9). The
+          // merged stream cannot cut a prefix.
           fork = { ...fork, prefix_resolved: false };
         }
       }
     }
-    // A stream where some parse result saw a fork and another did not is divergent too.
-    if (fork !== null && sorted.some((s) => s.fork === null) && key.provider === "codex") {
-      unverified = true;
-      reasons.add("divergent_session_meta");
-    }
   }
-
-  // R4.13: a copy-exposed file makes every stream of that file integrity_unverified. Derived here from the file
-  // facts as well, so the gate cannot be bypassed by a Stream record that forgot it.
-  for (const i of files) {
-    const fi = fileInfo.get(i);
-    if (fi?.copy_exposed === true) {
-      unverified = true;
-      reasons.add("copy_exposed_file");
-    }
-  }
-  if (reasons.size > 0) unverified = true;
 
   return {
     chain: key,
@@ -263,8 +247,6 @@ function mergeStreams(key: ChainKey, records: readonly Stream[], fileInfo: Reado
     files,
     start_ms: start,
     ordinal_verified: ordinal,
-    integrity_unverified: unverified,
-    integrity_reasons: orderedReasons(reasons),
     fork,
     has_settings_marker: settings,
   };
@@ -357,7 +339,11 @@ function startHi(r: Response): number {
 function startLo(r: Response, uuidIndex: ReadonlyMap<string, ClaudeUuidNode>): number | null {
   if (r.provider !== "claude") return null;
   let asm = r.time.t_asm_ms;
-  if (asm === null && r.parent_uuid !== null) asm = uuidIndex.get(r.parent_uuid)?.ts_ms ?? null; // R6.3
+  if (r.parent_uuid !== null) {
+    const node = uuidIndex.get(r.parent_uuid);
+    if (node?.unresolved === true) asm = null; // R6.3: an unresolved uuid gives no t_asm
+    else if (asm === null) asm = node?.ts_ms ?? null; // R6.3
+  }
   return asm !== null && asm <= r.time.t_first_ms ? asm : null;
 }
 
@@ -396,6 +382,38 @@ function compareItems(a: Item, b: Item): number {
     cmp(ea.reason, eb.reason) ||
     cmp(ea.files.join(","), eb.files.join(","))
   );
+}
+
+/** R0.9 effect 1 and 2: the attribution of a response of a tainted chain. Claude keeps its candidate for token breakdowns. */
+function taintedModel(r: Response): ModelAttribution {
+  return { candidate: r.provider === "claude" ? r.model.candidate : null, verified: false, source: "chain_tainted", model: null };
+}
+
+/** Merge the integrity facts of every parse result of one provider (file indices shifted into the graph's index space). */
+function mergeIntegrity(
+  provider: Provider,
+  parsed: readonly ParseResult[],
+  offsets: readonly number[],
+  chainIds: ReadonlySet<ChainId>,
+  extraTriggers: readonly IntegrityFacts["triggers"][number][] = [],
+): { facts: IntegrityFacts; files: FileFacts[] } {
+  const base = emptyIntegrityFacts(provider);
+  const chains = new Set<ChainId>(chainIds);
+  const family_groups: (readonly ChainId[])[] = [];
+  const triggers: IntegrityFacts["triggers"][number][] = [];
+  const files: FileFacts[] = [];
+  for (const t of extraTriggers) triggers.push(t);
+  parsed.forEach((p, k) => {
+    if (p.provider !== provider) return;
+    // A hand-built parse result may omit the facts: it then asserts nothing (R0.9 has no hidden defaults).
+    const f = (p as Partial<ParseResult>).integrity ?? base;
+    const off = offsets[k] as number;
+    for (const c of f.chains) chains.add(c);
+    for (const g of f.family_groups) family_groups.push(g);
+    for (const t of f.triggers) triggers.push(t);
+    for (const ff of f.files) files.push({ ...ff, index: ff.index + off });
+  });
+  return { facts: { provider, chains: [...chains].sort(cmp), family_groups, triggers, files }, files };
 }
 
 export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: GraphOptions): Graph => {
@@ -458,7 +476,17 @@ export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: G
 
   uuidEntries.sort((a, b) => cmp(a[0], b[0]));
   const uuidIndex = new Map<string, ClaudeUuidNode>();
-  for (const [u, node] of uuidEntries) if (!uuidIndex.has(u)) uuidIndex.set(u, node);
+  for (const [u, node] of uuidEntries) {
+    const have = uuidIndex.get(u);
+    if (have === undefined) uuidIndex.set(u, node);
+    else if (
+      !have.unresolved &&
+      (node.unresolved || node.ts_ms !== have.ts_ms || node.parent_uuid !== have.parent_uuid || node.logical_parent_uuid !== have.logical_parent_uuid)
+    ) {
+      // R6.3: records of one uuid that disagree on timestamp or parents do not resolve.
+      uuidIndex.set(u, { ...have, parent_uuid: null, logical_parent_uuid: null, ts_ms: null, unresolved: true });
+    }
+  }
 
   // ---- per chain: collapse repeated keys, merge streams -----------------------------------------------------
   const chainKeysSorted = [...builds.values()].sort((a, b) => compareChainKeys(a.key, b.key));
@@ -466,8 +494,30 @@ export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: G
   for (const b of chainKeysSorted) {
     const rs = new Map<string, Response>();
     for (const [k, list] of b.responses) rs.set(k, list.length === 1 ? (list[0] as Response) : mergeSameKey(list));
-    resolved.set(b.ks, { responses: rs, stream: mergeStreams(b.key, b.streams, fileInfo, [...rs.values()]) });
+    resolved.set(b.ks, { responses: rs, stream: mergeStreams(b.key, b.streams, [...rs.values()]) });
   }
+
+  // ---- R0.9: families, live families and taint, per provider ---------------------------------------------------
+  const builtIds = new Map<Provider, Set<ChainId>>();
+  for (const prov of PROVIDERS) builtIds.set(prov, new Set());
+  for (const b of chainKeysSorted) (builtIds.get(b.key.provider) as Set<ChainId>).add(chainIdOf(b.key));
+  // A Codex chain with responses but no Stream record has a stream that cannot be checked, which fails R4.12.
+  // Real input always has a Stream record; this only keeps hand-built input from passing as verified.
+  const unstreamed: IntegrityFacts["triggers"][number][] = [];
+  for (const b of chainKeysSorted) {
+    if (b.key.provider === "codex" && b.streams.length === 0 && b.responses.size > 0) {
+      unstreamed.push({ reason: "ordinal_unverified", names: [chainIdOf(b.key)] });
+    }
+  }
+  const taint = {} as Record<Provider, ProviderTaint>;
+  for (const prov of PROVIDERS) {
+    const m = mergeIntegrity(prov, parsed, offsets, builtIds.get(prov) as Set<ChainId>, prov === "codex" ? unstreamed : []);
+    taint[prov] = computeTaint(m.facts, m.files, opts.run_start_ms);
+  }
+  const taintOfChain = (key: ChainKey): { family: number; tainted: boolean; reasons: ChainTaint["reasons"]; live: boolean } => {
+    const t = (taint[key.provider] as ProviderTaint).chains.get(chainIdOf(key));
+    return t === undefined ? { family: -1, tainted: false, reasons: [], live: false } : t;
+  };
 
   // ---- R5.8, R4.6: every key contributes once to the grand total --------------------------------------------
   const byKey = new Map<string, { ks: string; key: string }[]>();
@@ -494,9 +544,13 @@ export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: G
     const first = lookup(owners[0] as { ks: string; key: string });
     if (first.provider === "codex") {
       // R4.4: the same response_id owned by two threads is a conflict and leaves accounting entirely.
+      // The parser already labels a conflicted key (it saw every occurrence and nulled the usage): keep that label.
+      // Equality is recomputed only for occurrences the parser did not label, which still carry their usage.
+      const labelled = owners.map((o) => lookup(o).exclusion).find((e) => e === "conflict_usage" || e === "conflict_attribution");
       const equal = owners.every((o) => usageEqual(lookup(o).usage, first.usage));
+      const kind = labelled ?? (equal ? "conflict_attribution" : "conflict_usage");
       for (const o of owners) {
-        replace(o, { ...lookup(o), usage: null, exclusion: equal ? "conflict_attribution" : "conflict_usage" });
+        replace(o, { ...lookup(o), usage: null, exclusion: kind });
       }
       continue;
     }
@@ -537,9 +591,26 @@ export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: G
   const chains: Chain[] = [];
   const excludedOut: ExcludedRecord[] = [];
 
+  const liveSkipped = {} as Record<Provider, { responses: number; tokens: bigint }>;
+  for (const prov of PROVIDERS) liveSkipped[prov] = { responses: 0, tokens: 0n };
+
   for (const b of chainKeysSorted) {
     const entry = resolved.get(b.ks) as { responses: Map<string, Response>; stream: Stream };
     const stream = entry.stream;
+    const ct = taintOfChain(b.key);
+
+    if (ct.live) {
+      // R0.9 live family: removed from the analysis entirely. Counted over the totals set (owner, kept, in window).
+      for (const r of entry.responses.values()) {
+        const inW = r.time.event_ms >= window.since_ms && r.time.event_ms < window.until_ms;
+        if (inW && countsInTotals(r) && r.usage !== null) {
+          const acc = liveSkipped[b.key.provider];
+          acc.responses++;
+          acc.tokens += responseTokens(r.usage);
+        }
+      }
+      continue;
+    }
 
     const items: Item[] = [];
     for (const r of entry.responses.values()) items.push({ t: r.time.event_ms, r, e: null });
@@ -591,7 +662,8 @@ export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: G
         excludedOut.push(it.e);
         continue;
       }
-      const r = it.r;
+      // R0.9 effect 1 and 2: a tainted chain keeps its tokens and has no verified model.
+      const r: Response = ct.tainted ? { ...it.r, model: taintedModel(it.r) } : it.r;
       const tie = (i > 0 && (items[i - 1] as Item).t === it.t) || (i < n - 1 && (items[i + 1] as Item).t === it.t);
       const idx = base + seq;
       const inWindow = r.time.event_ms >= window.since_ms && r.time.event_ms < window.until_ms;
@@ -648,7 +720,7 @@ export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: G
       seq++;
     }
 
-    chains.push({ key: b.key, kind, link, stream, order });
+    chains.push({ key: b.key, kind, link, stream, order, family: ct.family, tainted: ct.tainted, taint_reasons: ct.reasons });
   }
 
   // The graph keeps R6.2's "removed" records in one list in chain order.
@@ -661,7 +733,6 @@ export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: G
       cmp(a.files.join(","), c.files.join(",")),
   );
 
-  const assumptionList = ASSUMPTIONS.filter((a) => assumptions.has(a));
   const sortedBoundaries = [...boundaries.values()].sort(
     (a, c) => compareChainKeys(a.chain, c.chain) || cmp(a.uuid, c.uuid),
   );
@@ -673,7 +744,10 @@ export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: G
       cmpNum(a.window_number ?? -1, c.window_number ?? -1),
   );
 
-  return {
+  if (PROVIDERS.some((prov) => (taint[prov] as ProviderTaint).families_live > 0)) assumptions.add("live_session_skipped");
+  const assumptionList = ASSUMPTIONS.filter((a) => assumptions.has(a));
+
+  const graph: Graph = {
     window,
     responses: graphResponses,
     nodes,
@@ -683,7 +757,29 @@ export const buildGraph: BuildGraph = (parsedIn: readonly ParseResult[], opts: G
     claude: { uuid_index: uuidIndex, compact_boundaries: sortedBoundaries },
     codex: { compactions: sortedCompactions },
     assumptions: assumptionList,
+    taint,
+    coverage_by_provider: { claude: emptyCoverage(), codex: emptyCoverage() },
   };
+  const cov = {} as Record<Provider, CoverageCounters>;
+  for (const prov of PROVIDERS) {
+    const t = taint[prov] as ProviderTaint;
+    const c = emptyCoverage();
+    c.chains_total = t.chains_total;
+    c.chains_tainted = t.chains_tainted;
+    c.chains_tainted_by_reason = { ...t.chains_tainted_by_reason };
+    c.families_total = t.families_total;
+    c.families_tainted = t.families_tainted;
+    c.families_live_skipped = t.families_live;
+    c.responses_live_skipped = (liveSkipped[prov] as { responses: number }).responses;
+    c.tokens_live_skipped = (liveSkipped[prov] as { tokens: bigint }).tokens;
+    const links = summarizeLinks(graph, prov);
+    c.links_verified = links.verified;
+    c.links_directory_only = links.directory;
+    c.links_unlinked = links.unlinked;
+    c.links_unlinked_by_reason = links.unlinked_by_reason;
+    cov[prov] = c;
+  }
+  return { ...graph, coverage_by_provider: cov };
 };
 
 // ---------------------------------------------------------------------------
@@ -724,7 +820,7 @@ export function countedByKind(graph: Graph): Record<RequestKind, number> {
  * before those checks, so the report builder should take these values for `links_verified`, `links_directory_only`,
  * `links_unlinked` and `links_unlinked_by_reason`.
  */
-export function summarizeLinks(graph: Graph): {
+export function summarizeLinks(graph: Graph, provider?: Provider): {
   verified: number;
   directory: number;
   unlinked: number;
@@ -736,6 +832,7 @@ export function summarizeLinks(graph: Graph): {
   let directory = 0;
   let unlinkedCount = 0;
   for (const c of graph.chains) {
+    if (provider !== undefined && c.key.provider !== provider) continue;
     const l = c.link;
     if (l === null) continue;
     if (l.state === "verified") verified++;

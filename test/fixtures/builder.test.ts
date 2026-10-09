@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ClaudeProject, CodexThread, CodexHome, IdGen, zstdCompress, zstdDecompress, type GeneratedFile } from './builder.ts';
+import { ClaudeProject, CodexThread, CodexHome, IdGen, withRawLines, withTruncatedTail, zstdCompress, zstdDecompress, type GeneratedFile } from './builder.ts';
 import { checkFixtures, checkFixturesDetailed, scenarios, writeAll, OUT_DIR } from '../../scripts/gen-fixtures.ts';
 
 const zstdAvailable = zstdCompress('x') !== null;
@@ -143,12 +143,20 @@ test('codex fork: copied parent meta, prefix without usage records, history star
   const copied = metas.find((m) => m.payload.id === 'synthetic-thread-p')!;
   assert.equal(own.payload.forked_from_id, 'synthetic-thread-p');
   assert.equal(copied.payload.forked_from_id, undefined);
-  assert.equal(own.payload.subagent_history_start_ordinal, 4);
+  // A copied record keeps the envelope of the parent's record (timestamp and ordinal). The parent's usage record at
+  // ordinal 3 is not copied, so the copied prefix has a gap and the fork's own lines start after the last copied ordinal.
+  assert.equal(own.payload.subagent_history_start_ordinal, 5);
   assert.ok(fork.lines.every((l) => l.type !== 'token_usage_record'));
-  const prefix = fork.lines.filter((l) => l.ordinal < 4);
+  const prefix = fork.lines.filter((l) => (l.ordinal ?? -1) < 5);
   assert.equal(prefix.length, 4);
-  assert.deepEqual(fork.lines.map((l) => l.ordinal), [0, 1, 2, 3, 4]);
-  assert.equal(own.ordinal, 4);
+  assert.deepEqual(fork.lines.map((l) => l.ordinal), [0, 1, 2, 4, 5]);
+  assert.equal(own.ordinal, 5);
+  const original = parent.lines.filter((l) => l.type !== 'token_usage_record');
+  for (const copy of fork.lines.slice(0, 4)) {
+    const orig = original.find((l) => l.ordinal === copy.ordinal)!;
+    assert.equal(copy.timestamp, orig.timestamp);
+    assert.deepEqual(copy, orig);
+  }
   const first = CodexThread.fork(parent, { threadId: 'synthetic-thread-f2', ownMetaPosition: 'first', prefixLen: 2 });
   assert.equal(first.lines[0]!.payload.id, 'synthetic-thread-f2');
 });
@@ -307,4 +315,84 @@ test('writeTo writes the tree', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// R0.9 builder additions: mtimes, raw lines, truncated tails, record-level overrides
+// ---------------------------------------------------------------------------
+
+test('R0.9 builder: a file mtime is written to disk and every split part keeps it', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cachewhy-fx-'));
+  try {
+    const t = new CodexThread({ threadId: 'synthetic-thread-m' });
+    t.turnContext();
+    t.tokenUsage();
+    t.tokenUsage();
+    const when = Date.UTC(2026, 1, 3, 4, 5, 6);
+    const home = new CodexHome();
+    home.add(t, { splitAfter: [2], mtimeMs: when });
+    const files = home.files();
+    assert.equal(files.length, 2);
+    assert.ok(files.every((f) => f.mtimeMs === when));
+    home.writeTo(dir);
+    const abs = join(dir, ...files[0]!.path.split('/'));
+    assert.equal(Math.round(statSync(abs).mtimeMs / 1000), when / 1000);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('R0.9 builder: raw lines are inserted with their own terminator and a truncated tail has none', () => {
+  const t = new CodexThread({ threadId: 'synthetic-thread-r' });
+  t.tokenUsage();
+  const file = t.files()[0]!;
+  const withGarbage = withRawLines(file, [{ at: 1, text: 'not json' }, { at: 1, text: 'also not json' }]);
+  const lines = String(withGarbage.content).split('\n');
+  assert.equal(lines.length, 5, 'meta, two raw lines, usage, trailing empty');
+  assert.equal(lines[1], 'also not json');
+  assert.equal(lines[2], 'not json');
+  assert.ok(String(withGarbage.content).endsWith('\n'));
+  const cut = withTruncatedTail(file);
+  assert.ok(!String(cut.content).endsWith('\n'));
+  assert.throws(() => JSON.parse(String(cut.content).split('\n').pop()!));
+});
+
+test('R0.9 builder: claude records can lose or retype sessionId and requestId, and a request has its own version', () => {
+  const p = new ClaudeProject();
+  const s = p.session({ sessionId: 'synthetic-session-o' });
+  s.main.request({ extra: { sessionId: undefined } });
+  s.main.request({ extra: { sessionId: 7 } });
+  s.main.request({ extra: { requestId: undefined }, version: '9.9.9' });
+  s.main.user({ extra: { sessionId: undefined } });
+  const recs = parse(p.files()[0]);
+  assert.equal(recs[0]!.sessionId, undefined);
+  assert.equal(recs[1]!.sessionId, 7);
+  assert.equal(recs[2]!.requestId, undefined);
+  assert.equal(recs[2]!.version, '9.9.9');
+  assert.equal(recs[3]!.type, 'user');
+  assert.equal(recs[3]!.version, '2.1.293');
+  assert.equal(recs[3]!.sessionId, undefined);
+});
+
+test('R0.9 builder: codex metas, usage records and ordinals can be shaped', () => {
+  const t = new CodexThread({ threadId: 'synthetic-thread-c', emitMeta: false });
+  t.sessionMeta({ cliVersion: '0.159.0' });
+  t.sessionMeta({ id: null });
+  t.turnContext({ turnId: 'synthetic-turn-c', model: 'gpt-5-codex', ordinal: null });
+  t.settingsApplied({ ordinal: 40 });
+  t.tokenCount();
+  t.tokenUsage({ omitThreadId: true });
+  t.tokenUsage({ omitResponseId: true, ordinal: null });
+  const [meta1, meta2, ctx, marker, count, noThread, noResp] = t.lines;
+  assert.equal(meta1!.payload.cli_version, '0.159.0');
+  assert.equal(meta1!.payload.id, 'synthetic-thread-c');
+  assert.equal('id' in meta2!.payload && meta2!.payload.id !== undefined, false);
+  assert.equal(ctx!.ordinal, undefined);
+  assert.equal(marker!.ordinal, 40);
+  assert.deepEqual(marker!.payload, { type: 'thread_settings_applied' });
+  assert.deepEqual(count!.payload, { type: 'token_count' });
+  assert.equal(noThread!.payload.thread_id, undefined);
+  assert.equal(noResp!.payload.response_id, undefined);
+  assert.equal(noResp!.ordinal, undefined);
+  assert.equal(noThread!.ordinal, 5, 'the counter keeps running past an explicit ordinal and a removed one');
 });

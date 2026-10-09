@@ -26,8 +26,8 @@ export interface LineStats {
   finalLineUnterminated: boolean;
   /** Set when the file cannot be decoded on this Node build (coverage loss). Never thrown. */
   unsupported?: "zstd-unavailable";
-  /** Set when the file could not be (fully) read. Never thrown. */
-  error?: string;
+  /** Set to the fixed code `read_failed` when the file could not be (fully) read (R0.2, R17.1). Never thrown, never exception text. */
+  error?: "read_failed";
 }
 
 export interface ReadLinesOptions {
@@ -158,9 +158,10 @@ export async function* readLines(path: string, options: ReadLinesOptions = {}): 
       if (!emptyTail) stats.finalLineUnterminated = true;
       if (rec) yield rec;
     }
-  } catch (err) {
+  } catch {
     // A partial final line cannot be trusted after a read/decompress failure: dropped.
-    stats.error = err instanceof Error ? err.message : String(err);
+    // R14.6, R1.3: exception text can quote a path or input text, so only a fixed code is kept.
+    stats.error = "read_failed";
   }
 }
 

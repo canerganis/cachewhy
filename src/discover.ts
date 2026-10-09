@@ -66,6 +66,14 @@ export interface DiscoverOptions {
   home?: string;
 }
 
+/**
+ * `--project` membership (R5.9: an output filter, never a read filter). A project is a Claude project directory,
+ * the first path segment under the scan root. Codex logs have none (R1.1).
+ */
+export function inProject(f: Pick<DiscoveredFile, "agent" | "relPath">, project: string): boolean {
+  return f.agent === "claude" && f.relPath.split("/")[0] === project;
+}
+
 export interface DiscoverResult {
   files: DiscoveredFile[];
   diagnostics: Diagnostic[];
@@ -217,6 +225,17 @@ export async function discover(opts: DiscoverOptions = {}): Promise<DiscoverResu
   const seenDirs = new Set<string>();
   const seenFiles = new Set<string>();
 
+  /**
+   * R0.9 `file_unreadable`: a directory that cannot be listed counts as a file that cannot be read. Its logs are
+   * unknown, so it stays in the list as one unreadable entry (size and mtime unknown, so never live). The parser
+   * fails to read it, counts it in `files_unreadable` and raises the trigger, which names no chain and taints the
+   * provider of that root. The scan is never withheld as a whole for this.
+   */
+  function unreadableEntry(agent: SourceAgent, path: string, rootPath: string): void {
+    const relPath = relative(rootPath, path).split(sep).join("/");
+    files.push({ kind: agent === "claude" ? "claude-main" : "codex-rollout", agent, path, relPath, root: rootPath, size: 0, mtimeMs: 0 });
+  }
+
   async function walk(c: Candidate, rootReal: string): Promise<void> {
     const rootPath = c.path;
     const stack: { dir: string; real: string }[] = [{ dir: rootPath, real: rootReal }];
@@ -240,6 +259,7 @@ export async function discover(opts: DiscoverOptions = {}): Promise<DiscoverResu
           path: cur.dir,
           message: `cannot read directory: ${(e as NodeJS.ErrnoException).code ?? "error"}`,
         });
+        unreadableEntry(c.agent, cur.dir, rootPath);
         continue;
       }
       entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
@@ -262,6 +282,7 @@ export async function discover(opts: DiscoverOptions = {}): Promise<DiscoverResu
             stack.push({ dir: p, real: await realpath(p) });
           } catch {
             diagnostics.push({ level: "warn", code: "dir_unreadable", path: p, message: "cannot resolve directory" });
+            unreadableEntry(c.agent, p, rootPath);
           }
           continue;
         }
@@ -290,6 +311,10 @@ export async function discover(opts: DiscoverOptions = {}): Promise<DiscoverResu
             path: p,
             message: `cannot stat: ${(e as NodeJS.ErrnoException).code ?? "error"}`,
           });
+          // R0.9 file_unreadable: a log file that cannot be examined must not vanish from the scan. It stays in the
+          // list (size and mtime unknown, so never live) so that the parser reports it as unreadable and taints the
+          // provider.
+          files.push({ ...info, agent: c.agent, path: p, relPath, root: rootPath, size: 0, mtimeMs: 0 });
         }
       }
     }
@@ -306,6 +331,7 @@ export async function discover(opts: DiscoverOptions = {}): Promise<DiscoverResu
         diagnostics.push({ level: c.explicit ? "warn" : "info", code: "root_missing", path: c.path, message: "directory does not exist" });
       } else {
         diagnostics.push({ level: "warn", code: "root_unreadable", path: c.path, message: `cannot resolve: ${code ?? "error"}` });
+        unreadableEntry(c.agent, c.path, c.path);
       }
       continue;
     }

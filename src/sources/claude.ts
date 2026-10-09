@@ -1,15 +1,18 @@
-// Claude Code source reader. Binding spec: docs/methodology.md (spec-1, revision 7).
+// Claude Code source reader. Binding spec: docs/methodology.md (spec-1, revision 11).
 //
 // parseClaude(files, opts) turns the Claude files of `discover()` into Responses (one per (key, chain)),
-// links, streams, markers and coverage counters. It applies, in order:
+// links, streams, markers, coverage counters and the integrity facts of R0.9. It applies, in order:
+//   R0.9  named chains, family groups, taint triggers and per-file facts (the parser only reports them)
 //   R1.2/R1.3/R1.4  structural allowlist, parse failures, record types
 //   R2.1-R2.5, R2.12-R2.16  usage normalization, range check, BigInt only
+//   R3.12, R4.2  modifiers are read from the final copy only
 //   R4.1-R4.3, R4.5-R4.7  keys, copy selection, retries, replay ownership
-//   R5.1-R5.5, R5.9  chains, kinds, subagent and workflow linkage, helper tagging
+//   R4.11  identity is read per record from (sessionId, agentId or main), never from a path
+//   R5.1-R5.5, R5.9  chains, kinds, subagent and workflow linkage, helper tagging, every file is read
 //   R6.3, R6.4  start bounds inputs (t_first, t_last, t_asm, start_lo)
 //   R10.1, R10.6, R10.7  diagnostics and prefix hints
 //   R11.7  compact boundary records and the uuid index for the walks
-//   R15.7  unverified versions are counted, never accounted
+//   R15.7  a request key is supported iff every copy in the scan is; unverified keys are counted, never accounted
 //   R17.1, R17.5, R17.6  coverage counters, unlogged-usage inputs, physical vs logical counters
 //
 // Privacy (R1.1): every free-text field is parsed and dropped. Ids stay in process memory only. A SHA-256 of the
@@ -26,19 +29,23 @@ import type { DiscoveredFile } from "../discover.js";
 import { mapWithLimit, newLineStats, readLines } from "../io/lines.js";
 import {
   CLAUDE_FULL_VERSIONS,
-  CONSTANTS,
   RESPONSE_FLAGS,
+  TAINT_REASONS,
+  chainIdOf,
   chainKeyString,
   emptyCoverage,
 } from "../model/types.js";
 import type {
   AgentPrefixHint,
   Assumption,
+  ChainId,
   ChainKey,
   ClaudeCompactBoundary,
   ClaudeParseResult,
   ClaudeResponse,
   ClaudeUuidNode,
+  LedgerCountField,
+  LedgerEntry,
   ConflictKind,
   CostStateUsage,
   CoverageCounters,
@@ -49,8 +56,10 @@ import type {
   Entrypoint,
   ExcludedRecord,
   ExclusionReason,
+  FileFacts,
   FileInfo,
   Geo,
+  IntegrityFacts,
   Link,
   ModelAttribution,
   Modifiers,
@@ -62,6 +71,7 @@ import type {
   Speed,
   StopReason,
   Stream,
+  TaintTrigger,
   UnlinkedReason,
   UsageBuckets,
 } from "../model/types.js";
@@ -92,7 +102,6 @@ const VERSION_RE = /^[0-9]+\.[0-9]+\.[0-9]+$/;
 const BUILD_VERSION_RE = /^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$/;
 const MODEL_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const FULL_VERSIONS: ReadonlySet<string> = new Set<string>(CLAUDE_FULL_VERSIONS);
-const DAY_MS = 86_400_000;
 const MAX_SIDECAR_BYTES = 8 * 1024 * 1024;
 const READ_CONCURRENCY = 8;
 
@@ -200,6 +209,8 @@ interface Rec {
   graph: boolean;
   ver: string;
   supported: boolean;
+  /** R4.11: the record carries a string `sessionId`. Without it the record has no chain (R0.9 `unattributed_record`). */
+  hasSid: boolean;
   S: string;
   T: string;
   uuid: string | null;
@@ -242,14 +253,17 @@ interface FileCtx {
 }
 
 interface Resolved {
+  /** The record's own `sessionId`, or "" when it has none (R0.9 `unattributed_record`). */
   S: string;
   T: string;
+  hasSid: boolean;
 }
 
-function resolveChain(o: Obj, f: DiscoveredFile): Resolved {
-  const S = str(o["sessionId"]) ?? f.sessionId ?? "";
-  const agent = str(o["agentId"]) ?? f.agentId ?? null;
-  return { S, T: agent ?? "main" };
+/** R4.11: identity is read per record from `(sessionId, agentId or main)`. No fallback to the path of the file. */
+function resolveChain(o: Obj): Resolved {
+  const sid = str(o["sessionId"]);
+  const agent = str(o["agentId"]);
+  return { S: sid ?? "", T: agent ?? "main", hasSid: sid !== null };
 }
 
 function parseAsst(o: Obj, ctx: FileCtx): { a: Asst; proj: unknown[] } {
@@ -294,6 +308,9 @@ function parseAsst(o: Obj, ctx: FileCtx): { a: Asst; proj: unknown[] } {
   let hasCC = false;
   let ccBad = false;
   let iter: Asst["iter"] = null;
+  // R1.2, R17.6: every in-range integer member of iterations[0], by member name, as a decimal string. It takes part in
+  // record identity only (hashed); the four shared members are the ones compared (R4.2) and kept.
+  let iterMembers: [string, string][] | null = null;
   let rangeFail = false;
   let speed: Speed | null = null;
   let geo: Geo | null = null;
@@ -318,16 +335,26 @@ function parseAsst(o: Obj, ctx: FileCtx): { a: Asst; proj: unknown[] } {
     if (Array.isArray(its) && isObj(its[0])) {
       const it0 = its[0];
       iter = {};
-      const take = (name: string, slot: "i" | "o" | "r" | "wt"): void => {
-        const v = it0[name];
-        if (typeof v !== "number" || !Number.isInteger(v)) return; // integer members only (R1.2)
-        if (!Number.isSafeInteger(v) || v < 0) rangeFail = true;
-        else (iter as NonNullable<Asst["iter"]>)[slot] = BigInt(v);
+      iterMembers = [];
+      // R1.2, R2.15: EVERY integer member of iterations[0] belongs to the counter row and is range checked. Only the
+      // four members that share a key with the top-level usage are compared (R4.2) and kept.
+      const slots: Record<string, "i" | "o" | "r" | "wt"> = {
+        input_tokens: "i",
+        output_tokens: "o",
+        cache_read_input_tokens: "r",
+        cache_creation_input_tokens: "wt",
       };
-      take("input_tokens", "i");
-      take("output_tokens", "o");
-      take("cache_read_input_tokens", "r");
-      take("cache_creation_input_tokens", "wt");
+      for (const [name, v] of Object.entries(it0)) {
+        if (typeof v !== "number" || !Number.isInteger(v)) continue; // integer members only (R1.2)
+        if (!Number.isSafeInteger(v) || v < 0) {
+          rangeFail = true;
+          continue;
+        }
+        iterMembers.push([name, BigInt(v).toString()]);
+        const slot = Object.hasOwn(slots, name) ? slots[name] : undefined;
+        if (slot !== undefined) (iter as NonNullable<Asst["iter"]>)[slot] = BigInt(v);
+      }
+      iterMembers.sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
     }
     for (const c of [i, r, wt, w5, w1, o2, think]) if (c === "range") rangeFail = true;
     const sp = u["speed"];
@@ -422,7 +449,7 @@ function parseAsst(o: Obj, ctx: FileCtx): { a: Asst; proj: unknown[] } {
     cntProj(w1),
     cntProj(o2),
     cntProj(think),
-    iter === null ? null : [iter.i?.toString(), iter.o?.toString(), iter.r?.toString(), iter.wt?.toString()],
+    iterMembers,
     rangeFail,
     speed,
     hasSpeed,
@@ -507,7 +534,6 @@ function parseCost(o: Obj): { c: CostData; side: number; proj: unknown[] } {
 
 /** Parse one JSON value into a record. Returns the record and its projection digest. */
 function makeRec(v: unknown, ctx: FileCtx): Rec {
-  const f = ctx.file;
   if (!isObj(v)) {
     return {
       d: sha(JSON.stringify(["nonobject", typeof v])),
@@ -515,6 +541,7 @@ function makeRec(v: unknown, ctx: FileCtx): Rec {
       graph: false,
       ver: "unlisted",
       supported: false,
+      hasSid: false,
       S: "",
       T: "main",
       uuid: null,
@@ -531,15 +558,18 @@ function makeRec(v: unknown, ctx: FileCtx): Rec {
   const ts = parseTs(v["timestamp"]);
   const uuid = str(v["uuid"]);
   if (type === "other") {
-    // Unlisted type (R1.4): only the structural id and time are used for equality. The raw type is dropped.
+    // Unlisted type (R1.4): the structural id, the time and the chain key are used for equality. The raw type is
+    // dropped. The chain key is read so that the file names its chain (R0.9 "Named chains").
+    const rc = resolveChain(v);
     return {
-      d: sha(JSON.stringify(["other", uuid, ts])),
+      d: sha(JSON.stringify(["other", uuid, ts, rc.S, rc.T])),
       type,
       graph: false,
       ver: "unlisted",
       supported: false,
-      S: "",
-      T: "main",
+      hasSid: rc.hasSid,
+      S: rc.S,
+      T: rc.T,
       uuid: null,
       parent: null,
       lparent: null,
@@ -549,7 +579,7 @@ function makeRec(v: unknown, ctx: FileCtx): Rec {
       sideRangeFailed: 0,
     };
   }
-  const { S, T } = resolveChain(v, f);
+  const { S, T, hasSid } = resolveChain(v);
   const verRaw = v["version"];
   const ver = typeof verRaw === "string" && VERSION_RE.test(verRaw) ? verRaw : "unlisted";
   const graph = type !== "cost-state";
@@ -564,6 +594,7 @@ function makeRec(v: unknown, ctx: FileCtx): Rec {
     graph,
     ver,
     supported,
+    hasSid,
     S,
     T,
     uuid,
@@ -714,7 +745,20 @@ async function readSmallJson(path: string): Promise<{ state: "ok"; value: unknow
   try {
     return { state: "ok", value: JSON.parse(text) };
   } catch {
-    return { state: "parse_error" };
+    // A one-line sidecar duplicated line by line is still readable: every non-empty line must parse on its own, so
+    // line duplication cannot change the taint. An empty or otherwise broken sidecar is one unparsed line.
+    const lines = text.split("\n").filter((l) => l.trim().length > 0);
+    if (lines.length === 0) return { state: "parse_error" };
+    let first: unknown;
+    for (let k = 0; k < lines.length; k++) {
+      try {
+        const v: unknown = JSON.parse(lines[k] as string);
+        if (k === 0) first = v;
+      } catch {
+        return { state: "parse_error" };
+      }
+    }
+    return { state: "ok", value: first };
   }
 }
 
@@ -857,7 +901,9 @@ function analyzeKey(allCopies: readonly Rec[], keyConflict: boolean): Shared {
   const incomplete = (c: Rec): boolean => {
     const a = c.a as Asst;
     if (c.ts === null || a.ccBad) return true;
-    if (!isBig(a.i) || !isBig(a.r) || !isBig(a.wt)) return true;
+    // R2.12: output_tokens is a counter of the R1.2 row like the others. A copy that lacks it (or holds a non-integer)
+    // makes the request incomplete, a final copy included: a missing value is never treated as 0.
+    if (!isBig(a.i) || !isBig(a.r) || !isBig(a.wt) || !isBig(a.o)) return true;
     if (a.hasCC && (!isBig(a.w5) || !isBig(a.w1))) return true;
     return false;
   };
@@ -931,51 +977,62 @@ function analyzeKey(allCopies: readonly Rec[], keyConflict: boolean): Shared {
       }
     }
   }
-  // iterations[0] must equal the top-level counters on shared keys (final copy)
+  // iterations[0] must equal the top-level counters on shared keys, on EVERY final copy (R4.2): a disagreement on any
+  // of them is a conflict, whatever the order of the copies. The stop reason is read from the first final copy.
   const pf = finals[0];
   if (pf) {
-    const a = pf.a as Asst;
-    const it = a.iter;
-    if (it) {
-      const bad =
+    const iterBad = finals.some((c) => {
+      const a = c.a as Asst;
+      const it = a.iter;
+      if (!it) return false;
+      return (
         (it.i !== undefined && isBig(a.i) && it.i !== a.i) ||
         (it.o !== undefined && isBig(a.o) && it.o !== a.o) ||
         (it.r !== undefined && isBig(a.r) && it.r !== a.r) ||
-        (it.wt !== undefined && isBig(a.wt) && it.wt !== a.wt);
-      if (bad) {
-        output = null;
-        flags.add("output_unknown");
-        flags.add("conflict_iterations");
-        conflicts.push({ kind: "conflict_iterations", effect: "output_unknown" });
-      }
+        (it.wt !== undefined && isBig(a.wt) && it.wt !== a.wt)
+      );
+    });
+    if (iterBad) {
+      output = null;
+      flags.add("output_unknown");
+      flags.add("conflict_iterations");
+      conflicts.push({ kind: "conflict_iterations", effect: "output_unknown" });
     }
-    sh.stop = a.stop;
+    sh.stop = (pf.a as Asst).stop;
   }
 
-  // modifiers (R4.2, R3.4)
+  // modifiers (R4.2, R3.12): speed, inference_geo and service_tier are read from the final copy only. A response
+  // without a final copy has no verified modifier: nothing is assumed, all three stay null and the flag is set.
   let speed: Speed | null = null;
   let geo: Geo | null = null;
   let tier: ServiceTier | null = null;
   let modConflict = false;
-  const sp = new Set(finals.map((c) => (c.a as Asst).speed ?? "other"));
   if (finals.length === 0) {
-    flags.add("speed_assumed");
-  } else if (sp.size === 1) {
-    speed = [...sp][0] as Speed;
+    flags.add("no_final_copy");
   } else {
-    modConflict = true;
+    const nonFinal = usageCopies.filter((c) => !(c.a as Asst).hasSpeed);
+    // The final copies must agree with each other (a final copy that lacks a value another one carries is a
+    // disagreement), and a non-final copy that carries a value must carry the final copy's value (R4.2).
+    const resolve = <T extends string>(get: (a: Asst) => T | null): T | null => {
+      const fv = new Set<T | null>(finals.map((c) => get(c.a as Asst)));
+      if (fv.size > 1) {
+        modConflict = true;
+        return null;
+      }
+      const v = [...fv][0] ?? null;
+      for (const c of nonFinal) {
+        const x = get(c.a as Asst);
+        if (x !== null && x !== v) {
+          modConflict = true;
+          return null;
+        }
+      }
+      return v;
+    };
+    speed = resolve((a) => a.speed);
+    geo = resolve((a) => a.geo);
+    tier = resolve((a) => a.tier);
   }
-  const gs = new Set<Geo>();
-  const ts = new Set<ServiceTier>();
-  for (const c of usageCopies) {
-    const a = c.a as Asst;
-    if (a.geo !== null) gs.add(a.geo);
-    if (a.tier !== null) ts.add(a.tier);
-  }
-  if (gs.size === 1) geo = [...gs][0] as Geo;
-  else if (gs.size > 1) modConflict = true;
-  if (ts.size === 1) tier = [...ts][0] as ServiceTier;
-  else if (ts.size > 1) modConflict = true;
   if (modConflict) {
     flags.add("conflict_modifier");
     conflicts.push({ kind: "conflict_modifier", effect: "unpriced_modifier" });
@@ -1037,7 +1094,7 @@ interface ChainAgg {
 
 const FLAG_ORDER: ReadonlyMap<ResponseFlag, number> = new Map(RESPONSE_FLAGS.map((f, i) => [f, i]));
 
-export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFile[], opts: ParseOptions = {}): Promise<ClaudeParseResult> => {
+export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFile[], _opts: ParseOptions = {}): Promise<ClaudeParseResult> => {
   const cov: CoverageCounters = emptyCoverage();
   const assumptions = new Set<Assumption>();
 
@@ -1055,9 +1112,8 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
 
   const fileUnreadable: boolean[] = files.map(() => false);
   const fileLines: number[] = files.map(() => 0);
-  const prefilterCut =
-    opts.fastPrefilter === true && opts.window ? opts.window.since_ms - CONSTANTS.FAST_PREFILTER_DAYS * DAY_MS : null;
-  if (prefilterCut !== null) assumptions.add("mtime_prefilter_on");
+  /** Lines of each physical file that failed to parse, a truncated tail included (R1.3, R0.9 FileFacts). */
+  const fileUnparsed: number[] = files.map(() => 0);
 
   // ----- phase 1: sidecars (meta, prefix, workflow run, workflow journal) ----------------------------------
   const metas = new Map<string, MetaInfo>(); // S\0agent
@@ -1085,6 +1141,7 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     }
     if (val.state === "parse_error") {
       cov.lines_parse_error += 1;
+      fileUnparsed[i] = 1; // R0.9: a sidecar that fails to parse names no chain, so its taint is provider-wide
       return;
     }
     const sess = f.sessionId ?? "";
@@ -1138,6 +1195,7 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     cov.lines_parse_error += j.perr;
     cov.lines_truncated_tail += j.tail;
     fileLines[j.i] = j.lines;
+    fileUnparsed[j.i] = j.perr + j.tail;
     for (const n of j.dupLines) {
       if (n >= 2) {
         cov.lines_duplicate_collapsed += n - 1;
@@ -1167,8 +1225,7 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
   const jsonlIdx: number[] = [];
   files.forEach((f, i) => {
     if (f.kind === "claude-main" || f.kind === "claude-subagent") {
-      if (prefilterCut !== null && f.mtimeMs < prefilterCut) return; // R5.9 --fast: not read
-      jsonlIdx.push(i);
+      jsonlIdx.push(i); // R5.9: every file is read, whatever its modification time
     }
   });
   const fileRes = await mapWithLimit(jsonlIdx, READ_CONCURRENCY, async (i) =>
@@ -1199,6 +1256,7 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
   for (const out of outs) {
     outByIdx.set(out.idx, out);
     fileLines[out.idx] = out.lines;
+    fileUnparsed[out.idx] = out.parseErr + out.truncTail;
     cov.lines_total += out.lines;
     cov.lines_parse_error += out.parseErr;
     cov.lines_truncated_tail += out.truncTail;
@@ -1235,9 +1293,42 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
   const unverifiedVersionsSeen = recs.some((r) => r.graph && !r.supported);
   if (unverifiedVersionsSeen) assumptions.add("unverified_version");
 
+  // ----- R0.9 integrity inputs: named chains, chain ids, triggers ------------------------------------------------
+  // Every parsed record of any version with a string `sessionId` names a chain (structural read, R15.7). The sets
+  // below are built from sets of collapsed records, so line order, file order and duplication cannot change them.
+  const chainKeyOf = (S: string, T: string): ChainKey => ({ provider: "claude", root_session: S, thread: T });
+  const cidOf = (S: string, T: string): ChainId => chainIdOf(chainKeyOf(S, T));
+  const seenChains = new Set<ChainId>();
+  const bySession = new Map<string, Set<ChainId>>(); // R0.9 link (i)
+  const named: Array<Set<ChainId>> = files.map(() => new Set<ChainId>());
+  const triggerMap = new Map<string, TaintTrigger>();
+  const addTrigger = (reason: TaintTrigger["reason"], names: Iterable<ChainId> | "provider"): void => {
+    if (names === "provider") {
+      triggerMap.set(`${reason}\u0000*`, { reason, names: "provider" });
+      return;
+    }
+    const list = [...new Set(names)].sort(cmpStr);
+    if (list.length === 0) return;
+    triggerMap.set(`${reason}\u0000${list.join("\u0001")}`, { reason, names: list });
+  };
+  for (const r of recs) {
+    if (!r.hasSid) {
+      // R0.9 `unattributed_record`: an assistant, user, system or attachment record whose sessionId is missing or
+      // not a string. It contributes nothing to accounting and taints every Claude chain.
+      if (r.graph) addTrigger("unattributed_record", "provider");
+      continue;
+    }
+    const id = cidOf(r.S, r.T);
+    seenChains.add(id);
+    let g = bySession.get(r.S);
+    if (!g) bySession.set(r.S, (g = new Set()));
+    g.add(id);
+    for (const fi of r.files) named[fi]?.add(id);
+  }
+
   // ----- phase 4: chains / streams ---------------------------------------------------------------------------
   const chains = new Map<string, ChainAgg>();
-  const supportedGraph = recs.filter((r) => r.graph && r.supported);
+  const supportedGraph = recs.filter((r) => r.graph && r.hasSid && r.supported);
   for (const r of supportedGraph) {
     const k = recChain(r);
     let c = chains.get(k);
@@ -1280,7 +1371,6 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
   }
   const uuidIndex = new Map<string, ClaudeUuidNode>();
   const compactBoundaries: ClaudeCompactBoundary[] = [];
-  const chainKeyOf = (S: string, T: string): ChainKey => ({ provider: "claude", root_session: S, thread: T });
   const uuidKeys = [...byUuid.keys()].sort(cmpStr);
   for (const u of uuidKeys) {
     const cands = (byUuid.get(u) as Rec[]).slice().sort((x, y) => cmpNum(x.ts, y.ts) || cmpNullStr(x.parent, y.parent) || cmpStr(x.d, y.d));
@@ -1288,83 +1378,125 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     const owner = pickOwner([...new Set(cands.map(recChain))].sort(cmpStr));
     const oc = chains.get(owner.owner) as ChainAgg;
     const isBoundary = cands.some((c) => c.sys?.boundary === true);
+    // R6.3: a uuid that names records with different timestamps or parents does not resolve.
+    const unresolved = cands.some((c) => c.ts !== first.ts || c.parent !== first.parent || c.lparent !== first.lparent);
     uuidIndex.set(u, {
       uuid: u,
-      parent_uuid: first.parent,
-      logical_parent_uuid: first.lparent,
-      ts_ms: first.ts,
+      parent_uuid: unresolved ? null : first.parent,
+      logical_parent_uuid: unresolved ? null : first.lparent,
+      ts_ms: unresolved ? null : first.ts,
       is_compact_summary: first.isSummary,
       is_compact_boundary: isBoundary,
       chain: chainKeyOf(oc.S, oc.T),
+      unresolved,
     });
     if (isBoundary) {
       const b = (cands.find((c) => c.sys?.boundary === true) as Rec).sys as SysData;
       compactBoundaries.push({
         chain: chainKeyOf(oc.S, oc.T),
         uuid: u,
-        logical_parent_uuid: first.lparent,
+        logical_parent_uuid: unresolved ? null : first.lparent,
         trigger: b.trigger,
         pre_tokens: b.pre,
         post_tokens: b.post,
-        ts_ms: first.ts,
+        ts_ms: unresolved ? null : first.ts,
       });
     }
   }
 
   // ----- phase 5: requests --------------------------------------------------------------------------------------
-  const byKey = new Map<string, Rec[]>();
-  const unverifiedKeys = new Map<string, Map<string, number | null>>(); // key -> chain -> min ts
+  // R15.7: a request key is supported iff every copy of it in the scan carries a version with full support. All
+  // copies of every version are read to decide this; only keys with no unsupported copy are accounted.
+  const byKey = new Map<string, Rec[]>(); // supported copies of a key
+  const keyChains = new Map<string, Map<string, number | null>>(); // key -> chain -> min ts, copies of any version
+  const unverifiedKeySet = new Set<string>();
   const excluded: ExcludedRecord[] = [];
+  const ledger: LedgerEntry[] = []; // event-time ledger of the logical counters (LEDGER_COUNT_FIELDS)
   const reqToMsg = new Map<string, Set<string>>();
   const msgToReq = new Map<string, Set<string>>();
+  const noteCopy = (key: string, ck: string, ts: number | null): void => {
+    let m = keyChains.get(key);
+    if (!m) keyChains.set(key, (m = new Map()));
+    const prev = m.get(ck);
+    m.set(ck, prev === undefined ? ts : prev === null ? ts : ts === null ? prev : Math.min(prev, ts));
+  };
   for (const r of recs) {
     if (r.type === "cost-state") {
       cov.fields_range_failed += r.sideRangeFailed;
+      if (r.sideRangeFailed > 0) ledger.push({ t_ms: r.ts, chain: null, n: { fields_range_failed: r.sideRangeFailed } });
+      continue;
+    }
+    // R0.9 `unattributed_record`: no chain, no accounting, no counters. Its version still counts for the key
+    // (R15.7: every copy of the key decides, whatever the chain of the copy): a copy of an unsupported version
+    // makes the key unverified, so a supported peer cannot enter the totals next to it.
+    if (!r.hasSid) {
+      if (r.type === "assistant" && !r.supported) {
+        const sa = r.a as Asst;
+        if (!sa.isErr && sa.key !== null) unverifiedKeySet.add(sa.key);
+      }
       continue;
     }
     if (r.type !== "assistant") {
-      if (r.supported) cov.fields_range_failed += r.sideRangeFailed;
+      if (r.supported) {
+        cov.fields_range_failed += r.sideRangeFailed;
+        if (r.sideRangeFailed > 0) ledger.push({ t_ms: r.ts, chain: cidOf(r.S, r.T), n: { fields_range_failed: r.sideRangeFailed } });
+      }
       continue;
     }
     const a = r.a as Asst;
+    const ck = recChain(r);
     if (!r.supported) {
-      // R15.7: counted, never accounted.
-      if (!a.isErr && a.key !== null) {
-        let m = unverifiedKeys.get(a.key);
-        if (!m) unverifiedKeys.set(a.key, (m = new Map()));
-        const ck = recChain(r);
-        const prev = m.get(ck);
-        m.set(ck, prev === undefined ? r.ts : prev === null ? r.ts : r.ts === null ? prev : Math.min(prev, r.ts));
+      // Counted and structurally read, never accounted (R15.7).
+      if (!a.isErr) {
+        if (a.key !== null) {
+          unverifiedKeySet.add(a.key);
+          noteCopy(a.key, ck, r.ts);
+        } else {
+          addTrigger("request_anomaly", [cidOf(r.S, r.T)]); // R2.13: an unkeyed record with a known chain
+        }
       }
       continue;
     }
     cov.fields_range_failed += r.sideRangeFailed;
+    if (r.sideRangeFailed > 0) ledger.push({ t_ms: r.ts, chain: cidOf(r.S, r.T), n: { fields_range_failed: r.sideRangeFailed } });
     if (a.isErr) {
       cov.api_error_records += 1; // R2.14
-      if (r.ts !== null && chains.has(recChain(r))) {
+      ledger.push({ t_ms: r.ts, chain: cidOf(r.S, r.T), n: { api_error_records: 1 } });
+      if (r.ts !== null && chains.has(ck)) {
         excluded.push({ provider: "claude", chain: chainKeyOf(r.S, r.T), reason: "api_error", event_ms: r.ts, ordinal: null, files: r.files });
       }
       continue;
     }
+    const recN: { -readonly [K in LedgerCountField]?: number } = {};
     if (a.hasUsage) {
       cov.records_usage_bearing += 1;
+      recN.records_usage_bearing = 1;
       const gone = (c: Cnt): boolean => c === "missing" || c === "bad";
       const unmappable =
-        r.ts === null || a.ccBad || gone(a.i) || gone(a.r) || gone(a.wt) || (a.hasCC && (gone(a.w5) || gone(a.w1)));
-      if (unmappable) cov.records_usage_unmappable += 1;
+        r.ts === null || a.ccBad || gone(a.i) || gone(a.r) || gone(a.wt) || gone(a.o) || (a.hasCC && (gone(a.w5) || gone(a.w1)));
+      if (unmappable) {
+        cov.records_usage_unmappable += 1;
+        recN.records_usage_unmappable = 1;
+      }
     }
     if (a.key === null) {
+      // R2.13: unkeyed. The chain is known (string sessionId), so it is tainted (R0.9 `request_anomaly`).
+      addTrigger("request_anomaly", [cidOf(r.S, r.T)]);
       if (a.hasUsage) {
-        cov.records_unkeyed += 1; // R2.13
+        cov.records_unkeyed += 1;
+        recN.records_unkeyed = 1;
+        ledger.push({ t_ms: r.ts, chain: cidOf(r.S, r.T), n: recN });
         if (r.ts !== null) {
           excluded.push({ provider: "claude", chain: chainKeyOf(r.S, r.T), reason: "unkeyed", event_ms: r.ts, ordinal: null, files: r.files });
         }
       }
       continue;
     }
+    if (a.hasUsage) ledger.push({ t_ms: r.ts, chain: cidOf(r.S, r.T), n: recN });
     let l = byKey.get(a.key);
     if (!l) byKey.set(a.key, (l = []));
     l.push(r);
+    noteCopy(a.key, ck, r.ts);
     if (a.msgId !== null) {
       let s = reqToMsg.get(a.key);
       if (!s) reqToMsg.set(a.key, (s = new Set()));
@@ -1381,17 +1513,23 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
 
   const responses: ClaudeResponse[] = [];
   const conflicts: DedupConflict[] = [];
-  const keyList = [...byKey.keys()].sort(cmpStr);
-  const sinceMs = opts.window ? opts.window.since_ms : null;
+  const keyList = [...byKey.keys()].filter((k) => !unverifiedKeySet.has(k)).sort(cmpStr);
   let anyStartLo = false;
+  const chainIdOfAgg = (cs: string): ChainId => {
+    const agg = chains.get(cs) as ChainAgg;
+    return cidOf(agg.S, agg.T);
+  };
 
   for (const key of keyList) {
     const copies = byKey.get(key) as Rec[];
     const sh = analyzeKey(copies, conflictedKeys.has(key));
     cov.responses_total += 1;
     cov.requests_total += 1;
-    if (unverifiedKeys.has(key)) cov.requests_unverified_version += 1;
-    if (sh.hasFinal) cov.requests_with_final_marker += 1;
+    const keyN: { -readonly [K in LedgerCountField]?: number } = { responses_total: 1 };
+    if (sh.hasFinal) {
+      cov.requests_with_final_marker += 1;
+      keyN.requests_with_final_marker = 1;
+    }
 
     // ownership (R4.6)
     const chainSet = [...new Set(copies.map(recChain))].sort(cmpStr);
@@ -1399,18 +1537,58 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     const allFiles = [...new Set(copies.flatMap((c) => c.files))].sort((a, b) => a - b);
     if (chainSet.length > 1) {
       cov.replay_requests_excluded += chainSet.length - 1;
-      if (own.ambiguous) cov.replay_ownership_ambiguous += 1;
+      keyN.replay_requests_excluded = chainSet.length - 1;
+      if (own.ambiguous) {
+        cov.replay_ownership_ambiguous += 1;
+        keyN.replay_ownership_ambiguous = 1;
+      }
     }
+    // R0.9 `request_anomaly` and `ownership_ambiguous` name every chain that holds a copy.
+    const anomaly =
+      sh.exclusion === "usage_range_failed" ||
+      sh.exclusion === "usage_incomplete" ||
+      sh.conflicts.some((c) => c.kind !== "conflict_diagnostics") ||
+      sh.flags.has("bucket_mismatch");
+    if (anomaly) addTrigger("request_anomaly", chainSet.map(chainIdOfAgg));
+    if (chainSet.length > 1 && own.ambiguous) addTrigger("ownership_ambiguous", chainSet.map(chainIdOfAgg));
+    // R17.1 requests_conflict counts requests: one per request with at least one conflict code except
+    // `conflict_diagnostics` (no exclusion, no taint, R4.2). The per-code counts stay in requests_conflict_by_kind.
     for (const c of sh.conflicts) {
       conflicts.push({ provider: "claude", kind: c.kind, key, files: allFiles, effect: c.effect });
-      cov.requests_conflict += 1;
       cov.requests_conflict_by_kind[c.kind] += 1;
-      if (c.kind === "conflict_modifier") cov.requests_conflict_modifier += 1;
+      if (c.kind === "conflict_modifier") {
+        cov.requests_conflict_modifier += 1;
+        keyN.requests_conflict_modifier = 1;
+      }
     }
-    if (sh.exclusion === "usage_range_failed") cov.responses_usage_range_failed += 1;
+    if (sh.conflicts.some((c) => c.kind !== "conflict_diagnostics")) {
+      cov.requests_conflict += 1;
+      keyN.requests_conflict = 1;
+    }
+    if (sh.exclusion === "usage_range_failed") {
+      cov.responses_usage_range_failed += 1;
+      keyN.responses_usage_range_failed = 1;
+    }
     if (sh.exclusion === "usage_incomplete") cov.tokens_in_incomplete_responses += sh.incompleteTokens;
-    if (sh.flags.has("bucket_mismatch")) cov.responses_bucket_mismatch += 1;
-    if (sh.flags.has("speed_assumed")) cov.responses_speed_assumed += 1;
+    if (sh.flags.has("bucket_mismatch")) {
+      cov.responses_bucket_mismatch += 1;
+      keyN.responses_bucket_mismatch = 1;
+    }
+    // R6.3, R4.2, R5.9: the times of a request are min and max over EVERY copy of the key, whatever chain holds the
+    // copy. The owner and the replay streams then carry one and the same event time, so the window and the ledger
+    // cannot depend on which stream owns the request.
+    const allTs = copies.map((c) => c.ts).filter((t): t is number => t !== null);
+    const reqFirst = allTs.length > 0 ? Math.min(...allTs) : 0;
+    const reqLast = allTs.length > 0 ? Math.max(...allTs) : 0;
+    {
+      ledger.push({
+        t_ms: allTs.length > 0 ? reqFirst : null,
+        chain: chainIdOfAgg(own.owner),
+        n: keyN,
+        conflict_kinds: sh.conflicts.map((c) => c.kind),
+        tokens_incomplete: sh.exclusion === "usage_incomplete" ? sh.incompleteTokens : 0n,
+      });
+    }
     if (sh.usage && sh.usage.output === null) cov.output_unknown_requests += 1;
     if (sh.exclusion === null && !sh.model.verified) cov.responses_model_unverified += 1;
 
@@ -1418,9 +1596,8 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
       const agg = chains.get(cs) as ChainAgg;
       const mine = copies.filter((c) => recChain(c) === cs).sort(earliestOrder);
       const earliest = mine[0] as Rec;
-      const tsList = mine.map((c) => c.ts).filter((t): t is number => t !== null);
-      const tFirst = tsList.length > 0 ? Math.min(...tsList) : 0;
-      const tLast = tsList.length > 0 ? Math.max(...tsList) : 0;
+      const tFirst = reqFirst;
+      const tLast = reqLast;
       const parentNode = earliest.parent !== null ? uuidIndex.get(earliest.parent) : undefined;
       const tAsm = parentNode?.ts_ms ?? null;
       const startLo = tAsm !== null && tAsm <= tFirst ? tAsm : null;
@@ -1430,7 +1607,6 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
       let kind: RequestKind = "main";
       if (agg.T !== "main") kind = agg.workflowFile ? "workflow_agent" : "subagent";
       const role = cs === own.owner ? "owner" : "replayed";
-      if (role === "owner" && sinceMs !== null && sh.exclusion === null && tFirst < sinceMs) cov.baseline_requests_loaded += 1;
       const r: ClaudeResponse = {
         provider: "claude",
         key,
@@ -1470,11 +1646,19 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
       responses.push(r);
     }
   }
-  // keys seen only in unverified versions (R15.7)
-  for (const [key, m] of [...unverifiedKeys.entries()].sort((x, y) => cmpStr(x[0], y[0]))) {
-    if (byKey.has(key)) continue;
+  // R15.7: unverified keys (some copy of a version without full support) are counted, never accounted. Every chain
+  // that holds a copy is tainted (R0.9 `version_unverified`).
+  for (const key of [...unverifiedKeySet].sort(cmpStr)) {
     cov.requests_total += 1;
     cov.requests_unverified_version += 1;
+    const m = keyChains.get(key) ?? new Map<string, number | null>();
+    addTrigger(
+      "version_unverified",
+      [...m.keys()].map((ck) => {
+        const [S, T] = ck.split("\u0000") as [string, string];
+        return cidOf(S, T);
+      }),
+    );
     for (const [ck, ts] of [...m.entries()].sort((x, y) => cmpStr(x[0], y[0]))) {
       const agg = chains.get(ck);
       if (!agg || ts === null) continue; // a chain without a supported record has no stream to sit in
@@ -1533,13 +1717,19 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
       let parent: ChainKey | null = null;
       let depth: number | null = null;
       const af = agentFiles.length > 0 ? (files[agentFiles[0] as number] as DiscoveredFile) : null;
-      const meta = af ? metas.get(chainStr(af.sessionId ?? "", af.agentId ?? "")) : undefined;
+      // R4.11, R5.3: the sidecar is bound to the logical chain, never to the name of a physical file. The chain's own
+      // ids (the `sessionId` and `agentId` of its records) name the meta.json that belongs to it, so a split of an
+      // agent file into files with other names (R4.10, R17.7: no links_* counter changes) leaves the link as it was.
+      // Only a chain that has no meta of its own falls back to the meta that the name of its first file points at,
+      // which is how a file that holds records of another agent or session is still reported (R5.3 item 2).
+      const ownMeta = metas.get(chainStr(agg.S, agg.T));
+      const meta = ownMeta ?? (af ? metas.get(chainStr(af.sessionId ?? "", af.agentId ?? "")) : undefined);
       if (meta && typeof meta.depth === "number") depth = meta.depth;
       if (af === null) reason = "agent_mismatch"; // records name an agent id, but no agent file holds them
       else if (!meta) reason = "no_meta";
       else if (meta.toolUseId === null) reason = "no_tool_use_id";
-      else if (agentFiles.some((fi) => outByIdx.get(fi)?.sessMismatch === true)) reason = "session_mismatch";
-      else if (agentFiles.some((fi) => outByIdx.get(fi)?.agentMismatch === true)) reason = "agent_mismatch";
+      else if (ownMeta === undefined && agentFiles.some((fi) => outByIdx.get(fi)?.sessMismatch === true)) reason = "session_mismatch";
+      else if (ownMeta === undefined && agentFiles.some((fi) => outByIdx.get(fi)?.agentMismatch === true)) reason = "agent_mismatch";
       else {
         // R5.3 (3): parent selection
         let parentThread: string | null = null;
@@ -1575,13 +1765,10 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
       files: [...agg.files].sort((a, b) => a - b),
       start_ms: agg.start,
       ordinal_verified: null,
-      integrity_unverified: false,
-      integrity_reasons: [],
       fork: null,
       has_settings_marker: false,
     };
   });
-  cov.streams_total = streams.length;
 
   const prefixHints: AgentPrefixHint[] = prefixes
     .filter((p) => chains.has(chainStr(p.S, p.A)))
@@ -1660,6 +1847,7 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
       index: i,
       provider: "claude",
       source_kind: f.kind,
+      mtime_ms: f.mtimeMs,
       versions: vs,
       support: graphVs > 0 && !anySupported ? "coverage_only" : "full",
       readable: !(fileUnreadable[i] as boolean),
@@ -1679,7 +1867,41 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
   );
   compactBoundaries.sort((x, y) => cmpStr(x.uuid, y.uuid));
 
-  const assumptionOrder: readonly Assumption[] = ["parent_record_precedes_request", "unverified_version", "mtime_prefilter_on"];
+  // ----- R0.9 integrity facts -----------------------------------------------------------------------------------
+  // R15.7 structural reads feed only the family relation and the taint, which can only withdraw output.
+  const groupSet = new Map<string, readonly ChainId[]>();
+  const addGroup = (ids: Iterable<ChainId>): void => {
+    const g = [...new Set(ids)].sort(cmpStr);
+    if (g.length >= 2) groupSet.set(g.join("\u0001"), g); // a group of one links nothing
+  };
+  for (const g of bySession.values()) addGroup(g); // link (i): a shared sessionId
+  for (const m of keyChains.values()) {
+    // link (iii): copies of one request key (Claude replays, R4.6)
+    addGroup([...m.keys()].map((ck) => cidOf(...(ck.split("\u0000") as [string, string]))));
+  }
+  fileUnreadable.forEach((u) => {
+    if (u) addTrigger("file_unreadable", "provider"); // R17.1: the file cannot be read, its records are unknown
+  });
+  const fileFacts: FileFacts[] = files.map((f, i) => ({
+    index: i,
+    provider: "claude",
+    mtime_ms: f.mtimeMs,
+    named_chains: [...(named[i] as Set<ChainId>)].sort(cmpStr),
+    unparsed_lines: fileUnparsed[i] as number,
+    readable: !(fileUnreadable[i] as boolean),
+  }));
+  const reasonOrder: ReadonlyMap<string, number> = new Map(TAINT_REASONS.map((r, i) => [r, i]));
+  const trigKey = (t: TaintTrigger): string => (t.names === "provider" ? "*" : t.names.join("\u0001"));
+  const integrity: IntegrityFacts = {
+    provider: "claude",
+    chains: [...seenChains].sort(cmpStr),
+    family_groups: [...groupSet.values()].sort((x, y) => cmpStr(x.join("\u0001"), y.join("\u0001"))),
+    triggers: [...triggerMap.values()].sort(
+      (x, y) => (reasonOrder.get(x.reason) as number) - (reasonOrder.get(y.reason) as number) || cmpStr(trigKey(x), trigKey(y)),
+    ),
+    files: fileFacts,
+  };
+  const assumptionOrder: readonly Assumption[] = ["parent_record_precedes_request", "unverified_version"];
   return {
     provider: "claude",
     responses,
@@ -1694,5 +1916,7 @@ export const parseClaude: ParseClaude = async (inputFiles: readonly DiscoveredFi
     compact_boundaries: compactBoundaries,
     prefix_hints: prefixHints,
     cost_state: costState,
+    integrity,
+    ledger,
   };
 };

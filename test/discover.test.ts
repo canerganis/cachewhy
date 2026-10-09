@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import { classifyClaude, discover } from "../src/discover.ts";
+import { classifyClaude, discover, inProject } from "../src/discover.ts";
 
 let tmp: string;
 const S = "synthetic-session-0001";
@@ -171,5 +171,12 @@ describe("discover", () => {
     writeFileSync(f, "x");
     const r = await discover({ home, env: {}, claudeDirs: [f] });
     assert.ok(r.diagnostics.some((d) => d.code === "root_not_directory"));
+  });
+
+  it("inProject is a Claude project directory match and never matches a Codex file (R5.9 output filter)", () => {
+    assert.equal(inProject({ agent: "claude", relPath: "proj-a/x.jsonl" }, "proj-a"), true);
+    assert.equal(inProject({ agent: "claude", relPath: "proj-a/x.jsonl" }, "proj"), false);
+    assert.equal(inProject({ agent: "claude", relPath: "proj-b/proj-a/x.jsonl" }, "proj-a"), false);
+    assert.equal(inProject({ agent: "codex", relPath: "proj-a/x.jsonl" }, "proj-a"), false);
   });
 });

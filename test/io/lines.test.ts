@@ -65,11 +65,29 @@ test("prefilter skips lines but keeps ordinals and offsets", async () => {
   assert.equal(stats.linesSkippedByPrefilter, 1);
 });
 
-test("missing file is reported in stats", async () => {
+test("missing file is reported in stats as a fixed code, never as exception text or a path (R0.2, R14.6, R17.1)", async () => {
   const stats = newLineStats();
   const got = await collect(join(dir, "nope.jsonl"), { stats });
   assert.equal(got.length, 0);
-  assert.ok(stats.error);
+  assert.equal(stats.error, "read_failed");
+  assert.ok(!JSON.stringify(stats).includes("nope"));
+});
+
+test("a directory where a file is expected is reported per file and never thrown (R0.2)", async () => {
+  const stats = newLineStats();
+  const got = await collect(dir, { stats });
+  assert.equal(got.length, 0);
+  assert.equal(stats.error, "read_failed");
+});
+
+test("a truncated zstd frame never throws and is reported, so the caller can mark the file unreadable (R0.9 file_unreadable)", { skip: !zstdSupported() }, async () => {
+  const p = join(dir, "partial.jsonl.zst");
+  const good = (zlib as unknown as { zstdCompressSync(b: Buffer): Buffer }).zstdCompressSync(Buffer.from("l1\nl2\n".repeat(50)));
+  writeFileSync(p, good.subarray(0, Math.max(1, good.length - 4)));
+  const stats = newLineStats();
+  const got = await collect(p, { stats });
+  assert.equal(stats.error, "read_failed");
+  assert.ok(got.length <= 100);
 });
 
 test("zstd file: decoded when supported, else reported unsupported", async () => {

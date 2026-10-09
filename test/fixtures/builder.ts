@@ -6,7 +6,7 @@
 // - Only erasable TypeScript syntax (no enums, no parameter properties), so Node 22.18+ and Node 24 can
 //   run it directly with type stripping. Relative imports use the .ts extension.
 
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import * as zlib from 'node:zlib';
 
@@ -76,6 +76,11 @@ export interface GeneratedFile {
    * must not be written to disk.
    */
   unavailable?: boolean;
+  /**
+   * Modification time to give the file on disk (R0.9 live families read it). Unset leaves the write time. Splitting
+   * helpers copy it to both halves (R4.10 op 5).
+   */
+  mtimeMs?: number;
 }
 
 /** Writes the files. Files this Node cannot produce (unavailable) are skipped. */
@@ -85,7 +90,48 @@ export function writeFiles(root: string, files: readonly GeneratedFile[]): void 
     const abs = join(root, ...f.path.split('/'));
     mkdirSync(dirname(abs), { recursive: true });
     writeFileSync(abs, f.content);
+    if (f.mtimeMs !== undefined) utimesSync(abs, f.mtimeMs / 1000, f.mtimeMs / 1000);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Text-level edits of a generated file (raw lines, truncated tail)
+// ---------------------------------------------------------------------------
+
+/** Lines of a text file as written: without the terminators. A final line without terminator is a truncated tail. */
+export function textLines(text: string): { lines: string[]; endsWithNewline: boolean } {
+  if (text === '') return { lines: [], endsWithNewline: true };
+  const endsWithNewline = text.endsWith('\n');
+  const body = endsWithNewline ? text.slice(0, -1) : text;
+  return { lines: body.split('\n'), endsWithNewline };
+}
+
+/** Inverse of textLines. */
+export function joinLines(lines: readonly string[], endsWithNewline: boolean): string {
+  if (lines.length === 0) return '';
+  return lines.join('\n') + (endsWithNewline ? '\n' : '');
+}
+
+/**
+ * Insert raw text lines (for example garbage that does not parse as JSON) before the line at index `at` of the
+ * file, each with its own terminator (R17.6). The file must be uncompressed text. Returns a new file.
+ */
+export function withRawLines(file: GeneratedFile, inserts: ReadonlyArray<{ at: number; text: string }>): GeneratedFile {
+  if (typeof file.content !== 'string') throw new Error('withRawLines needs a text file');
+  const { lines, endsWithNewline } = textLines(file.content);
+  const out = lines.slice();
+  // Insert from the highest index down so that earlier indices stay valid.
+  for (const ins of [...inserts].sort((a, b) => b.at - a.at)) out.splice(Math.min(ins.at, out.length), 0, ins.text);
+  return { ...file, content: joinLines(out, endsWithNewline), plain: undefined };
+}
+
+/** Append a truncated last line (no terminator), as a session being written leaves it (R1.3). Returns a new file. */
+export function withTruncatedTail(file: GeneratedFile, tail = '{"type":"user","message":{"content":"synthetic-trunc'): GeneratedFile {
+  if (typeof file.content !== 'string') throw new Error('withTruncatedTail needs a text file');
+  const { lines, endsWithNewline } = textLines(file.content);
+  const base = joinLines(lines, true);
+  void endsWithNewline;
+  return { ...file, content: base + tail, plain: undefined };
 }
 
 /** zstd-compress with node:zlib when this Node has it (22.15+ / 23.8+ / 24). Returns null otherwise. */
@@ -262,7 +308,7 @@ export interface ClaudeRequestSpec {
   model?: string;
   usage?: ClaudeUsageSpec;
   /** Content blocks. One block is one record (copy). Default: a single text block. */
-  blocks?: ClaudeBlockSpec[];
+  blocks?: readonly ClaudeBlockSpec[];
   stopReason?: string | null;
   /** usage.speed on the final copy. Default 'standard'. null omits it (no final copy exists). */
   finalSpeed?: string | null;
@@ -276,8 +322,10 @@ export interface ClaudeRequestSpec {
   apiError?: boolean;
   /** message.diagnostics.cache_miss_reason on the final copy. */
   diagnostics?: { type: string; cacheMissedInputTokens?: number };
-  /** Extra top-level fields merged into every copy (for example effort). */
+  /** Extra top-level fields merged into every copy (for example effort). A value of `undefined` removes the key. */
   extra?: JsonObject;
+  /** Product version of every copy of this request (default: the thread's version), R15.7. */
+  version?: string;
 }
 
 export type ClaudeRecord = JsonObject;
@@ -341,8 +389,9 @@ export class ClaudeThread {
    * `compactSummary`, an `isCompactSummary` record: put it right after compactBoundary() so that its
    * parent is the boundary (spec R11.7).
    */
-  user(opts: { toolResultFor?: string; dtMs?: number; compactSummary?: boolean } = {}): ClaudeRecord {
+  user(opts: { toolResultFor?: string; dtMs?: number; compactSummary?: boolean; extra?: JsonObject } = {}): ClaudeRecord {
     const rec = this.base('user', this.clock.tick(opts.dtMs));
+    if (opts.extra) Object.assign(rec, opts.extra);
     if (opts.compactSummary) rec.isCompactSummary = true;
     rec.message = {
       role: 'user',
@@ -372,16 +421,18 @@ export class ClaudeThread {
   }
 
   /** A generic system record (for example subtype 'informational'). */
-  system(subtype: string, opts: { dtMs?: number } = {}): ClaudeRecord {
+  system(subtype: string, opts: { dtMs?: number; extra?: JsonObject } = {}): ClaudeRecord {
     const rec = this.base('system', this.clock.tick(opts.dtMs));
+    if (opts.extra) Object.assign(rec, opts.extra);
     rec.subtype = subtype;
     rec.content = 'synthetic-system';
     this.records.push(rec);
     return rec;
   }
 
-  attachment(opts: { dtMs?: number } = {}): ClaudeRecord {
+  attachment(opts: { dtMs?: number; extra?: JsonObject } = {}): ClaudeRecord {
     const rec = this.base('attachment', this.clock.tick(opts.dtMs));
+    if (opts.extra) Object.assign(rec, opts.extra);
     rec.attachment = { type: 'synthetic-attachment' };
     this.records.push(rec);
     return rec;
@@ -395,7 +446,7 @@ export class ClaudeThread {
   request(spec: ClaudeRequestSpec = {}): ClaudeRequestResult {
     const requestId = spec.requestId ?? this.ids.next('req');
     const messageId = spec.messageId ?? this.ids.next('msg');
-    const blocks: ClaudeBlockSpec[] = spec.blocks && spec.blocks.length ? spec.blocks : [{ type: 'text' }];
+    const blocks: readonly ClaudeBlockSpec[] = spec.blocks && spec.blocks.length ? spec.blocks : [{ type: 'text' }];
     const model = spec.apiError ? '<synthetic>' : (spec.model ?? this.model);
     const u = spec.usage ?? {};
     const output = u.output ?? 100;
@@ -467,6 +518,7 @@ export class ClaudeThread {
         };
       }
       rec.requestId = requestId;
+      if (spec.version !== undefined) rec.version = spec.version;
       rec.message = message;
       if (spec.apiError) rec.isApiErrorMessage = true;
       if (spec.extra) Object.assign(rec, spec.extra);
@@ -743,8 +795,26 @@ export interface CodexUsageSpec {
 export interface CodexLine {
   timestamp: string;
   type: string;
-  ordinal: number;
+  /** Envelope ordinal. Absent when a fixture removes it (R4.12). */
+  ordinal?: number;
   payload: JsonObject;
+}
+
+/** Overrides for one session_meta line (R4.11, R15.7). A `null` removes the field. */
+export interface SessionMetaOverrides {
+  id?: string | null;
+  sessionId?: string | null;
+  cliVersion?: string | null;
+  forkedFromId?: string | null;
+  subagentHistoryStartOrdinal?: number | null;
+  ordinal?: number | null;
+  dtMs?: number;
+}
+
+/** Position of a pushed line: time step and ordinal (a number sets it, `null` removes it, `undefined` is the counter). */
+export interface LineOptions {
+  dtMs?: number;
+  ordinal?: number | null;
 }
 
 export interface CodexThreadOptions {
@@ -766,6 +836,8 @@ export interface CodexThreadOptions {
   ids?: IdGen;
   /** Emit own session_meta at construction (default true). Forks use forkFrom(), which controls the order. */
   emitMeta?: boolean;
+  /** First envelope ordinal of this builder (default 0). Lets two builders write disjoint ordinal ranges of one thread. */
+  ordinalStart?: number;
 }
 
 export class CodexThread {
@@ -779,7 +851,7 @@ export class CodexThread {
   private readonly opts: CodexThreadOptions;
   private totals = { input: 0, cached: 0, cacheWrite: 0, output: 0, reasoning: 0, total: 0 };
   private turnId: string | null = null;
-  private ordinal = 0;
+  private ordinal: number;
 
   constructor(o: CodexThreadOptions = {}) {
     this.opts = o;
@@ -789,17 +861,27 @@ export class CodexThread {
     this.sessionId = o.sessionId ?? this.threadId;
     this.cliVersion = o.cliVersion ?? '0.158.0';
     this.model = o.model ?? 'gpt-5-codex';
+    this.ordinal = o.ordinalStart ?? 0;
     if (o.emitMeta !== false && o.forkedFromId === undefined) this.sessionMeta();
   }
 
-  private push(type: string, payload: JsonObject, dtMs?: number): CodexLine {
-    const line: CodexLine = { timestamp: this.clock.tick(dtMs), type, ordinal: this.ordinal++, payload };
+  private push(type: string, payload: JsonObject, dtMs?: number, ordinal?: number | null): CodexLine {
+    const counter = this.ordinal++;
+    // Key order is part of the committed trees: timestamp, type, ordinal, payload.
+    const ord = ordinal === undefined ? counter : ordinal;
+    const timestamp = this.clock.tick(dtMs);
+    const line: CodexLine = ord === null ? { timestamp, type, payload } : { timestamp, type, ordinal: ord, payload };
     this.lines.push(line);
     return line;
   }
 
-  /** The thread's own session_meta. */
-  sessionMeta(): CodexLine {
+  /** Any line, for cases the typed methods do not cover (unlisted types, odd payloads). */
+  line(type: string, payload: JsonObject, o: LineOptions = {}): CodexLine {
+    return this.push(type, payload, o.dtMs, o.ordinal);
+  }
+
+  /** The thread's own session_meta. With overrides: a meta without id, another version, another session (R4.11, R15.7). */
+  sessionMeta(over: SessionMetaOverrides = {}): CodexLine {
     const o = this.opts;
     const payload: JsonObject = {
       id: this.threadId,
@@ -832,10 +914,22 @@ export class CodexThread {
       payload.subagent_history_start_ordinal = o.subagentHistoryStartOrdinal;
     }
     if (o.threadSpawn || o.subagentOther !== undefined) payload.agent_nickname = 'synthetic-nickname';
-    return this.push('session_meta', payload);
+    const apply = (key: string, v: string | number | null | undefined): void => {
+      if (v === undefined) return;
+      if (v === null) delete payload[key];
+      else payload[key] = v;
+    };
+    apply('id', over.id);
+    apply('session_id', over.sessionId);
+    apply('cli_version', over.cliVersion);
+    apply('forked_from_id', over.forkedFromId);
+    apply('subagent_history_start_ordinal', over.subagentHistoryStartOrdinal);
+    return this.push('session_meta', payload, over.dtMs, over.ordinal);
   }
 
-  turnContext(o: { turnId?: string; model?: string; effort?: string; compHash?: string | null; mode?: string } = {}): CodexLine {
+  turnContext(
+    o: { turnId?: string; model?: string; effort?: string; compHash?: string | null; mode?: string; ordinal?: number | null; dtMs?: number } = {},
+  ): CodexLine {
     this.turnId = o.turnId ?? this.ids.next('turn');
     return this.push('turn_context', {
       turn_id: this.turnId,
@@ -845,11 +939,21 @@ export class CodexThread {
       comp_hash: o.compHash === undefined ? 'synthetic-comp-hash-a' : o.compHash,
       collaboration_mode: { mode: o.mode ?? 'default' },
       cwd: 'synthetic-cwd',
-    });
+    }, o.dtMs, o.ordinal);
   }
 
-  eventMsg(payloadType: string, dtMs?: number): CodexLine {
-    return this.push('event_msg', { type: payloadType }, dtMs);
+  eventMsg(payloadType: string, dtMs?: number, ordinal?: number | null): CodexLine {
+    return this.push('event_msg', { type: payloadType }, dtMs, ordinal);
+  }
+
+  /** An `event_msg` of payload type `token_count` (never an accounting source, R2.9). */
+  tokenCount(o: LineOptions = {}): CodexLine {
+    return this.push('event_msg', { type: 'token_count' }, o.dtMs, o.ordinal);
+  }
+
+  /** The `thread_settings_applied` marker (R2.10, R2.17). */
+  settingsApplied(o: LineOptions = {}): CodexLine {
+    return this.push('event_msg', { type: 'thread_settings_applied' }, o.dtMs, o.ordinal);
   }
 
   responseItem(payloadType: string, role?: string, dtMs?: number): CodexLine {
@@ -872,6 +976,12 @@ export class CodexThread {
     dtMs?: number;
     /** Do not add this usage to the running totals (duplicate copies). */
     noAccumulate?: boolean;
+    /** Remove thread_id from the record (R2.13, R0.9 unattributed_record). */
+    omitThreadId?: boolean;
+    /** Remove response_id from the record (R2.13, an unkeyed record). */
+    omitResponseId?: boolean;
+    /** Set (number) or remove (null) the envelope ordinal (R4.12). */
+    ordinal?: number | null;
   } = {}): { responseId: string; line: CodexLine } {
     const u = o.usage ?? {};
     const inp = u.input ?? 1000;
@@ -903,15 +1013,15 @@ export class CodexThread {
     };
     const responseId = o.responseId ?? this.ids.next('resp');
     const payload: JsonObject = {
-      response_id: responseId,
-      thread_id: o.threadId ?? this.threadId,
+      response_id: o.omitResponseId ? undefined : responseId,
+      thread_id: o.omitThreadId ? undefined : (o.threadId ?? this.threadId),
       session_id: this.sessionId,
       turn_id: o.turnId ?? this.turnId ?? 'synthetic-turn-none',
       usage,
       turn_token_usage: usage,
       thread_token_usage,
     };
-    const line = this.push('token_usage_record', payload, o.dtMs);
+    const line = this.push('token_usage_record', payload, o.dtMs, o.ordinal);
     if (o.emitTokenCountEvent) this.eventMsg('token_count');
     return { responseId, line };
   }
@@ -932,8 +1042,11 @@ export class CodexThread {
   /**
    * Make this thread a fork of `parent`: copies the parent's session_meta and the first `prefixLen`
    * non-meta parent lines (never token_usage_record, as in real logs) into this thread, then writes the
-   * fork's own session_meta. subagent_history_start_ordinal is the ordinal where the copied prefix ends.
-   * Own session_meta position: 'after-prefix' (default) or 'first'.
+   * fork's own session_meta. A copied record keeps every envelope field of the parent's record (timestamp and
+   * ordinal), so a copy that lands next to its original is an equal record (a duplicate, R4.12) and never an
+   * ordinal collision. subagent_history_start_ordinal is the first ordinal after the copied prefix; the fork's own
+   * records continue from there. Own session_meta position: 'after-prefix' (default) or 'first' (written first in
+   * the file, with the ordinal of the first own line).
    */
   static fork(
     parent: CodexThread,
@@ -941,20 +1054,23 @@ export class CodexThread {
   ): CodexThread {
     const prefix = parent.lines.filter((l) => l.type !== 'session_meta' && l.type !== 'token_usage_record').slice(0, o.prefixLen ?? 3);
     const parentMeta = parent.lines.find((l) => l.type === 'session_meta');
-    const copiedCount = 1 + prefix.length;
+    const copied = parentMeta ? [parentMeta, ...prefix] : prefix;
+    let after = copied.length;
+    for (const l of copied) if (l.ordinal !== undefined && l.ordinal + 1 > after) after = l.ordinal + 1;
+    const first = o.ownMetaPosition === 'first';
     const fork = new CodexThread({
       ...o,
       forkedFromId: o.forkedFromId ?? parent.threadId,
       sessionId: o.sessionId ?? parent.sessionId,
-      subagentHistoryStartOrdinal: o.subagentHistoryStartOrdinal ?? (o.ownMetaPosition === 'first' ? copiedCount + 1 : copiedCount),
+      subagentHistoryStartOrdinal: o.subagentHistoryStartOrdinal ?? (first ? after + 1 : after),
       emitMeta: false,
       clock: o.clock ?? parent.clock,
       ids: o.ids ?? parent.ids,
+      ordinalStart: after,
     });
-    if (o.ownMetaPosition === 'first') fork.sessionMeta();
-    if (parentMeta) fork.push('session_meta', structuredClone(parentMeta.payload), 0);
-    for (const l of prefix) fork.push(l.type, structuredClone(l.payload), 0);
-    if (o.ownMetaPosition !== 'first') fork.sessionMeta();
+    if (first) fork.sessionMeta();
+    for (const l of copied) fork.lines.push(structuredClone(l));
+    if (!first) fork.sessionMeta();
     return fork;
   }
 
@@ -967,7 +1083,7 @@ export class CodexThread {
    * gives lines 0..2, 3..6 and 7..end. Names are rollout-<n>-<threadId>.jsonl under sessions/2026/01/01/.
    */
   files(
-    o: { archived?: boolean; splitAfter?: number[]; zstd?: boolean; canary?: string; compress?: Compressor } = {},
+    o: { archived?: boolean; splitAfter?: number[]; zstd?: boolean; canary?: string; compress?: Compressor; mtimeMs?: number } = {},
   ): GeneratedFile[] {
     const cuts = [0, ...(o.splitAfter ?? []), this.lines.length];
     const out: GeneratedFile[] = [];
@@ -991,12 +1107,14 @@ export class CodexThread {
         out.push({ path: `sessions/2026/01/01/${name}`, content: text });
       }
     }
+    // Every part carries the modification time of the thread file (R4.10 op 5).
+    if (o.mtimeMs !== undefined) for (const f of out) f.mtimeMs = o.mtimeMs;
     return out;
   }
 }
 
 export class CodexHome {
-  readonly threads: Array<{ thread: CodexThread; archived: boolean; zstd: boolean; splitAfter?: number[] }> = [];
+  readonly threads: Array<{ thread: CodexThread; archived: boolean; zstd: boolean; splitAfter?: number[]; mtimeMs?: number }> = [];
   /** When set, files() plants this canary in every dropped field (R14.7). */
   readonly canary: string | undefined;
   /** Compressor for archived .zst files. Default zstd from node:zlib. Tests pass one that returns null. */
@@ -1005,13 +1123,20 @@ export class CodexHome {
     this.canary = o.canary;
     this.compress = o.compress;
   }
-  add(thread: CodexThread, o: { archived?: boolean; zstd?: boolean; splitAfter?: number[] } = {}): CodexThread {
-    this.threads.push({ thread, archived: o.archived ?? false, zstd: o.zstd ?? false, splitAfter: o.splitAfter });
+  add(thread: CodexThread, o: { archived?: boolean; zstd?: boolean; splitAfter?: number[]; mtimeMs?: number } = {}): CodexThread {
+    this.threads.push({ thread, archived: o.archived ?? false, zstd: o.zstd ?? false, splitAfter: o.splitAfter, mtimeMs: o.mtimeMs });
     return thread;
   }
   files(): GeneratedFile[] {
     return this.threads.flatMap((t) =>
-      t.thread.files({ archived: t.archived, zstd: t.zstd, splitAfter: t.splitAfter, canary: this.canary, compress: this.compress }),
+      t.thread.files({
+        archived: t.archived,
+        zstd: t.zstd,
+        splitAfter: t.splitAfter,
+        canary: this.canary,
+        compress: this.compress,
+        ...(t.mtimeMs !== undefined ? { mtimeMs: t.mtimeMs } : {}),
+      }),
     );
   }
   writeTo(root: string): void {

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // cachewhy independent recompute (spec R13.1 to R13.3).
 //
-// A second, deliberately separate implementation of the ACCOUNTING part of docs/methodology.md:
-// unique responses (R4), token buckets per provider (R2), list-price equivalent (R3). It reads raw
-// log files and the pricing table JSON. It imports nothing from src/ and nothing outside node:*.
-// It does not detect events, boundaries or causes (sections 7 to 11).
+// A second, deliberately separate implementation of the ACCOUNTING part of docs/methodology.md (revision 11):
+// unique responses (R4), token buckets per provider (R2), list-price equivalent (R3) and the global integrity
+// abstention (R0.9: families, taint, live families). It reads raw log files and the pricing table JSON. It imports
+// nothing from src/ and nothing outside node:*. It does not detect events, boundaries or causes (sections 6 to 11).
 //
 // Written from the spec text, not from src/. Rule ids are cited where a rule is implemented.
 // Plain Node ESM, zero dependencies. All token arithmetic and all money use BigInt (R2.16, R3.8).
@@ -12,17 +12,19 @@
 // Codex dollars: R3.4 has a tier gate. No retained field shows the Codex service tier, so a default run gives
 // every Codex response reason modifier_unverified and no dollars. The test-only API parameter
 // `codexTierForTest: "standard"` (spec name codex_tier_for_test) marks the tier as verified Standard so that the
-// row selection of R3.6 and R3.10 can be exercised. It is deliberately not a CLI flag or an environment variable.
+// row selection of R3.6 and R3.10 can be exercised. The run start and the file modification times (R0.9, live
+// families) are likewise API parameters only (`runStartMs`, `mtimeMs` on in-memory files). None of them is a CLI
+// flag or an environment variable. The CLI reads the clock once and stats each file.
 //
 // Usage:
 //   node scripts/recompute/index.mjs --claude-dir <dir> [--claude-dir <dir>] --codex-dir <dir>
 //        [--since <ISO instant or YYYY-MM-DD>] [--until <ISO instant or YYYY-MM-DD>]
-//        [--table <table.json>] [--version-policy strict|all] [--per-response [--raw-keys]] [--out <file>]
+//        [--table <table.json>] [--per-response [--raw-keys]] [--out <file>]
 //
 // Output: one JSON document on stdout (or --out). Token amounts and money are decimal strings.
 
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as zlib from "node:zlib";
@@ -40,6 +42,23 @@ const C24 = [1n, 10n]; // UNPRICED_PARTIAL
 const C25 = 272000n; // CODEX_LONG_CTX
 const C26 = 100000n; // HAIKU_TIER_SPLIT
 const C32 = [11n, 10n]; // GEO_US_MULT
+const C35_MS = 600000; // LIVE_WINDOW, 600 s (R0.9)
+const C36 = [3n, 10n]; // TAINT_WARN_SHARE (reported through the counters; the warning itself is a report matter)
+/** The closed enum of R0.9, in spec order. */
+const TAINT_REASONS = [
+  "stream_unresolved",
+  "copy_exposed",
+  "turn_model_conflicted",
+  "ordinal_unverified",
+  "fork_prefix_unresolved",
+  "request_anomaly",
+  "ownership_ambiguous",
+  "version_unverified",
+  "unparsed_line",
+  "unlogged_usage",
+  "unattributed_record",
+  "file_unreadable",
+];
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 
 const VERSION_RE = /^[0-9]+\.[0-9]+\.[0-9]+$/; // R1.2 `version`
@@ -72,13 +91,24 @@ function normalizeModel(m) {
   return typeof m === "string" ? m.replace(DATE_SUFFIX_RE, "") : null; // R3.3
 }
 
+/** R3.3, R14.3: the normalized model of a Claude copy. The date suffix is stripped before copies are compared (R4.2), so
+ * claude-opus-5-5 and claude-opus-5-5-20261009 are one model; a string that is no plain model id is `unlisted`. */
+function claudeModel(v) {
+  if (typeof v !== "string" || v.length === 0) return null;
+  const id = v.replace(DATE_SUFFIX_RE, "");
+  return MODEL_ID_RE.test(id) ? id : "unlisted";
+}
+
+/** R3.3, R14.3: the normalized model of a Codex `turn_context`; a missing or unusable id is null (never a model). */
+function ctxModel(v) {
+  if (typeof v !== "string" || v.length > 80) return null;
+  const n = v.replace(DATE_SUFFIX_RE, "");
+  return MODEL_ID_RE.test(n) ? n : null;
+}
+
 function enumOf(v, allowed) {
   if (v === undefined || v === null) return null;
   return typeof v === "string" && allowed.includes(v) ? v : "other";
-}
-
-function sha16(s) {
-  return createHash("sha256").update(s).digest("hex").slice(0, 16);
 }
 
 // ---------------------------------------------------------------------------
@@ -133,10 +163,30 @@ function classifyClaude(segs) {
   return null;
 }
 
+/**
+ * Claude sidecar files that R1.2 reads (agent meta and prefix JSON, workflow run JSON, workflow journal). They hold no
+ * request and name no chain, but a sidecar that fails to parse is a lost line (R1.3, R0.9 unparsed_line).
+ */
+function classifyClaudeSidecar(segs) {
+  const name = segs[segs.length - 1] ?? "";
+  const sub = segs.indexOf("subagents");
+  if (sub >= 1 && sub < segs.length - 1 && /^agent-.+\.(meta|prefix)\.json$/.test(name)) return "sidecar_json";
+  const wf = segs.indexOf("workflows");
+  if (wf >= 1 && wf === segs.length - 2 && /^wf_.+\.json$/.test(name)) return "sidecar_json";
+  if (name === "journal.jsonl" && segs.length >= 4 && segs[segs.length - 2].startsWith("wf_") && segs[segs.length - 3] === "workflows") {
+    return "sidecar_lines";
+  }
+  return null;
+}
+
 const ROLLOUT_RE = /^rollout-.*\.jsonl$/;
 const ROLLOUT_ZST_RE = /^rollout-.*\.jsonl\.zst$/;
 
-function walk(dir, out, seen = new Set()) {
+/**
+ * Collect the files under `dir`. A directory that cannot be resolved or listed is reported through `onBad`: it counts as
+ * a file that cannot be read (R0.9 file_unreadable), so its logs are unknown and the provider abstains.
+ */
+function walk(dir, out, onBad, seen = new Set()) {
   let ents;
   try {
     const real = realpathSync(dir);
@@ -144,6 +194,7 @@ function walk(dir, out, seen = new Set()) {
     seen.add(real);
     ents = readdirSync(dir, { withFileTypes: true });
   } catch {
+    onBad();
     return false;
   }
   ents.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
@@ -160,7 +211,7 @@ function walk(dir, out, seen = new Set()) {
         continue;
       }
     }
-    if (isDir) walk(p, out, seen);
+    if (isDir) walk(p, out, onBad, seen);
     else if (isFile) out.push(p);
   }
   return true;
@@ -174,16 +225,32 @@ function isDirectory(p) {
   }
 }
 
-/** Entries: { provider, rel: string[], zst: boolean, read(): Buffer }. */
+/** Entries: { provider, rel: string[], zst: boolean, mtimeMs: number | null, read(): Buffer }. */
 function discoverEntries(claudeDirs, codexDirs, cov) {
   const entries = [];
   const seenFiles = new Set();
   const seenRoots = new Set();
+  // A path that cannot be examined stays in the scan as one entry that fails to read (R0.9 file_unreadable). It names
+  // no chain, so it is never live and taints the provider of its root.
+  const unreadableEntry = (provider) =>
+    entries.push({
+      provider,
+      rel: [],
+      kind: provider === "claude" ? "main" : null,
+      zst: false,
+      mtimeMs: null,
+      read: () => {
+        throw new Error("file_unreadable");
+      },
+    });
   const addFiles = (provider, root) => {
     let real;
     try {
       real = realpathSync(root);
-    } catch {
+    } catch (e) {
+      // A root that does not exist is routine. A root that exists but cannot be resolved is an unreadable directory.
+      const code = e && typeof e === "object" ? e.code : undefined;
+      if (code !== "ENOENT" && code !== "ENOTDIR") unreadableEntry(provider);
       return;
     }
     if (!isDirectory(real)) return;
@@ -191,28 +258,31 @@ function discoverEntries(claudeDirs, codexDirs, cov) {
     if (seenRoots.has(rootKey)) return;
     seenRoots.add(rootKey);
     const files = [];
-    walk(root, files);
+    walk(root, files, () => unreadableEntry(provider));
     for (const f of files) {
       const rel = f.slice(root.length).split(/[\\/]+/).filter(Boolean);
+      const name = rel[rel.length - 1] ?? "";
+      let kind = null;
+      let zst = false;
+      if (provider === "claude") {
+        kind = classifyClaude(rel) ?? classifyClaudeSidecar(rel);
+        if (!kind) continue;
+      } else {
+        zst = ROLLOUT_ZST_RE.test(name);
+        if (!zst && !ROLLOUT_RE.test(name)) continue;
+      }
       let key;
+      let mtimeMs = null;
       try {
         key = realpathSync(f);
+        mtimeMs = statSync(f).mtimeMs; // R0.9: the only use of a modification time is the live test
       } catch {
+        unreadableEntry(provider); // a log file that cannot be examined must not vanish from the scan
         continue;
       }
       if (seenFiles.has(key)) continue;
-      const name = rel[rel.length - 1] ?? "";
-      if (provider === "claude") {
-        const kind = classifyClaude(rel);
-        if (!kind) continue;
-        seenFiles.add(key);
-        entries.push({ provider, rel, kind, zst: false, read: () => readFileSync(f) });
-      } else {
-        const zst = ROLLOUT_ZST_RE.test(name);
-        if (!zst && !ROLLOUT_RE.test(name)) continue;
-        seenFiles.add(key);
-        entries.push({ provider, rel, kind: null, zst, read: () => readFileSync(f) });
-      }
+      seenFiles.add(key);
+      entries.push({ provider, rel, kind, zst, mtimeMs, read: () => readFileSync(f) });
     }
   };
   for (const d of claudeDirs ?? []) {
@@ -238,15 +308,21 @@ function memoryEntries(files) {
   const entries = [];
   for (const f of files) {
     const segs = String(f.path).split("/").filter(Boolean);
-    const content = typeof f.content === "string" ? Buffer.from(f.content, "utf8") : Buffer.from(f.content);
+    const content = typeof f.content === "string" ? Buffer.from(f.content, "utf8") : Buffer.from(f.content ?? "");
+    const mtimeMs = typeof f.mtimeMs === "number" && Number.isFinite(f.mtimeMs) ? f.mtimeMs : null;
+    const failRead = f.unreadable === true; // test hook: the file exists but cannot be read
+    const read = () => {
+      if (failRead) throw new Error("file_unreadable");
+      return content;
+    };
     if (segs[0] === "projects") {
       const rel = segs.slice(1);
-      const kind = classifyClaude(rel);
-      if (kind) entries.push({ provider: "claude", rel, kind, zst: false, read: () => content });
+      const kind = classifyClaude(rel) ?? classifyClaudeSidecar(rel);
+      if (kind) entries.push({ provider: "claude", rel, kind, zst: false, mtimeMs, read });
     } else if (segs[0] === "sessions" || segs[0] === "archived_sessions") {
       const name = segs[segs.length - 1] ?? "";
       const zst = ROLLOUT_ZST_RE.test(name);
-      if (zst || ROLLOUT_RE.test(name)) entries.push({ provider: "codex", rel: segs, kind: null, zst, read: () => content });
+      if (zst || ROLLOUT_RE.test(name)) entries.push({ provider: "codex", rel: segs, kind: null, zst, mtimeMs, read });
     }
   }
   return entries;
@@ -287,11 +363,14 @@ function codexRow(p) {
   return row.input === null || row.output === null || row.cache_read === null ? null : row;
 }
 
+/** R3.11: an effective verified_at is an ISO date, `YYYY-MM-DD`, optionally followed by a time. */
+const ISO_DATE_PREFIX = /^[0-9]{4}-[0-9]{2}-[0-9]{2}/;
+
 /** R3.11: an object with verified:true and an effective date. */
 function verifiedObj(obj, entry, table) {
   if (!isObj(obj) || obj.verified !== true) return false;
   const date = obj.verified_at ?? entry?.verified_at ?? table.verified_at;
-  return typeof date === "string" && date.length > 0;
+  return typeof date === "string" && ISO_DATE_PREFIX.test(date);
 }
 
 function loadBook(table) {
@@ -352,13 +431,11 @@ function emptyAgg() {
     responses: 0,
     priced: 0,
     unpriced: 0,
-    output_excluded: 0,
     tokens,
     context_tokens: 0n,
     tokens_total: 0n,
     tokens_unpriced: 0n,
-    usd_pico_lo: 0n,
-    usd_pico_hi: 0n,
+    usd_pico: 0n,
     reasoning_informational: 0n,
   };
 }
@@ -386,9 +463,7 @@ function addToAgg(a, r) {
   if (b.reasoning !== null) a.reasoning_informational += b.reasoning;
   if (r.price.priced) {
     a.priced += 1;
-    a.usd_pico_lo += r.price.lo;
-    a.usd_pico_hi += r.price.hi;
-    if (r.price.output_excluded) a.output_excluded += 1;
+    a.usd_pico += r.price.pico;
   } else {
     a.unpriced += 1;
     a.tokens_unpriced += r.price.tokens_unpriced;
@@ -402,7 +477,6 @@ function serializeAgg(a) {
     responses: a.responses,
     responses_priced: a.priced,
     responses_unpriced: a.unpriced,
-    responses_priced_without_output_term: a.output_excluded,
     tokens,
     context_tokens: a.context_tokens.toString(),
     tokens_total: a.tokens_total.toString(),
@@ -410,8 +484,7 @@ function serializeAgg(a) {
     // R3.9: exact cross-multiplication, `10 * tokens_unpriced > tokens_total`.
     unpriced_share_exceeds_c24: a.tokens_unpriced * C24[1] > a.tokens_total * C24[0],
     reasoning_informational: a.reasoning_informational.toString(),
-    usd_pico_lo: a.usd_pico_lo.toString(),
-    usd_pico_hi: a.usd_pico_hi.toString(),
+    usd_pico: a.usd_pico.toString(),
   };
 }
 
@@ -429,21 +502,36 @@ function bump(map, k, n = 1) {
 // Claude
 // ---------------------------------------------------------------------------
 
+
 const SPEEDS = ["standard", "fast"];
 const GEOS = ["not_available", "us"];
 const TIERS = ["standard", "priority", "batch"];
 const ITER_SHARED = ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"];
 
-function claudeSupported(version, policy) {
-  if (policy === "all") return true;
-  return typeof version === "string" && VERSION_RE.test(version) && CLAUDE_FULL_VERSIONS.includes(version); // R15.7
+/** Chain ids (R0.9). Claude: session and agent. Codex: the thread alone (a thread can carry divergent session ids). */
+const claudeChainId = (sess, agent) => `claude\u0000${sess}\u0000${agent ?? "main"}`;
+const codexChainId = (thread) => `codex\u0000${thread}`;
+
+const newLineCov = () => ({ lines_total: 0, lines_parse_error: 0, lines_truncated_tail: 0 });
+
+function addTo(map, key, value) {
+  let s = map.get(key);
+  if (!s) map.set(key, (s = new Set()));
+  s.add(value);
+}
+
+/** R15.7: a Claude record version has full support. */
+function claudeSupported(version) {
+  return typeof version === "string" && VERSION_RE.test(version) && CLAUDE_FULL_VERSIONS.includes(version);
 }
 
 /** Read one assistant copy (R1.2 counters, R2.1, R2.12, R2.15, R4.2). */
 function readClaudeCopy(rec, kind) {
-  const msg = rec.message;
-  if (!isObj(msg) || !isObj(msg.usage)) return null; // not usage-bearing
-  const u = msg.usage;
+  // A copy without `message.usage` is still a copy of the request: it carries the message id and the model that the
+  // key (R4.1) and model (R4.2) checks compare, so it is never dropped (R4.2, R13.2). It carries no counters.
+  const msg = isObj(rec.message) ? rec.message : {};
+  const usageless = !isObj(msg.usage);
+  const u = usageless ? {} : msg.usage;
   const i = ctr(u.input_tokens);
   const r = ctr(u.cache_read_input_tokens);
   const wt = ctr(u.cache_creation_input_tokens);
@@ -481,12 +569,12 @@ function readClaudeCopy(rec, kind) {
   return {
     rid: str(rec.requestId),
     mid: str(msg.id),
-    sess: str(rec.sessionId),
-    agent: str(rec.agentId),
     kind,
+    usageless,
+    chain: null,
     uuid: str(rec.uuid) ?? "",
     ts: null,
-    model: str(msg.model),
+    model: claudeModel(msg.model),
     i, r, wt, o, w5, w1, hasCC,
     range,
     incomplete,
@@ -509,27 +597,33 @@ function maxPresent(copies, field) {
 /**
  * Resolve the copies of one requestId into one response or an exclusion (R4.1, R4.2, R2.1 to R2.3).
  * Precedence of exclusions: range (R2.15), incomplete (R2.12), key_conflict (R4.1),
- * conflict_input and conflict_model (R4.2).
+ * conflict_input and conflict_model (R4.2). `anomaly` is true whenever R0.9 `request_anomaly` applies:
+ * an exclusion, or a kept response with bucket_mismatch, conflict_output, conflict_iterations or conflict_modifier.
  */
-function resolveClaude(copies, keyConflict) {
-  if (copies.some((c) => c.range)) return { excluded: "usage_range_failed" };
-  if (copies.some((c) => c.incomplete)) {
+function resolveClaude(allCopies, keyConflict) {
+  // Counters are read from the copies that carry a usage object. A copy without one still takes part in the model
+  // check below (R4.2, any copy), and a request with no usage-bearing copy at all is incomplete (R2.12).
+  const copies = allCopies.filter((c) => !c.usageless);
+  if (copies.some((c) => c.range)) return { excluded: "usage_range_failed", anomaly: true };
+  if (copies.length === 0 || copies.some((c) => c.incomplete)) {
     const present_fields = {};
     for (const f of ["i", "r", "wt", "w5", "w1", "o"]) {
       const m = maxPresent(copies, f);
       if (m >= 0) present_fields[f] = BigInt(m);
     }
-    return { excluded: "usage_incomplete", present_fields };
+    return { excluded: "usage_incomplete", present_fields, anomaly: true };
   }
-  if (keyConflict) return { excluded: "key_conflict" };
+  if (keyConflict) return { excluded: "key_conflict", anomaly: true, conflicts: ["key_conflict"] };
   const c0 = copies[0];
-  for (const c of copies) {
-    if (c.i !== c0.i || c.r !== c0.r || c.wt !== c0.wt || c.hasCC !== c0.hasCC || c.w5 !== c0.w5 || c.w1 !== c0.w1) {
-      return { excluded: "conflict_input" };
-    }
+  // R4.2: every conflict code of the request is recorded (an input and a model conflict are both reported); the
+  // first of them in this order is the exclusion.
+  const conflicts = [];
+  if (copies.some((c) => c.i !== c0.i || c.r !== c0.r || c.wt !== c0.wt || c.hasCC !== c0.hasCC || c.w5 !== c0.w5 || c.w1 !== c0.w1)) {
+    conflicts.push("conflict_input");
   }
-  const models = new Set(copies.map((c) => c.model).filter((m) => m !== null));
-  if (models.size > 1) return { excluded: "conflict_model" };
+  const models = new Set(allCopies.map((c) => c.model).filter((m) => m !== null));
+  if (models.size > 1) conflicts.push("conflict_model");
+  if (conflicts.length > 0) return { excluded: conflicts[0], anomaly: true, conflicts };
   const model = models.size === 1 ? [...models][0] : null;
 
   const flags = [];
@@ -566,6 +660,8 @@ function resolveClaude(copies, keyConflict) {
     if (iterOk) output = BigInt(finals[0].o);
     else flags.push("conflict_iterations");
   }
+  // R4.2 / R3.12: the three modifiers come from the final copy alone. A non-final copy that carries a value the final
+  // copy lacks, or a different one, is a disagreement. An absent value stays null: it is never defaulted.
   let mods = null;
   let modConflict = false;
   if (finals.length > 0) {
@@ -579,8 +675,12 @@ function resolveClaude(copies, keyConflict) {
     mods = { speed: f0.speed, geo: f0.geo, tier: f0.tier };
     if (modConflict) flags.push("conflict_modifier");
   }
+  for (const f of ["conflict_output", "conflict_iterations", "conflict_modifier"]) if (flags.includes(f)) conflicts.push(f);
+  const anomaly = flags.some((f) => ["bucket_mismatch", "conflict_output", "conflict_iterations", "conflict_modifier"].includes(f));
   return {
     excluded: null,
+    anomaly,
+    conflicts,
     model,
     flags,
     final: finals.length > 0,
@@ -604,25 +704,33 @@ function unpriced(reason, bucketsTotal) {
   return { priced: false, reason, tokens_unpriced: bucketsTotal };
 }
 
-/** R3.5, R3.4, R3.12: price one Claude response. */
+/**
+ * R3.5, R3.4, R3.12: price one Claude response of an untainted chain. Gate order as the spec reads: no table row
+ * (R3.3), conflicts, an unverified modifier (R3.12), then row selection, then the unknown TTL class (R3.5).
+ */
 function priceClaude(res, book, stats) {
   const b = res.buckets;
   const ctx = b.input_uncached + b.cache_read + b.cache_write_5m + b.cache_write_1h + b.cache_write_unknown_ttl;
   const tot = ctx + b.output_lower_bound; // lb equals output when output is known
   const entry = usableEntry(book, normalizeModel(res.model));
   if (!entry || claudeRow(entry.prices_usd_per_mtok) === null) return unpriced("unknown_model", tot); // R3.3
-  if (!res.final) return unpriced("modifier_unverified", tot); // R3.12
   if (res.modConflict) return unpriced("conflict_modifier", tot); // R4.2
+  // R3.12: priced only with a final copy that carries speed, inference_geo and service_tier.
+  if (!res.final || res.mods.geo === null || res.mods.tier === null) return unpriced("modifier_unverified", tot);
   const { speed, geo, tier } = res.mods;
   if (speed === "other") return unpriced("speed_other", tot);
   if (geo === "other") return unpriced("geo_other", tot);
 
   let row = claudeRow(entry.prices_usd_per_mtok);
+  const hasTiers = isObj(entry.tiers);
+  const aboveSplit = hasTiers && ctx > C26; // Haiku 5.5: tier by total_input = i + r + w (R2.2, R3.4)
   const nonStd = tier === "priority" || tier === "batch" || tier === "other";
   if (nonStd) {
-    const st = isObj(entry.service_tier) ? entry.service_tier[tier] : undefined;
+    const st = isObj(entry.service_tier) && tier !== "other" ? entry.service_tier[tier] : undefined;
     const stRow = isObj(st) && verifiedObj(st, entry, book.table) ? claudeRow(st.prices_usd_per_mtok) : null;
-    if (!stRow || speed === "fast") return unpriced("service_tier_unpriced", tot);
+    // The table defines a service tier row alone: a combination with fast or the geo multiplier is not defined.
+    if (!stRow || speed === "fast" || geo === "us") return unpriced("service_tier_unpriced", tot);
+    if (aboveSplit) return unpriced("tier_unverified", tot);
     row = stRow;
   } else if (speed === "fast") {
     const f = entry.fast;
@@ -632,51 +740,186 @@ function priceClaude(res, book, stats) {
       return unpriced("fast_geo_unverified", tot);
     }
     row = fRow;
-  } else if (isObj(entry.tiers)) {
-    // Haiku 5.5 tier by total_input = i + r + w (R2.2, R3.4)
-    if (ctx > C26) {
-      const hi = verifiedObj(entry.tiers, entry, book.table) ? claudeRow(entry.tiers.high) : null;
-      if (!hi) return unpriced("tier_unverified", tot);
-      row = hi;
-    }
+  } else if (aboveSplit) {
+    const hi = verifiedObj(entry.tiers, entry, book.table) ? claudeRow(entry.tiers.high) : null;
+    if (!hi) return unpriced("tier_unverified", tot);
+    row = hi;
   }
-  if (geo === "us" && !geoApplies(book, entry)) return unpriced("geo_unverified", tot);
+  if (geo === "us" && !geoApplies(book, entry)) return unpriced("geo_other", tot);
+  // R3.5: the write price depends on a TTL class the log does not show; one number only, so no range.
+  if (b.cache_write_unknown_ttl > 0n) return unpriced("bucket_unknown", tot);
+  // No partial output term exists (R3.5): an unknown output is only reachable without a final copy, handled above.
+  if (b.output === null) return unpriced("modifier_unverified", tot);
 
-  const base =
+  let pico =
     b.input_uncached * row.input +
     b.cache_read * row.cache_read +
     b.cache_write_5m * row.cache_write_5m +
-    b.cache_write_1h * row.cache_write_1h;
-  const out = b.output !== null ? b.output * row.output : 0n; // R2.3: omitted when output is unknown
-  let lo = base + out + b.cache_write_unknown_ttl * row.cache_write_5m; // R3.5 range ends
-  let hi = base + out + b.cache_write_unknown_ttl * row.cache_write_1h;
-  if (geo === "us") {
-    lo = applyGeo(lo, stats);
-    hi = applyGeo(hi, stats);
-  }
-  return { priced: true, lo, hi, output_excluded: b.output === null, tokens_unpriced: 0n };
+    b.cache_write_1h * row.cache_write_1h +
+    b.output * row.output;
+  if (geo === "us") pico = applyGeo(pico, stats);
+  return { priced: true, pico, tokens_unpriced: 0n };
 }
 
-function scanClaude(entries, opts, cov, window) {
-  const policy = opts.versionPolicy;
-  const streams = new Map(); // streamId -> { sess, agent, start }
-  const requests = new Map(); // rid -> copies[]
+/** A sidecar (R1.2: meta, prefix, workflow run JSON, journal). It names no chain; a parse failure is a lost line. */
+function readSidecar(ent, c, files) {
+  let buf;
+  try {
+    buf = ent.read();
+  } catch {
+    files.push({ mtimeMs: ent.mtimeMs, named: [], unparsed: 0, readable: false });
+    return;
+  }
+  c.sidecar_files += 1;
+  let unparsed = 0;
+  if (ent.kind === "sidecar_json") {
+    let text = buf.toString("utf8");
+    if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+    try {
+      JSON.parse(text);
+    } catch {
+      // A line-duplicated one-line file is still readable line by line; anything else is a lost record: abstain.
+      const lines = text.split("\n").filter((l) => l.trim().length > 0);
+      let ok = lines.length > 0;
+      for (const l of lines) {
+        try {
+          JSON.parse(l);
+        } catch {
+          ok = false;
+          break;
+        }
+      }
+      if (!ok) unparsed = 1; // an empty or broken JSON file
+    }
+  } else {
+    const fc = newLineCov();
+    for (const _ of jsonLines(buf, fc)) void _;
+    unparsed = fc.lines_parse_error + fc.lines_truncated_tail;
+  }
+  if (unparsed > 0) c.sidecar_files_unparsed += 1;
+  files.push({ mtimeMs: ent.mtimeMs, named: [], unparsed, readable: true });
+}
+
+/**
+ * Identity of a Claude record for the logical counters (R17.6, R4.12). Two records are equal iff their projections
+ * are equal field by field, where the projection is the tuple of every field that R1.2 retains for an assistant
+ * record. A uuid alone, or any subset of the fields, is never enough: two records that share a uuid and differ in a
+ * retained field are two records.
+ */
+function recordIdentity(rec) {
+  const m = isObj(rec.message) ? rec.message : null;
+  const u = m !== null && isObj(m.usage) ? m.usage : null;
+  const cc = u !== null && isObj(u.cache_creation) ? u.cache_creation : null;
+  const cnt = (v) => [ctr(v), v === undefined || v === null ? "m" : typeof v === "number" ? "" : "b"];
+  const model = claudeModel;
+  const version = typeof rec.version === "string" && VERSION_RE.test(rec.version) ? rec.version : "unlisted";
+  const blocks = [];
+  if (m !== null && Array.isArray(m.content)) {
+    for (const b of m.content) {
+      if (!isObj(b)) {
+        blocks.push(["other", null, null, null]);
+        continue;
+      }
+      const t = enumOf(b.type, ["text", "tool_use", "tool_result", "thinking"]) ?? "other";
+      if (t === "tool_use") blocks.push([t, str(b.id), enumOf(b.name, ["Agent", "Workflow"]) ?? "other", null]);
+      else if (t === "tool_result") blocks.push([t, null, null, str(b.tool_use_id)]);
+      else blocks.push([t, null, null, null]);
+    }
+  }
+  let iter = null;
+  if (u !== null && Array.isArray(u.iterations) && isObj(u.iterations[0])) {
+    // R1.2, R17.6: every in-range integer member, by member name (an out-of-range member is the range state).
+    iter = [];
+    let bad = false;
+    for (const [k, v] of Object.entries(u.iterations[0])) {
+      if (typeof v !== "number" || !Number.isInteger(v)) continue;
+      if (ctr(v) === RANGE) bad = true;
+      else iter.push([k, String(v + 0)]);
+    }
+    iter.sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+    iter = [iter, bad];
+  }
+  let diag = null;
+  const dg = m !== null && isObj(m.diagnostics) ? m.diagnostics.cache_miss_reason : undefined;
+  if (dg !== undefined && dg !== null) {
+    diag = isObj(dg)
+      ? [enumOf(dg.type, ["messages_changed", "tools_changed", "system_changed", "model_changed", "previous_message_not_found", "unavailable"]), ...cnt(dg.cache_missed_input_tokens)]
+      : ["other"];
+  }
+  const stop = m !== null && "stop_reason" in m ? (m.stop_reason === null ? "null" : enumOf(m.stop_reason, ["tool_use", "end_turn", "stop_sequence", "refusal"])) : null;
+  const projection = [
+    str(rec.type),
+    str(rec.uuid),
+    str(rec.parentUuid),
+    str(rec.logicalParentUuid),
+    str(rec.sessionId),
+    str(rec.agentId),
+    parseTs(rec.timestamp),
+    version,
+    rec.isCompactSummary === true,
+    typeof rec.isSidechain === "boolean" ? rec.isSidechain : null,
+    rec.isApiErrorMessage === true,
+    enumOf(rec.entrypoint, ["claude-desktop", "cli", "sdk-cli"]),
+    enumOf(rec.effort, ["low", "medium", "high", "xhigh", "max"]),
+    enumOf(rec.perTurnEffort, ["low", "medium", "high", "xhigh", "max"]),
+    model(rec.advisorModel),
+    rec.serverClassifierRequest !== undefined && rec.serverClassifierRequest !== null,
+    str(rec.requestId),
+    m !== null ? str(m.id) : null,
+    m !== null ? model(m.model) : null,
+    stop,
+    u !== null,
+    u !== null ? [cnt(u.input_tokens), cnt(u.cache_read_input_tokens), cnt(u.cache_creation_input_tokens), cnt(u.output_tokens)] : null,
+    cc !== null ? [cnt(cc.ephemeral_5m_input_tokens), cnt(cc.ephemeral_1h_input_tokens)] : cc === null && u !== null && u.cache_creation !== undefined && u.cache_creation !== null ? "bad" : null,
+    u !== null && isObj(u.output_tokens_details) ? cnt(u.output_tokens_details.thinking_tokens) : null,
+    iter,
+    u !== null ? [u.speed === undefined || u.speed === null ? null : enumOf(u.speed, SPEEDS), enumOf(u.inference_geo, GEOS), enumOf(u.service_tier, TIERS)] : null,
+    diag,
+    blocks,
+  ];
+  return createHash("sha256").update(JSON.stringify(projection)).digest("hex");
+}
+
+/** True the first time `key` is seen. */
+function firstOf(set, key) {
+  if (set.has(key)) return false;
+  set.add(key);
+  return true;
+}
+
+function scanClaude(entries, cov, window) {
+  const streams = new Map(); // chain id -> { sess, agent, start }
+  const requests = new Map(); // rid -> copies[] (usage-bearing copies of a supported version)
   const midToRids = new Map();
   const ridToMids = new Map();
+  const holders = new Map(); // rid -> Set(chain id), every copy of any version (R15.7 structural read, R0.9 link iii)
+  const sessChains = new Map(); // sessionId -> Set(chain id) (R0.9 link i)
   const unverifiedKeys = new Set();
-  cov.claude = { files_total: 0, files_unreadable: 0, lines_total: 0, lines_parse_error: 0, lines_truncated_tail: 0, known_type_count: 0, unlisted_type_count: 0, lines_unverified_version: 0, api_error_records: 0, records_unkeyed: 0 };
+  const logicalSeen = new Set(); // equal records count once in the logical counters (R17.6)
+  const chains = new Set();
+  const triggers = [];
+  const files = [];
+  cov.claude = { files_total: 0, files_unreadable: 0, lines_total: 0, lines_parse_error: 0, lines_truncated_tail: 0, known_type_count: 0, unlisted_type_count: 0, lines_unverified_version: 0, api_error_records: 0, records_unkeyed: 0, sidecar_files: 0, sidecar_files_unparsed: 0 };
   const c = cov.claude;
+  const ledger = []; // event-time ledger of the logical counters that the window and live families thin out
   for (const ent of entries) {
     if (ent.provider !== "claude") continue;
+    if (ent.kind === "sidecar_json" || ent.kind === "sidecar_lines") {
+      readSidecar(ent, c, files);
+      continue;
+    }
     c.files_total += 1;
     let buf;
     try {
       buf = ent.read();
     } catch {
       c.files_unreadable += 1;
+      files.push({ mtimeMs: ent.mtimeMs, named: [], unparsed: 0, readable: false });
       continue;
     }
-    for (const rec of jsonLines(buf, c)) {
+    const fc = newLineCov();
+    const named = new Set();
+    for (const rec of jsonLines(buf, fc)) {
       if (!isObj(rec)) {
         c.unlisted_type_count += 1;
         continue;
@@ -685,50 +928,72 @@ function scanClaude(entries, opts, cov, window) {
       const known = type === "assistant" || type === "user" || type === "system" || type === "attachment";
       if (known) c.known_type_count += 1;
       else c.unlisted_type_count += 1;
-      if (!known) continue;
-      if (!claudeSupported(rec.version, policy)) {
-        c.lines_unverified_version += 1;
-        if (type === "assistant" && str(rec.requestId)) unverifiedKeys.add(rec.requestId); // R15.7
-        continue;
-      }
+      // R4.11 / R0.9: identity is read per record from (sessionId, agentId or main), never from the path.
       const sess = str(rec.sessionId);
       const agent = str(rec.agentId);
-      const sid = `${sess ?? ""}\u0000${agent ?? "main"}`;
+      const chain = sess === null ? null : claudeChainId(sess, agent);
+      if (chain !== null) {
+        chains.add(chain);
+        named.add(chain);
+        addTo(sessChains, sess, chain);
+      } else if (known) {
+        triggers.push({ reason: "unattributed_record", names: "provider" }); // R0.9: no key, no accounting
+      }
+      const supported = claudeSupported(rec.version);
+      if (!known) continue;
+      if (!supported) c.lines_unverified_version += 1;
       const ts = parseTs(rec.timestamp);
-      let st = streams.get(sid);
-      if (!st) streams.set(sid, (st = { sess, agent, start: null }));
-      if (ts !== null && (st.start === null || ts < st.start)) st.start = ts; // R4.6 stream_start
+      if (supported && chain !== null) {
+        let st = streams.get(chain);
+        if (!st) streams.set(chain, (st = { sess, agent, start: null }));
+        if (ts !== null && (st.start === null || ts < st.start)) st.start = ts; // R4.6 stream_start
+      }
       if (type !== "assistant") continue;
       const msg = isObj(rec.message) ? rec.message : null;
       if (rec.isApiErrorMessage === true || msg?.model === "<synthetic>") {
-        c.api_error_records += 1; // R2.14
+        if (supported && firstOf(logicalSeen, `api\u0000${recordIdentity(rec)}`)) c.api_error_records += 1; // R2.14, logical (R17.6)
         continue;
       }
-      if (!str(rec.requestId)) {
-        if (msg && isObj(msg.usage)) c.records_unkeyed += 1; // R2.13
+      const rid = str(rec.requestId);
+      if (rid === null) {
+        // R2.13: the counter covers records that carry usage; the trigger is broader. A keyless non-error assistant
+        // record with a string sessionId is an anomaly with or without usage, whatever its version: it taints its chain.
+        if (msg && isObj(msg.usage) && supported && firstOf(logicalSeen, `unkeyed\u0000${recordIdentity(rec)}`)) {
+          c.records_unkeyed += 1; // logical (R17.6)
+          ledger.push({ t: ts, chain, inc: { records_unkeyed: 1 }, kinds: [], tok: {}, tokInvalid: 0n });
+        }
+        if (chain !== null) triggers.push({ reason: "request_anomaly", names: [chain] });
         continue;
       }
+      if (!supported) unverifiedKeys.add(rid); // R15.7: one unverified copy makes the key unverified
+      if (chain === null) continue;
+      addTo(holders, rid, chain);
+      if (!supported) continue;
       const copy = readClaudeCopy(rec, ent.kind);
       if (!copy) continue;
       copy.ts = ts;
-      copy.sid = sid;
+      copy.chain = chain;
       let list = requests.get(copy.rid);
       if (!list) requests.set(copy.rid, (list = []));
       list.push(copy);
       if (copy.mid) {
-        let s = ridToMids.get(copy.rid);
-        if (!s) ridToMids.set(copy.rid, (s = new Set()));
-        s.add(copy.mid);
-        let t = midToRids.get(copy.mid);
-        if (!t) midToRids.set(copy.mid, (t = new Set()));
-        t.add(copy.rid);
+        addTo(ridToMids, copy.rid, copy.mid);
+        addTo(midToRids, copy.mid, copy.rid);
       }
     }
+    for (const k of ["lines_total", "lines_parse_error", "lines_truncated_tail"]) c[k] += fc[k];
+    files.push({ mtimeMs: ent.mtimeMs, named: [...named], unparsed: fc.lines_parse_error + fc.lines_truncated_tail, readable: true });
   }
   cov.claude_requests_unverified_version = unverifiedKeys.size;
+  // R15.7 / R0.9 version_unverified: names every chain that holds a copy of an unverified key.
+  for (const rid of [...unverifiedKeys].sort()) triggers.push({ reason: "version_unverified", names: [...(holders.get(rid) ?? [])] });
+
+  // R0.9 family groups: link (i) a shared sessionId, link (iii) a shared request key.
+  const groups = [];
+  for (const s of sessChains.values()) if (s.size > 1) groups.push([...s]);
+  for (const s of holders.values()) if (s.size > 1) groups.push([...s]);
 
   const out = [];
-  const stats = { geo_rounded: 0 };
   const ccov = (cov.claude_responses = {
     requests_total: 0,
     requests_conflict: 0,
@@ -745,7 +1010,9 @@ function scanClaude(entries, opts, cov, window) {
     requests_no_event_time: 0,
   });
   for (const rid of [...requests.keys()].sort()) {
+    if (unverifiedKeys.has(rid)) continue; // R15.7: no accounting is derived from an unverified key
     const copies = requests.get(rid);
+    const heldBy = [...(holders.get(rid) ?? [])];
     // R4.1: requestId and message.id are 1 to 1.
     let keyConflict = false;
     const mids = ridToMids.get(rid);
@@ -757,24 +1024,23 @@ function scanClaude(entries, opts, cov, window) {
     for (const cp of copies) if (cp.ts !== null && (tFirst === null || cp.ts < tFirst)) tFirst = cp.ts;
     const inWindow = windowHas(window, tFirst);
     const res = resolveClaude(copies, keyConflict);
+    const L = { t: tFirst, chain: heldBy[0] ?? null, inc: {}, kinds: [...(res.conflicts ?? [])], tok: {}, tokInvalid: 0n };
+    if (L.kinds.length > 0) L.inc.requests_conflict = 1; // R17.1: once per request, not once per code
+    ledger.push(L);
+    if (res.anomaly) triggers.push({ reason: "request_anomaly", names: heldBy }); // R0.9, scan-wide (not windowed)
+    // Record-level counters (requests_total, the anomaly counters) are scan-wide: no window, live families included.
+    ccov.requests_total += 1;
     if (res.excluded) {
-      if (!inWindow) continue;
-      ccov.requests_total += 1;
-      if (res.excluded === "usage_range_failed") ccov.responses_usage_range_failed += 1;
+      if (res.excluded === "usage_range_failed") L.inc.responses_usage_range_failed = 1;
       else if (res.excluded === "usage_incomplete") {
-        ccov.responses_usage_incomplete += 1;
-        for (const [f, v] of Object.entries(res.present_fields)) {
-          ccov.tokens_in_incomplete_by_field[f] = (BigInt(ccov.tokens_in_incomplete_by_field[f] ?? 0) + v).toString();
-        }
-      } else {
-        ccov.requests_conflict += 1;
-        bump(ccov.requests_conflict_by_kind, res.excluded);
+        L.inc.responses_usage_incomplete = 1;
+        for (const [f, v] of Object.entries(res.present_fields)) L.tok[f] = v;
       }
-      out.push({ provider: "claude", key: rid, status: `excluded:${res.excluded}`, counted: false });
+      if (inWindow) out.push({ provider: "claude", key: rid, status: `excluded:${res.excluded}`, counted: false, chain: null });
       continue;
     }
     // R4.6: ownership by earliest stream_start; a key in several streams is a replay in all but one.
-    const sids = [...new Set(copies.map((cp) => cp.sid))];
+    const sids = [...new Set(copies.map((cp) => cp.chain))];
     let owner = sids[0];
     let ambiguous = false;
     if (sids.length > 1) {
@@ -793,7 +1059,10 @@ function scanClaude(entries, opts, cov, window) {
       }
       owner = tied[0];
     }
-    const ownerCopies = copies.filter((cp) => cp.sid === owner);
+    if (ambiguous) triggers.push({ reason: "ownership_ambiguous", names: heldBy }); // R4.6, R0.9
+    if (ambiguous) ccov.replay_ownership_ambiguous += 1;
+    if (res.flags.includes("bucket_mismatch")) L.inc.responses_bucket_mismatch = 1;
+    const ownerCopies = copies.filter((cp) => cp.chain === owner);
     ownerCopies.sort((a, b) => {
       const ta = a.ts ?? Infinity;
       const tb = b.ts ?? Infinity;
@@ -805,28 +1074,134 @@ function scanClaude(entries, opts, cov, window) {
       else if (windowActive(window)) ccov.requests_no_event_time += 1;
       continue;
     }
-    ccov.requests_total += 1;
     if (sids.length > 1) ccov.replay_requests_excluded += sids.length - 1;
-    if (ambiguous) ccov.replay_ownership_ambiguous += 1;
-    if (res.flags.includes("bucket_mismatch")) ccov.responses_bucket_mismatch += 1;
     if (!res.final) ccov.requests_no_final_copy += 1; // R3.12: tokens only
     else if (res.buckets.output === null) ccov.output_unknown_requests += 1; // R2.3: final copy, no usable output
-    const price = priceClaude(res, book_ref.book, stats);
     out.push({
       provider: "claude",
       key: rid,
       kind,
+      chain: owner,
       model: res.model,
       flags: res.flags,
       buckets: res.buckets,
       event_ms: tFirst,
-      price,
+      pr: res,
       counted: true,
       status: "counted",
     });
   }
-  cov.geo_rounded_claude = stats.geo_rounded;
-  return out;
+  return { responses: out, facts: { chains, groups, triggers, files }, ledger };
+}
+
+// ---------------------------------------------------------------------------
+// R0.9 Global integrity abstention: families, live families, taint.
+// ---------------------------------------------------------------------------
+
+/**
+ * Input per provider:
+ *   chains    Set of chain ids seen by a structural read of any version (R15.7).
+ *   groups    arrays of chain ids that are linked: R0.9 links (i), (ii) and (iii). Each group is fully connected.
+ *   triggers  { reason, names: string[] | "provider" } for every reason except unparsed_line and file_unreadable.
+ *   files     { mtimeMs, named: string[], unparsed: number, readable: boolean } per physical file.
+ * Output: per chain { family, tainted, reasons (spec enum order), live }, plus the counters of R0.9 "Coverage".
+ * The result depends on sets only (sorted before use), so file order, line order and duplication cannot change it.
+ */
+function computeTaint(facts, runStartMs) {
+  const ids = new Set(facts.chains);
+  for (const f of facts.files) for (const n of f.named) ids.add(n);
+  for (const t of facts.triggers) if (Array.isArray(t.names)) for (const n of t.names) ids.add(n);
+  const order = [...ids].sort();
+  const index = new Map(order.map((id, k) => [id, k]));
+  const parent = order.map((_, k) => k);
+  const find = (x) => {
+    while (parent[x] !== x) {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  };
+  const union = (a, b) => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra === rb) return;
+    if (ra < rb) parent[rb] = ra;
+    else parent[ra] = rb;
+  };
+  for (const g of facts.groups) {
+    const m = g.filter((x) => index.has(x)).map((x) => index.get(x));
+    for (let k = 1; k < m.length; k += 1) union(m[0], m[k]);
+  }
+
+  // Live files (R0.9): unparseable line, names a chain, modified at most C35 before the run start (a later mtime
+  // counts as live). A file that names no chain is never live.
+  const liveRoots = new Set();
+  const triggers = [...facts.triggers];
+  for (const f of facts.files) {
+    if (!f.readable) {
+      triggers.push({ reason: "file_unreadable", names: "provider" });
+      continue;
+    }
+    if (f.unparsed <= 0) continue;
+    // A missing mtime, an mtime of 0 and a failed stat all mean "never live".
+    const live = f.named.length > 0 && typeof f.mtimeMs === "number" && f.mtimeMs > 0 && runStartMs - f.mtimeMs <= C35_MS;
+    if (live) for (const n of f.named) liveRoots.add(find(index.get(n)));
+    else triggers.push({ reason: "unparsed_line", names: f.named.length > 0 ? f.named : "provider" });
+  }
+
+  // A reason taints every chain in the family of each chain it names; "provider" taints every chain.
+  const famReasons = new Map(); // root -> Set(reason)
+  const addReason = (root, reason) => {
+    let s = famReasons.get(root);
+    if (!s) famReasons.set(root, (s = new Set()));
+    s.add(reason);
+  };
+  const roots = [...new Set(order.map((_, k) => find(k)))];
+  for (const t of triggers) {
+    if (t.names === "provider") for (const r of roots) addReason(r, t.reason);
+    else for (const n of t.names) if (index.has(n)) addReason(find(index.get(n)), t.reason);
+  }
+
+  // Family numbers by the smallest chain id of the family (deterministic).
+  const famNo = new Map();
+  for (let k = 0; k < order.length; k += 1) {
+    const r = find(k);
+    if (!famNo.has(r)) famNo.set(r, famNo.size);
+  }
+  const chainsOut = new Map();
+  const byReason = Object.fromEntries(TAINT_REASONS.map((r) => [r, 0]));
+  let chainsTotal = 0;
+  let chainsTainted = 0;
+  for (let k = 0; k < order.length; k += 1) {
+    const r = find(k);
+    const live = liveRoots.has(r);
+    const set = famReasons.get(r);
+    const reasons = TAINT_REASONS.filter((x) => set?.has(x));
+    const tainted = reasons.length > 0;
+    chainsOut.set(order[k], { family: famNo.get(r), tainted, reasons, live });
+    if (live) continue; // live families are in none of the counters below (R0.9 Coverage)
+    chainsTotal += 1;
+    if (tainted) {
+      chainsTainted += 1;
+      for (const x of reasons) byReason[x] += 1;
+    }
+  }
+  let familiesTotal = 0;
+  let familiesTainted = 0;
+  for (const r of roots) {
+    if (liveRoots.has(r)) continue;
+    familiesTotal += 1;
+    if (famReasons.has(r)) familiesTainted += 1;
+  }
+  return {
+    chains: chainsOut,
+    chains_total: chainsTotal,
+    chains_tainted: chainsTainted,
+    chains_tainted_by_reason: byReason,
+    families_total: familiesTotal,
+    families_tainted: familiesTainted,
+    families_live_skipped: liveRoots.size,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -835,9 +1210,50 @@ function scanClaude(entries, opts, cov, window) {
 
 const CODEX_KNOWN = ["session_meta", "turn_context", "token_usage_record", "event_msg", "compacted", "response_item"];
 
-function parseCodexFile(buf, c) {
+/** Every file is parsed with the same readers whatever its version (R15.7 structural reads). `c` takes the type counters, `fc` the line counters. */
+// R1.2, R4.12: the Codex retained projection is typed. Every field is reduced to an enum member, a validated id, an
+// instant, a bounded token or a counter state before it enters a projection; an invalid raw value is never kept.
+const CODEX_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+const CODEX_VERSION_RE = /^[0-9]+\.[0-9]+\.[0-9]+(?:[-.][0-9A-Za-z.]+)?$/;
+const CODEX_SOURCE_KINDS = ["cli", "exec", "vscode", "mcp", "subagent"];
+const CODEX_THREAD_SOURCES = ["user", "subagent", "agent_created_thread", "automation", "guardian_review"];
+const CODEX_ORIGINATORS = ["codex_cli", "codex_exec", "codex_vscode", "codex_cli_rs", "codex_exec_rs"];
+const CODEX_AGENT_ROLES = ["default", "worker", "explorer", "awaiter"];
+const CODEX_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+
+function codexInstant(v) {
+  if (typeof v !== "string" || v.length > 40 || !CODEX_ISO_RE.test(v)) return null;
+  const ms = Date.parse(v);
+  return Number.isNaN(ms) ? null : ms;
+}
+/** An instant field of a payload: the instant, "!" when present and invalid, null when absent. */
+const instantState = (v) => (v === undefined || v === null ? null : codexInstant(v) ?? "!");
+const codexVersion = (v) => (typeof v === "string" && v.length <= 40 && CODEX_VERSION_RE.test(v) ? v : "unlisted");
+const boundedToken = (v) => (typeof v === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(v) ? v : null);
+/** A counter field reduced to its state: the counter, "r" (range) or null (missing, R2.12, R2.15). */
+const counterState = (v) => {
+  const x = ctr(v);
+  return x === MISSING ? null : x === RANGE ? "r" : x;
+};
+/** An optional counter field of a payload: null when absent, else the counter, "r" or "!" (not a number). */
+const optCounter = (v) => {
+  if (v === undefined || v === null) return null;
+  const x = ctr(v);
+  return x === MISSING ? "!" : x === RANGE ? "r" : x;
+};
+
+/** R1.2, R4.12: integer members of a cumulative counter object, sorted by name, as a stable string. */
+function cumMembers(v) {
+  if (!isObj(v)) return v === undefined ? null : "!";
+  const out = [];
+  for (const k of Object.keys(v)) if (typeof v[k] === "number" && Number.isInteger(v[k])) out.push([k, counterState(v[k])]);
+  out.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return JSON.stringify(out);
+}
+
+function parseCodexFile(buf, c, fc) {
   const fd = { metas: [], ctxs: [], turs: [], markers: [], ordRecs: [], tokenCountEvents: 0, lines: 0 };
-  for (const obj of jsonLines(buf, c)) {
+  for (const obj of jsonLines(buf, fc)) {
     fd.lines += 1;
     if (!isObj(obj)) {
       c.unlisted_type_count += 1;
@@ -851,9 +1267,10 @@ function parseCodexFile(buf, c) {
     const ordPresent = ordRaw !== undefined && ordRaw !== null;
     const ordValid = ordPresent && typeof ordRaw === "number" && Number.isInteger(ordRaw) && ordRaw >= 0 && ordRaw <= MAX_SAFE;
     const ord = ordValid ? ordRaw : null;
-    const tsMs = parseTs(obj.timestamp);
-    const tsKey = tsMs !== null ? tsMs : JSON.stringify(obj.timestamp ?? null);
-    const base = [type ?? "other", tsKey, ordPresent ? (ordValid ? ordRaw : "bad") : null];
+    const tsMs = codexInstant(obj.timestamp);
+    const tsKey = tsMs !== null ? tsMs : obj.timestamp === undefined || obj.timestamp === null ? null : "!";
+    const known = type !== null && CODEX_KNOWN.includes(type);
+    const base = [known ? type : "other", tsKey, ordPresent ? (ordValid ? ordRaw : "!") : null];
     let proj = JSON.stringify(base);
     let decision = false;
 
@@ -865,30 +1282,32 @@ function parseCodexFile(buf, c) {
       const meta = {
         id: str(payload.id),
         sessionId: str(payload.session_id),
-        cliVersion: str(payload.cli_version),
+        cliVersion: codexVersion(payload.cli_version),
         forkedFrom: str(payload.forked_from_id),
         parentThreadId: str(payload.parent_thread_id),
         spawnParent: spawn ? str(spawn.parent_thread_id) : null,
         hasSpawn: spawn !== null,
         subOther: sub !== null && "other" in sub,
         histStartRaw: payload.subagent_history_start_ordinal,
-        threadSource: str(payload.thread_source),
+        threadSource: enumOf(payload.thread_source, CODEX_THREAD_SOURCES),
         ord,
         tsMs,
       };
       const hs = ctr(meta.histStartRaw);
       meta.histStart = hs >= 0 ? hs : null;
-      proj = JSON.stringify([...base, meta.id, meta.sessionId, str(payload.timestamp), meta.cliVersion, meta.forkedFrom, meta.parentThreadId, meta.spawnParent, spawn?.depth ?? null, meta.subOther, meta.histStartRaw ?? null, str(payload.originator), typeof src === "string" ? src : isObj(src) ? "object" : null, meta.threadSource, str(payload.agent_role)]);
+      meta.histKey = optCounter(meta.histStartRaw);
+      const srcKind = typeof src === "string" ? enumOf(src, CODEX_SOURCE_KINDS) : sub !== null ? "subagent" : src === undefined ? null : "other";
+      proj = JSON.stringify([...base, meta.id, meta.sessionId, instantState(payload.timestamp), meta.cliVersion, meta.forkedFrom, meta.parentThreadId, meta.spawnParent, spawn ? optCounter(spawn.depth) : null, spawn !== null, sub !== null, meta.subOther, meta.histKey, enumOf(payload.originator, CODEX_ORIGINATORS), srcKind, meta.threadSource, enumOf(payload.agent_role, CODEX_AGENT_ROLES)]);
       fd.metas.push(meta);
     } else if (type === "turn_context") {
       decision = true;
       const ctx = {
         turnId: str(payload.turn_id),
-        model: normalizeModel(str(payload.model)),
+        model: ctxModel(payload.model),
         ord,
         tsMs,
       };
-      proj = JSON.stringify([...base, ctx.turnId, str(payload.root_turn_id), str(payload.model), str(payload.effort), str(payload.comp_hash), isObj(payload.collaboration_mode) ? str(payload.collaboration_mode.mode) : null]);
+      proj = JSON.stringify([...base, ctx.turnId, str(payload.root_turn_id), ctx.model, payload.model === undefined ? 0 : 1, enumOf(payload.effort, CODEX_EFFORTS), boundedToken(payload.comp_hash), isObj(payload.collaboration_mode) ? boundedToken(payload.collaboration_mode.mode) : null]);
       fd.ctxs.push(ctx);
     } else if (type === "token_usage_record") {
       decision = true;
@@ -908,9 +1327,9 @@ function parseCodexFile(buf, c) {
         ord,
         tsMs,
       };
-      const rawUsage = [u.input_tokens, u.cached_input_tokens, u.cache_write_input_tokens, u.output_tokens, u.reasoning_output_tokens, u.total_tokens].map((x) => (x === undefined ? "undef" : x));
+      const rawUsage = [u.input_tokens, u.cached_input_tokens, u.cache_write_input_tokens, u.output_tokens, u.reasoning_output_tokens, u.total_tokens].map(counterState);
       tur.usageKey = JSON.stringify(rawUsage);
-      proj = JSON.stringify([...base, tur.responseId, tur.threadId, tur.sessionId, tur.turnId, rawUsage, tu.total_tokens ?? null]);
+      proj = JSON.stringify([...base, tur.responseId, tur.threadId, tur.sessionId, tur.turnId, rawUsage, counterState(tu.total_tokens), cumMembers(payload.thread_token_usage), cumMembers(payload.turn_token_usage)]);
       tur.proj = proj;
       fd.turs.push(tur);
     } else if (type === "event_msg") {
@@ -923,7 +1342,7 @@ function parseCodexFile(buf, c) {
       }
     } else if (type === "compacted") {
       decision = true;
-      proj = JSON.stringify([...base, str(payload.compaction_response_id), str(payload.window_id), typeof payload.window_number === "number" ? payload.window_number : null, payload.latest_token_usage_record === null || payload.latest_token_usage_record === undefined]);
+      proj = JSON.stringify([...base, str(payload.compaction_response_id), str(payload.window_id), optCounter(payload.window_number), payload.latest_token_usage_record === null || payload.latest_token_usage_record === undefined]);
     }
     if (decision || ordPresent) {
       const bad = (decision && (!ordValid || tsMs === null)) || (ordPresent && (!ordValid || tsMs === null));
@@ -956,11 +1375,12 @@ function codexKind(meta) {
   return "unclassified";
 }
 
-function scanCodex(entries, opts, cov, window) {
-  const policy = opts.versionPolicy;
-  cov.codex = { files_total: 0, files_unreadable: 0, lines_total: 0, lines_parse_error: 0, lines_truncated_tail: 0, known_type_count: 0, unlisted_type_count: 0, files_without_response_id: 0, token_count_events_in_such_files: 0, files_unassigned_stream: 0, files_assigned_by_stream: 0, files_stream_conflict: 0, files_copy_exposed: 0 };
+function scanCodex(entries, cov, window) {
+  cov.codex = { files_total: 0, files_unreadable: 0, lines_total: 0, lines_parse_error: 0, lines_truncated_tail: 0, known_type_count: 0, unlisted_type_count: 0, files_without_response_id: 0, token_count_events_without_response_id: 0, files_unassigned_stream: 0, files_assigned_by_stream: 0, files_stream_conflict: 0, files_copy_exposed: 0, lines_unverified_version: 0 };
   const c = cov.codex;
   const files = [];
+  const factFiles = [];
+  const triggers = [];
   for (const ent of entries) {
     if (ent.provider !== "codex") continue;
     c.files_total += 1;
@@ -972,14 +1392,23 @@ function scanCodex(entries, opts, cov, window) {
         buf = zlib.zstdDecompressSync(buf);
       }
     } catch {
-      c.files_unreadable += 1;
+      c.files_unreadable += 1; // R0.2, R17.1: counted, never skipped silently; taints every Codex chain (R0.9)
+      factFiles.push({ mtimeMs: ent.mtimeMs, named: [], unparsed: 0, readable: false });
       continue;
     }
-    const fd = parseCodexFile(buf, c);
+    const fc = newLineCov();
+    const fd = parseCodexFile(buf, c, fc);
+    for (const k of ["lines_total", "lines_parse_error", "lines_truncated_tail"]) c[k] += fc[k];
+    fd.unparsed = fc.lines_parse_error + fc.lines_truncated_tail;
+    fd.mtimeMs = ent.mtimeMs;
+    // R0.9 named chains: every id of a session_meta in F (own or copied) and every thread_id of a usage record in F.
+    fd.named = [...new Set([...fd.metas.map((m) => m.id), ...fd.turs.map((t) => t.threadId)].filter((x) => x !== null).map(codexChainId))].sort();
     if (fd.turs.length === 0 && fd.tokenCountEvents > 0) {
       c.files_without_response_id += 1; // R2.9
-      c.token_count_events_in_such_files += fd.tokenCountEvents;
+      c.token_count_events_without_response_id += fd.tokenCountEvents;
+      triggers.push({ reason: "unlogged_usage", names: fd.named.length > 0 ? fd.named : "provider" });
     }
+    factFiles.push({ mtimeMs: ent.mtimeMs, named: fd.named, unparsed: fd.unparsed, readable: true });
     files.push(fd);
   }
 
@@ -990,10 +1419,14 @@ function scanCodex(entries, opts, cov, window) {
     fd.turIds = new Set(fd.turs.map((t) => t.threadId).filter((x) => x !== null));
     fd.I = new Set([...fd.ownIds, ...fd.turIds]);
   }
-  // R4.13: FS over the whole scan.
+  // R4.13: FS over the whole scan, every file of every version.
   const FS = new Set();
   for (const fd of files) for (const m of fd.metas) if (m.forkedFrom !== null) FS.add(m.forkedFrom);
   for (const fd of files) {
+    // R0.9 unattributed_record: a record whose chain key is missing (session_meta id, usage record thread_id).
+    if (fd.metas.some((m) => m.id === null) || fd.turs.some((t) => t.threadId === null)) {
+      triggers.push({ reason: "unattributed_record", names: "provider" });
+    }
     fd.copyExposed = [...fd.ownIds].some((x) => FS.has(x) && !fd.turs.some((t) => t.threadId === x));
     if (fd.I.size === 1) {
       fd.assignment = "assigned";
@@ -1001,16 +1434,28 @@ function scanCodex(entries, opts, cov, window) {
     } else if (fd.I.size === 0) {
       fd.assignment = "unassigned";
       c.files_unassigned_stream += 1;
+      if (fd.lines > 0) triggers.push({ reason: "unattributed_record", names: "provider" }); // R4.11: non-empty and unassigned
     } else {
       fd.assignment = "conflict";
       c.files_stream_conflict += 1;
+      triggers.push({ reason: "stream_unresolved", names: [...fd.I].map(codexChainId) }); // R4.11
     }
-    if (fd.copyExposed) c.files_copy_exposed += 1;
+    if (fd.copyExposed) {
+      c.files_copy_exposed += 1;
+      triggers.push({ reason: "copy_exposed", names: fd.named }); // R4.13
+    }
   }
 
-  // Own session_meta of the whole scan (for versions, forks, FA(S)).
+  // Own session_meta of the whole scan; all session_meta of the scan by id (versions, R15.7).
   const ownMetasById = new Map();
+  const allMetasById = new Map();
   for (const fd of files) {
+    for (const m of fd.metas) {
+      if (m.id === null) continue;
+      let l = allMetasById.get(m.id);
+      if (!l) allMetasById.set(m.id, (l = []));
+      l.push(m);
+    }
     for (const m of fd.own) {
       if (m.id === null) continue;
       let l = ownMetasById.get(m.id);
@@ -1018,67 +1463,60 @@ function scanCodex(entries, opts, cov, window) {
       l.push(m);
     }
   }
-  const copyExposedOwnIds = new Set();
-  for (const fd of files) if (fd.copyExposed) for (const x of fd.ownIds) copyExposedOwnIds.add(x);
+  // R4.11: two own session_meta with one id that differ in session_id, forked_from_id or subagent_history_start_ordinal.
+  for (const [id, metas] of ownMetasById) {
+    const shapes = new Set(metas.map((m) => JSON.stringify([m.sessionId, m.forkedFrom, m.histKey])));
+    if (shapes.size > 1) triggers.push({ reason: "stream_unresolved", names: [codexChainId(id)] });
+  }
 
-  // Logical streams.
+  // R2.17 (d): TM(T) over every turn_context of every file; the files that hold a context or a usage record of T.
+  const turns = new Map(); // turn id -> { models: Set, named: Set }
+  const turn = (id) => {
+    let t = turns.get(id);
+    if (!t) turns.set(id, (t = { models: new Set(), named: new Set() }));
+    return t;
+  };
+  for (const fd of files) {
+    for (const x of fd.ctxs) {
+      if (x.turnId === null) continue;
+      const t = turn(x.turnId);
+      t.models.add(x.model); // a missing or unusable model is a null member of TM(T): A plus null conflicts (R2.17 (d))
+      for (const n of fd.named) t.named.add(n);
+    }
+    for (const x of fd.turs) {
+      if (x.turnId === null) continue;
+      for (const n of fd.named) turn(x.turnId).named.add(n);
+    }
+  }
+  for (const t of turns.values()) if (t.models.size >= 2) triggers.push({ reason: "turn_model_conflicted", names: [...t.named] });
+
+  // Logical streams: the files assigned to one id (R4.11).
   const streams = new Map();
   const getStream = (id) => {
     let s = streams.get(id);
     if (!s) {
-      s = { id, files: [], ordRecs: [], ctxs: [], markers: [], integrity: false };
+      s = { id, files: [], ordRecs: [], ctxs: [], markers: [] };
       streams.set(id, s);
     }
     return s;
   };
   for (const fd of files) {
-    if (fd.assignment === "conflict") for (const id of fd.I) getStream(id).integrity = true; // R4.11
     if (fd.assignment !== "assigned") continue;
-    const id = [...fd.I][0];
-    const s = getStream(id);
+    const s = getStream([...fd.I][0]);
     s.files.push(fd);
     for (const x of fd.ordRecs) s.ordRecs.push(x);
-    for (const x of fd.markers) s.markers.push(x); // conservative: markers of any file count
-    if (!fd.copyExposed) for (const x of fd.ctxs) if (x.model !== null) s.ctxs.push(x); // certain provenance (R4.13 (b))
-    if (fd.copyExposed && fd.ownIds.has(id) && FS.has(id)) s.integrity = true; // R4.13 (a)
+    for (const x of fd.markers) s.markers.push(x);
+    for (const x of fd.ctxs) s.ctxs.push(x); // G(S): EVERY context of the assigned files, a null (unusable) model included, copied prefix included (R2.17 (c))
   }
-  for (const fd of files) {
-    if (fd.assignment === "assigned" && fd.copyExposed) {
-      for (const x of fd.ownIds) if (FS.has(x)) getStream(x).integrity = true;
-    }
-  }
-  const scov = (cov.codex_streams = { streams_integrity_unverified: 0, streams_ordinal_unverified: 0, streams_fork_prefix_unresolved: 0, streams_prefix_exposed: 0 });
-  const faCache = new Map();
-  const forkAncestors = (id) => {
-    if (faCache.has(id)) return faCache.get(id);
-    const set = new Set();
-    const metas = ownMetasById.get(id) ?? [];
-    const queue = metas.map((m) => m.forkedFrom).filter((x) => x !== null);
-    while (queue.length) {
-      const x = queue.pop();
-      if (set.has(x)) continue;
-      set.add(x);
-      for (const m of ownMetasById.get(x) ?? []) if (m.forkedFrom !== null) queue.push(m.forkedFrom);
-    }
-    faCache.set(id, set);
-    return set;
-  };
   for (const s of streams.values()) {
     const metas = ownMetasById.get(s.id) ?? [];
     s.meta = [...metas].sort((a, b) => (a.ord ?? Infinity) - (b.ord ?? Infinity))[0] ?? null;
-    s.versions = [...new Set(metas.map((m) => m.cliVersion))];
-    // R4.11: same id with differing fork fields is integrity_unverified.
-    if (new Set(metas.map((m) => `${m.forkedFrom}|${m.histStartRaw ?? ""}`)).size > 1) s.integrity = true;
     s.ordinalVerified = ordinalVerified(s.ordRecs);
     s.isFork = metas.some((m) => m.forkedFrom !== null);
-    const hs = metas.find((m) => m.forkedFrom !== null)?.histStart ?? null;
-    s.histStart = hs;
-    s.prefixResolved = !s.isFork || (s.ordinalVerified && hs !== null); // R4.9
-    // R4.13 (c): prefix_exposed
-    s.prefixExposed = false;
-    if (s.isFork) for (const x of forkAncestors(s.id)) if (copyExposedOwnIds.has(x)) s.prefixExposed = true;
-    if (s.prefixExposed) s.integrity = true;
-    s.supported = policy === "all" ? true : s.versions.length > 0 && s.versions.every((v) => v !== null && CODEX_FULL_VERSIONS.includes(v)); // R15.7
+    s.histStart = metas.find((m) => m.forkedFrom !== null)?.histStart ?? null;
+    s.prefixResolved = !s.isFork || (s.ordinalVerified && s.histStart !== null); // R4.9
+    if (!s.ordinalVerified) triggers.push({ reason: "ordinal_unverified", names: [codexChainId(s.id)] }); // R4.12
+    if (s.isFork && !s.prefixResolved) triggers.push({ reason: "fork_prefix_unresolved", names: [codexChainId(s.id)] }); // R4.9
     s.kind = codexKind(s.meta);
     s.modelsOfCtx = new Set(s.ctxs.map((x) => x.model));
     s.ctxByTurn = new Map();
@@ -1088,39 +1526,36 @@ function scanCodex(entries, opts, cov, window) {
       if (!l) s.ctxByTurn.set(x.turnId, (l = []));
       l.push(x);
     }
-    if (s.integrity) scov.streams_integrity_unverified += 1;
-    if (!s.ordinalVerified) scov.streams_ordinal_unverified += 1;
-    if (s.isFork && !s.prefixResolved) scov.streams_fork_prefix_unresolved += 1;
-    if (s.prefixExposed) scov.streams_prefix_exposed += 1;
   }
-  // A thread id with own session_meta but no assigned file still has a version for tur accounting.
-  const versionOfThread = (id) => {
-    const s = streams.get(id);
-    if (s) return s.supported;
-    if (policy === "all") return true;
-    const metas = ownMetasById.get(id) ?? [];
+
+  // R15.7: V(S) is the cli_version of every session_meta with id = S, own or copied. Supported iff non-empty and all full.
+  const supportedThread = (id) => {
+    const metas = allMetasById.get(id) ?? [];
     return metas.length > 0 && metas.every((m) => m.cliVersion !== null && CODEX_FULL_VERSIONS.includes(m.cliVersion));
   };
+  const threads = new Set();
+  for (const id of allMetasById.keys()) threads.add(id);
+  for (const fd of files) for (const t of fd.turs) if (t.threadId !== null) threads.add(t.threadId);
+  for (const id of [...threads].sort()) if (!supportedThread(id)) triggers.push({ reason: "version_unverified", names: [codexChainId(id)] });
 
-  // R2.10 / R2.17 model attribution for one usage record.
+  // R2.10 / R2.17 model attribution for one usage record, before R0.9 (the parser's view, valid only for untainted chains).
   const attribute = (t) => {
     const s = t.threadId === null ? undefined : streams.get(t.threadId);
     if (!s) return { source: "none", verified: false, model: null };
-    // R2.10: an integrity_unverified stream verifies no model through any row. prefix_exposed keeps its own name.
-    if (s.prefixExposed) return { source: "prefix_exposed", verified: false, model: null };
-    if (s.integrity) return { source: "stream_unverified", verified: false, model: null };
     const own = t.turnId === null ? [] : (s.ctxByTurn.get(t.turnId) ?? []);
     if (own.length > 0) {
       const models = new Set(own.map((x) => x.model));
-      if (models.size > 1) return { source: "own_turn_unsettled", verified: false, model: null, why: "two_models_in_turn" };
+      if (models.size > 1) return { source: "own_turn_unsettled", verified: false, model: null };
       const model = [...models][0];
+      // A context without a usable model is no model: the response is not verified (R2.17 (a)), as in src.
+      if (model === null) return { source: "own_turn_unsettled", verified: false, model: null };
       if (s.markers.length > 0) {
-        const posOk = s.ordinalVerified && !s.integrity && t.ord !== null;
-        if (!posOk) return { source: "own_turn_unsettled", verified: false, model, why: "marker_position_unknown" };
+        const posOk = s.ordinalVerified && t.ord !== null;
+        if (!posOk) return { source: "own_turn_unsettled", verified: false, model };
         const earliest = Math.min(...own.map((x) => x.ord));
         const lo = Math.min(earliest, t.ord);
         const hi = Math.max(earliest, t.ord);
-        if (s.markers.some((m) => m.ord !== null && m.ord > lo && m.ord < hi)) return { source: "own_turn_unsettled", verified: false, model, why: "marker_between" };
+        if (s.markers.some((m) => m.ord !== null && m.ord > lo && m.ord < hi)) return { source: "own_turn_unsettled", verified: false, model };
       }
       return { source: "own_turn", verified: true, model };
     }
@@ -1140,17 +1575,16 @@ function scanCodex(entries, opts, cov, window) {
     }
     const ok =
       s.ordinalVerified &&
-      !s.integrity &&
       s.prefixResolved &&
       t.ord !== null &&
       best.ord !== null &&
       (!s.isFork || best.ord >= s.histStart) &&
       s.markers.length === 0 && // R2.17 (b): no settings marker anywhere in the stream
-      s.modelsOfCtx.size === 1; // R2.17 (b): one model over all certain contexts
+      s.modelsOfCtx.size === 1 && !s.modelsOfCtx.has(null); // R2.17 (b): one usable model over ALL contexts of G(S), none unusable
     return ok ? { source: "carried_verified", verified: true, model: best.model } : { source: "carried_unverified", verified: false, model: best.model };
   };
 
-  // Usage records, grouped by response_id (R4.4).
+  // Usage records, grouped by response_id (R4.4). Unkeyed and unattributed records first (R2.13).
   const groups = new Map();
   const unverifiedKeys = new Set();
   const ccov = (cov.codex_responses = {
@@ -1158,35 +1592,43 @@ function scanCodex(entries, opts, cov, window) {
     requests_conflict: 0,
     requests_conflict_by_kind: {},
     records_unkeyed: 0,
-    records_no_thread_id: 0,
     requests_unverified_version: 0,
     responses_usage_range_failed: 0,
     responses_usage_incomplete: 0,
     responses_usage_invariant_failed: 0,
     tokens_in_incomplete_by_field: {},
     tokens_in_invalid_responses: "0",
-    responses_model_unverified: 0,
-    model_source_counts: {},
-    own_turn_unsettled_by_reason: {},
     baseline_requests_loaded: 0,
     requests_no_event_time: 0,
   });
   const unkeyedSeen = new Set();
+  const ledger = [];
   for (const fd of files) {
     for (const t of fd.turs) {
-      if (t.responseId === null) {
+      if (t.threadId === null) {
+        // No chain key: unkeyed for accounting (R2.13, logical: equal records count once) and unattributed for R0.9
+        // (provider trigger, above). It counts in records_unkeyed and not as unmappable.
         if (!unkeyedSeen.has(t.proj)) {
           unkeyedSeen.add(t.proj);
-          ccov.records_unkeyed += 1; // R2.13
+          ccov.records_unkeyed += 1;
+          ledger.push({ t: t.tsMs, chain: null, inc: { records_unkeyed: 1 }, kinds: [], tok: {}, tokInvalid: 0n });
         }
         continue;
       }
-      if (t.threadId === null) {
-        ccov.records_no_thread_id += 1;
+      if (!supportedThread(t.threadId)) {
+        // R15.7: a record of an unverified stream is counted, never accounted, and no request-level rule runs on it:
+        // the stream gets version_unverified only (no request_anomaly, no unkeyed count).
+        c.lines_unverified_version += 1;
+        if (t.responseId !== null) unverifiedKeys.add(t.responseId);
         continue;
       }
-      if (!versionOfThread(t.threadId)) {
-        unverifiedKeys.add(t.responseId);
+      if (t.responseId === null) {
+        if (!unkeyedSeen.has(t.proj)) {
+          unkeyedSeen.add(t.proj);
+          ccov.records_unkeyed += 1; // R2.13, logical
+          ledger.push({ t: t.tsMs, chain: codexChainId(t.threadId), inc: { records_unkeyed: 1 }, kinds: [], tok: {}, tokInvalid: 0n });
+        }
+        triggers.push({ reason: "request_anomaly", names: [codexChainId(t.threadId)] }); // a thread without a response id
         continue;
       }
       let g = groups.get(t.responseId);
@@ -1196,45 +1638,76 @@ function scanCodex(entries, opts, cov, window) {
   }
   ccov.requests_unverified_version = unverifiedKeys.size;
 
+  // R0.9 family groups: (i) a shared session_id, (ii) fork and spawn edges, (iii) a response_id held by several threads.
+  const universe = new Set(); // every chain (thread) seen by a structural read
+  for (const id of threads) universe.add(codexChainId(id));
+  const famGroups = [];
+  const sessThreads = new Map();
+  const respThreads = new Map();
+  for (const fd of files) {
+    for (const m of fd.metas) {
+      if (m.id === null) continue;
+      if (m.sessionId !== null) addTo(sessThreads, m.sessionId, codexChainId(m.id));
+      for (const other of [m.forkedFrom, m.spawnParent]) {
+        if (other !== null && other !== m.id && threads.has(other)) famGroups.push([codexChainId(m.id), codexChainId(other)]);
+      }
+    }
+    for (const t of fd.turs) {
+      if (t.threadId === null) continue;
+      if (t.sessionId !== null) addTo(sessThreads, t.sessionId, codexChainId(t.threadId));
+      if (t.responseId !== null) addTo(respThreads, t.responseId, codexChainId(t.threadId));
+    }
+  }
+  for (const s of sessThreads.values()) if (s.size > 1) famGroups.push([...s]);
+  for (const s of respThreads.values()) if (s.size > 1) famGroups.push([...s]);
+
   const out = [];
-  let invalidTokens = 0n;
   for (const key of [...groups.keys()].sort()) {
     const occ = groups.get(key);
     const first = occ[0];
+    const heldBy = [...new Set(occ.map((o) => codexChainId(o.t.threadId)))].sort();
     const allEqual = occ.every((o) => o.t.proj === first.t.proj && o.attr.verified === first.attr.verified && (!o.attr.verified || o.attr.model === first.attr.model));
-    const tMs = first.t.tsMs;
+    // R4.10, R5.9, R17.6: the event time of a request is computed from the whole record set of the key (the minimum over
+    // every occurrence), never from the occurrence that happens to come first in file order. Equal occurrences share one
+    // timestamp, so this is the usual time; conflicting occurrences get one time whatever the order of the files.
+    let tMs = null;
+    for (const o of occ) if (o.t.tsMs !== null && (tMs === null || o.t.tsMs < tMs)) tMs = o.t.tsMs;
     const inWindow = windowHas(window, tMs);
+    const L = { t: tMs, chain: heldBy[0] ?? null, inc: {}, kinds: [], tok: {}, tokInvalid: 0n };
+    ledger.push(L);
     if (!allEqual) {
+      triggers.push({ reason: "request_anomaly", names: heldBy }); // R4.4
       const usageEqual = occ.every((o) => o.t.usageKey === first.t.usageKey);
       const kind = usageEqual ? "conflict_attribution" : "conflict_usage";
-      if (inWindow) {
-        ccov.requests_total += 1;
-        ccov.requests_conflict += 1;
-        bump(ccov.requests_conflict_by_kind, kind);
-      }
-      out.push({ provider: "codex", key, status: `excluded:${kind}`, counted: false });
+      ccov.requests_total += 1; // scan-wide diagnostic count of keys
+      L.inc.requests_conflict = 1;
+      L.kinds.push(kind);
+      if (inWindow) out.push({ provider: "codex", key, status: `excluded:${kind}`, counted: false, chain: null });
       continue;
     }
     const { t, attr } = first;
     const s = streams.get(t.threadId);
-    if (!inWindow) {
-      if (windowActive(window) && tMs !== null) ccov.baseline_requests_loaded += 1;
-      else if (windowActive(window)) ccov.requests_no_event_time += 1;
-      continue;
-    }
-    ccov.requests_total += 1;
     const vals = { in: t.in, c: t.c, cw: t.cw, out: t.out, rs: t.rs, total: t.total };
-    if (Object.values(vals).includes(RANGE)) {
-      ccov.responses_usage_range_failed += 1; // R2.15
-      out.push({ provider: "codex", key, status: "excluded:usage_range_failed", counted: false });
+    const rangeFailed = Object.values(vals).includes(RANGE);
+    const incomplete = !rangeFailed && Object.values(vals).includes(MISSING);
+    let invariantFailed = false;
+    if (!rangeFailed && !incomplete) {
+      invariantFailed = BigInt(t.c) + BigInt(t.cw) > BigInt(t.in) || BigInt(t.rs) > BigInt(t.out) || BigInt(t.total) !== BigInt(t.in) + BigInt(t.out);
+    }
+    if (rangeFailed || incomplete || invariantFailed) triggers.push({ reason: "request_anomaly", names: heldBy }); // R2.7, R2.12, R2.15
+    ccov.requests_total += 1; // scan-wide (see above)
+    const dropRow = (status) => {
+      if (inWindow) out.push({ provider: "codex", key, status, counted: false, chain: null });
+    };
+    if (rangeFailed) {
+      L.inc.responses_usage_range_failed = 1; // R2.15
+      dropRow("excluded:usage_range_failed");
       continue;
     }
-    if (Object.values(vals).includes(MISSING)) {
-      ccov.responses_usage_incomplete += 1; // R2.12
-      for (const [f, v] of Object.entries(vals)) {
-        if (v >= 0) ccov.tokens_in_incomplete_by_field[f] = (BigInt(ccov.tokens_in_incomplete_by_field[f] ?? 0) + BigInt(v)).toString();
-      }
-      out.push({ provider: "codex", key, status: "excluded:usage_incomplete", counted: false });
+    if (incomplete) {
+      L.inc.responses_usage_incomplete = 1; // R2.12
+      for (const [f, v] of Object.entries(vals)) if (v >= 0) L.tok[f] = BigInt(v);
+      dropRow("excluded:usage_incomplete");
       continue;
     }
     const inn = BigInt(t.in);
@@ -1242,15 +1715,17 @@ function scanCodex(entries, opts, cov, window) {
     const cw = BigInt(t.cw);
     const outT = BigInt(t.out);
     const rs = BigInt(t.rs);
-    if (cc + cw > inn || rs > outT || BigInt(t.total) !== inn + outT) {
-      ccov.responses_usage_invariant_failed += 1; // R2.7
-      invalidTokens += inn + outT;
-      out.push({ provider: "codex", key, status: "excluded:usage_invariant_failed", counted: false });
+    if (invariantFailed) {
+      L.inc.responses_usage_invariant_failed = 1; // R2.7
+      L.tokInvalid = inn + outT;
+      dropRow("excluded:usage_invariant_failed");
       continue;
     }
-    bump(ccov.model_source_counts, attr.source);
-    if (attr.why) bump(ccov.own_turn_unsettled_by_reason, attr.why);
-    if (!attr.verified) ccov.responses_model_unverified += 1;
+    if (!inWindow) {
+      if (windowActive(window) && tMs !== null) ccov.baseline_requests_loaded += 1;
+      else if (windowActive(window)) ccov.requests_no_event_time += 1;
+      continue;
+    }
     const buckets = {
       input_uncached: inn - cc - cw,
       cache_read: cc,
@@ -1262,34 +1737,33 @@ function scanCodex(entries, opts, cov, window) {
       output_lower_bound: outT,
       reasoning: rs,
     };
-    const price = priceCodex(attr, buckets, inn, book_ref.book, opts.codexTierForTest === "standard");
     out.push({
       provider: "codex",
       key,
       kind: s ? s.kind : "unclassified",
+      chain: codexChainId(t.threadId),
       model: attr.verified ? attr.model : null,
       model_source: attr.source,
       flags: [],
       buckets,
       event_ms: tMs,
-      price,
+      attr,
+      inn,
       counted: true,
       status: "counted",
     });
   }
-  ccov.tokens_in_invalid_responses = invalidTokens.toString();
-  return out;
+  return { responses: out, facts: { chains: universe, groups: famGroups, triggers, files: factFiles }, ledger };
 }
 
-/** R3.6, R3.10: price one Codex response. */
-function priceCodex(attr, b, inn, book, tierVerified) {
-  const tot = inn + b.output;
-  if (!attr.verified) return unpriced("model_unknown", tot); // R2.10
-  const entry = usableEntry(book, attr.model);
+/** R3.6, R3.10: price one Codex response of an untainted chain. The tier gate comes first (R3.4), before R3.10. */
+function priceCodex(r, book, tierVerified) {
+  const b = r.buckets;
+  const tot = r.inn + b.output;
+  if (!tierVerified) return unpriced("modifier_unverified", tot); // R3.4: no retained field shows the Codex service tier
+  if (!r.attr.verified) return unpriced("model_unknown", tot); // R2.10
+  const entry = usableEntry(book, r.attr.model);
   if (!entry || codexRow(entry.prices_usd_per_mtok) === null) return unpriced("unknown_model", tot); // R3.3
-  // R3.4 tier gate: no retained field shows the Codex service tier, so a default run prices nothing. The gate
-  // is evaluated before R3.10 (reason modifier_unverified, never long_context_scope).
-  if (!tierVerified) return unpriced("modifier_unverified", tot);
   const lc = entry.long_context;
   const requestScoped =
     isObj(lc) &&
@@ -1301,25 +1775,23 @@ function priceCodex(attr, b, inn, book, tierVerified) {
     lc.scope_source_id in book.table.sources; // R3.10, R3.11
   if (!requestScoped) return unpriced("long_context_scope", tot);
   let row = codexRow(entry.prices_usd_per_mtok);
-  if (inn > C25) {
+  if (r.inn > C25) {
     const lcRow = verifiedObj(lc, entry, book.table) ? codexRow(lc.prices_usd_per_mtok) : null;
     if (!lcRow) return unpriced("long_context_unverified", tot);
     row = lcRow;
   }
   if (b.cache_write > 0n && row.cache_write === null) return unpriced("cache_write_price_na", tot); // R3.6
-  const cost =
+  const pico =
     b.input_uncached * row.input +
     b.cache_read * row.cache_read +
     (b.cache_write > 0n ? b.cache_write * row.cache_write : 0n) +
     b.output * row.output;
-  return { priced: true, lo: cost, hi: cost, output_excluded: false, tokens_unpriced: 0n };
+  return { priced: true, pico, tokens_unpriced: 0n };
 }
 
 // ---------------------------------------------------------------------------
 // Window (R5.9, R5.10): [since, until) on event time, UTC.
 // ---------------------------------------------------------------------------
-
-const book_ref = { book: null };
 
 function windowActive(w) {
   return w.since !== null || w.until !== null;
@@ -1357,21 +1829,127 @@ function loadTableArg(t) {
   return JSON.parse(readFileSync(p, "utf8"));
 }
 
-function emptyCov() {
-  return {};
+/** Tokens of one counted response: context buckets plus output, or the output lower bound when output is unknown. */
+function responseTokens(b) {
+  return b.input_uncached + b.cache_read + b.cache_write_5m + b.cache_write_1h + b.cache_write_unknown_ttl + b.cache_write + (b.output !== null ? b.output : b.output_lower_bound);
+}
+
+/**
+ * R0.9 effects on the responses of one provider, then the price. Live families are removed (counted only in their own
+ * counters). A tainted chain keeps its buckets (effect 1) and gets no verified model and no dollars (effect 2).
+ */
+function applyTaint(provider, responses, taint, book, tierVerified, stats) {
+  const co = {
+    responses_in_tainted_chains: 0,
+    tokens_in_tainted_chains: 0n,
+    requests_unpriced_tainted: 0,
+    responses_live_skipped: 0,
+    tokens_live_skipped: 0n,
+    responses_model_unverified: 0,
+    model_source_counts: {},
+  };
+  for (const r of responses) {
+    const info = r.chain === null ? null : (taint.chains.get(r.chain) ?? null);
+    r.tainted = info !== null && info.tainted;
+    r.taint_reasons = info === null ? [] : [...info.reasons];
+    r.live_skipped = false;
+    if (!r.counted) continue;
+    const tokens = responseTokens(r.buckets);
+    if (info.live) {
+      r.counted = false;
+      r.live_skipped = true;
+      r.status = "live_skipped";
+      co.responses_live_skipped += 1;
+      co.tokens_live_skipped += tokens;
+      continue;
+    }
+    if (info.tainted) {
+      r.model_source = "chain_tainted";
+      if (provider === "codex") r.model = null; // the Codex candidate is not kept; Claude keeps its record's model id
+      r.price = unpriced("chain_tainted", tokens);
+      co.responses_in_tainted_chains += 1;
+      co.tokens_in_tainted_chains += tokens;
+      co.requests_unpriced_tainted += 1;
+    } else if (provider === "claude") {
+      r.model_source = r.model === null ? "none" : "claude_explicit";
+      r.price = r.model === null ? unpriced("model_unknown", tokens) : priceClaude(r.pr, book, stats);
+    } else {
+      r.model_source = r.attr.source;
+      r.price = priceCodex(r, book, tierVerified);
+    }
+    if (provider === "codex") {
+      bump(co.model_source_counts, r.model_source);
+      if (!(r.model_source !== "chain_tainted" && r.attr.verified)) co.responses_model_unverified += 1;
+    } else if (r.model_source === "chain_tainted" || r.model === null) {
+      co.responses_model_unverified += 1; // R2.10 / R17.1, tainted chains included
+    }
+  }
+  return co;
+}
+
+/**
+ * R17.3 "in the window" and R0.9 "removed from the analysis entirely": the logical counters of the ledger are the sum of
+ * the entries whose event time is in the window (an unknown time is in every window) and whose chain is not in a live
+ * family. `requests_conflict` counts requests (one per request with any conflict code), the by-kind counts one per code.
+ */
+function foldLedger(provider, ledger, window, taint, cov) {
+  const target = provider === "claude" ? cov.claude_responses : cov.codex_responses;
+  const own = provider === "claude" ? cov.claude : null;
+  target.requests_conflict = 0;
+  target.requests_conflict_by_kind = {};
+  target.responses_usage_range_failed = 0;
+  target.responses_usage_incomplete = 0;
+  target.tokens_in_incomplete_by_field = {};
+  if (provider === "claude") target.responses_bucket_mismatch = 0;
+  else {
+    target.responses_usage_invariant_failed = 0;
+    target.tokens_in_invalid_responses = "0";
+    target.records_unkeyed = 0;
+  }
+  if (own !== null) own.records_unkeyed = 0;
+  const tok = {};
+  let invalid = 0n;
+  for (const e of ledger) {
+    if (e.t !== null && windowActive(window) && !windowHas(window, e.t)) continue;
+    if (e.chain !== null && taint.chains.get(e.chain)?.live === true) continue;
+    for (const [k, n] of Object.entries(e.inc)) {
+      if (k === "records_unkeyed" && own !== null) own.records_unkeyed += n;
+      else target[k] += n;
+    }
+    for (const k of e.kinds) bump(target.requests_conflict_by_kind, k);
+    for (const [f, v] of Object.entries(e.tok)) tok[f] = (tok[f] ?? 0n) + v;
+    invalid += e.tokInvalid;
+  }
+  for (const [f, v] of Object.entries(tok)) target.tokens_in_incomplete_by_field[f] = v.toString();
+  if (provider === "codex") target.tokens_in_invalid_responses = invalid.toString();
+}
+
+function parseRunStart(v) {
+  if (v === undefined || v === null) return Date.now(); // read once per run (R0.9)
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  const ms = parseTs(v);
+  if (ms === null) throw new Error("bad_run_start");
+  return ms;
 }
 
 function run(entries, opts) {
-  const policy = opts.versionPolicy === "all" ? "all" : "strict";
   const window = { since: parseBound(opts.since, "since"), until: parseBound(opts.until, "until") };
   const book = loadBook(loadTableArg(opts.table));
-  book_ref.book = book;
-  const cov = emptyCov();
-  const o = { versionPolicy: policy, codexTierForTest: (opts.codexTierForTest ?? opts.codex_tier_for_test) === "standard" ? "standard" : null };
-  const claude = scanClaude(entries, o, cov, window);
-  const codex = scanCodex(entries, o, cov, window);
+  const runStartMs = parseRunStart(opts.runStartMs ?? opts.run_start_ms);
+  const tierVerified = (opts.codexTierForTest ?? opts.codex_tier_for_test) === "standard";
+  const cov = {};
+  const scans = { claude: scanClaude(entries, cov, window), codex: scanCodex(entries, cov, window) };
 
-  const responses = [...claude, ...codex];
+  const stats = { geo_rounded: 0 };
+  const taints = {};
+  const effects = {};
+  for (const provider of ["claude", "codex"]) {
+    taints[provider] = computeTaint(scans[provider].facts, runStartMs);
+    foldLedger(provider, scans[provider].ledger, window, taints[provider], cov);
+    effects[provider] = applyTaint(provider, scans[provider].responses, taints[provider], book, tierVerified, stats);
+  }
+
+  const responses = [...scans.claude.responses, ...scans.codex.responses];
   const known = new Set();
   for (const id of book.byModel.keys()) known.add(id);
   const modelLabel = (m) => {
@@ -1380,6 +1958,7 @@ function run(entries, opts) {
   };
 
   const providers = {};
+  const tokensTotal = {};
   for (const provider of ["claude", "codex"]) {
     const total = emptyAgg();
     const byModel = new Map();
@@ -1401,6 +1980,7 @@ function run(entries, opts) {
         unpricedReasons.set(r.price.reason, u);
       }
     }
+    tokensTotal[provider] = total.tokens_total;
     providers[provider] = {
       totals: serializeAgg(total),
       by_model: sortedObject(byModel, serializeAgg),
@@ -1409,15 +1989,49 @@ function run(entries, opts) {
     };
   }
 
+  // R17.1 coverage. Chain and family counters are scan-wide per provider and exclude live families (R0.9). The
+  // response-level counters are taken over the totals set: owner, non-excluded responses inside the window (ambiguity
+  // logged in README: R0.9 does not say whether they are windowed).
+  const taintCoverage = (provider) => {
+    const t = taints[provider];
+    const e = effects[provider];
+    return {
+      chains_total: t.chains_total,
+      chains_tainted: t.chains_tainted,
+      chains_tainted_by_reason: { ...t.chains_tainted_by_reason },
+      families_total: t.families_total,
+      families_tainted: t.families_tainted,
+      families_live_skipped: t.families_live_skipped,
+      responses_in_tainted_chains: e.responses_in_tainted_chains,
+      tokens_in_tainted_chains: e.tokens_in_tainted_chains.toString(),
+      requests_unpriced_tainted: e.requests_unpriced_tainted,
+      responses_live_skipped: e.responses_live_skipped,
+      tokens_live_skipped: e.tokens_live_skipped.toString(),
+      // R16.1 / C36 by cross-multiplication: the warning is a report matter, the inputs are exact here.
+      taint_warn: BigInt(t.families_tainted) * C36[1] > C36[0] * BigInt(t.families_total) || e.tokens_in_tainted_chains * C36[1] > C36[0] * tokensTotal[provider],
+    };
+  };
   const coverage = {
-    claude: { ...cov.claude, ...cov.claude_responses, requests_unverified_version: cov.claude_requests_unverified_version, geo_rounded_responses: cov.geo_rounded_claude },
-    codex: { ...cov.codex, ...cov.codex_streams, ...cov.codex_responses },
+    claude: {
+      ...cov.claude,
+      ...cov.claude_responses,
+      responses_model_unverified: effects.claude.responses_model_unverified,
+      requests_unverified_version: cov.claude_requests_unverified_version,
+      geo_rounded_responses: stats.geo_rounded,
+      ...taintCoverage("claude"),
+    },
+    codex: {
+      ...cov.codex,
+      ...cov.codex_responses,
+      responses_model_unverified: effects.codex.responses_model_unverified,
+      model_source_counts: effects.codex.model_source_counts,
+      ...taintCoverage("codex"),
+    },
   };
   return {
     schema: RECOMPUTE_SCHEMA,
     spec: SPEC_ID,
     table_version: book.version,
-    version_policy: policy,
     window: {
       since: window.since === null ? null : new Date(window.since).toISOString(),
       until: window.until === null ? null : new Date(window.until).toISOString(),
@@ -1429,38 +2043,50 @@ function run(entries, opts) {
   };
 }
 
-/** Recompute from directories. opts: claudeDirs, codexDirs, since, until, table (object or path), versionPolicy. */
+/** Recompute from directories. opts: claudeDirs, codexDirs, since, until, table (object or path), runStartMs, codexTierForTest. */
 export function recompute(opts = {}) {
   const cov = {};
   const entries = discoverEntries(opts.claudeDirs ?? [], opts.codexDirs ?? [], cov);
   return run(entries, opts);
 }
 
-/** Recompute from in-memory files: [{ path: "projects/...", content }, ...] in builder layout. */
+/** Recompute from in-memory files: [{ path: "projects/...", content, mtimeMs? }, ...] in builder layout. */
 export function recomputeFiles(files, opts = {}) {
   return run(memoryEntries(files), opts);
 }
 
-/** JSON-safe form. Per-response rows are included only with perResponse; keys are hashed unless rawKeys. */
-export function toJson(result, { perResponse = false, rawKeys = false } = {}) {
+/**
+ * JSON-safe form. Per-response rows are included only with perResponse. Request keys are replaced by
+ * `req_<8 hex>`, the first 8 hex characters of sha256(salt || provider || key), where the salt is 16 random bytes
+ * drawn per call and never stored or printed (R14.4). Rows are ordered by the raw key before it is hashed, so the
+ * order does not depend on the salt. `salt` and `rawKeys` are in-process parameters for tests and for comparison
+ * with src/ on synthetic data: neither has a CLI flag, and the CLI refuses `--raw-keys`.
+ */
+export function toJson(result, { perResponse = false, rawKeys = false, salt = undefined } = {}) {
+  const saltBytes = salt === undefined ? randomBytes(16) : Buffer.from(salt);
+  const opaque = (provider, key) => "req_" + createHash("sha256").update(saltBytes).update(provider + "\u0000" + key).digest("hex").slice(0, 8);
   const doc = {
     schema: result.schema,
     spec: result.spec,
     table_version: result.table_version,
-    version_policy: result.version_policy,
     window: result.window,
     price_mode: result.price_mode,
     providers: result.providers,
     coverage: result.coverage,
   };
   if (perResponse) {
-    doc.responses = result.responses
+    const byKey = (a, b) => (a.provider !== b.provider ? (a.provider < b.provider ? -1 : 1) : a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+    doc.responses = [...result.responses]
+      .sort(byKey)
       .map((r) => {
-        const row = { provider: r.provider, id: rawKeys ? r.key : `h_${sha16(`${r.provider}\u0000${r.key}`)}`, status: r.status };
+        const row = { provider: r.provider, id: rawKeys ? r.key : opaque(r.provider, r.key), status: r.status };
+        row.tainted = r.tainted === true;
+        row.taint_reasons = [...(r.taint_reasons ?? [])];
+        row.live_skipped = r.live_skipped === true;
         if (!r.counted) return row;
         row.kind = r.kind;
         row.model = r.model_label;
-        if (r.model_source) row.model_source = r.model_source;
+        row.model_source = r.model_source;
         if (r.flags.length) row.flags = [...r.flags].sort();
         const b = r.buckets;
         row.buckets = {
@@ -1475,18 +2101,14 @@ export function toJson(result, { perResponse = false, rawKeys = false } = {}) {
         };
         row.event = r.event_ms === null ? null : new Date(r.event_ms).toISOString();
         if (r.price.priced) {
-          row.usd_pico_lo = r.price.lo.toString();
-          row.usd_pico_hi = r.price.hi.toString();
-          row.output_excluded = r.price.output_excluded;
+          row.usd_pico = r.price.pico.toString();
         } else {
-          row.usd_pico_lo = null;
-          row.usd_pico_hi = null;
+          row.usd_pico = null;
           row.unpriced_reason = r.price.reason;
           row.tokens_unpriced = r.price.tokens_unpriced.toString();
         }
         return row;
-      })
-      .sort((a, b) => (a.provider + a.id < b.provider + b.id ? -1 : a.provider + a.id > b.provider + b.id ? 1 : 0));
+      });
   }
   return doc;
 }
@@ -1496,7 +2118,7 @@ export function toJson(result, { perResponse = false, rawKeys = false } = {}) {
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv) {
-  const o = { claudeDirs: [], codexDirs: [], perResponse: false, rawKeys: false };
+  const o = { claudeDirs: [], codexDirs: [], perResponse: false };
   for (let k = 0; k < argv.length; k += 1) {
     const a = argv[k];
     const next = () => {
@@ -1509,13 +2131,11 @@ function parseArgs(argv) {
     else if (a === "--since") o.since = next();
     else if (a === "--until") o.until = next();
     else if (a === "--table") o.table = next();
-    else if (a === "--version-policy") o.versionPolicy = next();
     else if (a === "--out") o.out = next();
     else if (a === "--per-response") o.perResponse = true;
-    else if (a === "--raw-keys") o.rawKeys = true;
+    else if (a === "--raw-keys") throw new Error("raw_keys_rejected"); // R14.4: the output is JSON, raw ids never go into it
     else throw new Error("unknown_argument");
   }
-  if (o.versionPolicy !== undefined && o.versionPolicy !== "strict" && o.versionPolicy !== "all") throw new Error("bad_version_policy");
   if (o.claudeDirs.length === 0 && o.codexDirs.length === 0) throw new Error("no_input_dir");
   return o;
 }
@@ -1524,7 +2144,7 @@ function main() {
   let o;
   try {
     o = parseArgs(process.argv.slice(2));
-    const doc = toJson(recompute(o), o);
+    const doc = toJson(recompute(o), o); // the run start is read once, inside run(); file mtimes are statted at discovery
     const text = `${JSON.stringify(doc, null, 2)}\n`;
     if (o.out) writeFileSync(o.out, text);
     else process.stdout.write(text);

@@ -1,11 +1,11 @@
-// Tests for src/sources/codex.ts. Spec: docs/methodology.md (spec-1, revision 7). All data is synthetic.
+// Tests for src/sources/codex.ts. Spec: docs/methodology.md (spec-1, revision 11). All data is synthetic.
 //
 // Layout:
-//   1. helpers (tree writer, raw line builders, semantic projection, metamorphic operators)
+//   1. helpers (tree writer, raw line builders, taint closure over the integrity facts, semantic projection, operators)
 //   2. accounting (R2.6 to R2.9, R2.12, R2.15, R2.16, R2.13)
 //   3. model attribution (R2.10, R2.17)
 //   4. dedup conflicts (R4.4)
-//   5. streams, identity, copy exposure, forks (R4.9, R4.11, R4.12, R4.13)
+//   5. streams, identity, copy exposure, forks (R4.9, R4.11, R4.12, R4.13) and the integrity facts of R0.9
 //   6. links, kinds, compactions, versions, thread totals
 //   7. metamorphic suite (R4.10, R17.6, R17.7)
 //   8. privacy canary (R1.1, R14.7)
@@ -18,9 +18,9 @@ import { after, describe, it } from "node:test";
 import { discover } from "../../src/discover.js";
 import { zstdSupported } from "../../src/io/lines.js";
 import { parseCodex } from "../../src/sources/codex.js";
-import { PHYSICAL_COVERAGE_COUNTERS, type CodexParseResult, type CodexResponse, type CoverageCounters } from "../../src/model/types.js";
+import { PHYSICAL_COVERAGE_COUNTERS, TAINT_REASONS, type CodexParseResult, type CodexResponse, type CoverageCounters, type TaintReason } from "../../src/model/types.js";
 import { scenarios } from "../../scripts/gen-fixtures.ts";
-import { CodexHome, CodexThread, type CodexLine, type GeneratedFile } from "../fixtures/builder.ts";
+import { CodexHome, CodexThread, zstdCompress, type CodexLine, type GeneratedFile } from "../fixtures/builder.ts";
 
 // ---------------------------------------------------------------------------
 // 1. helpers
@@ -31,6 +31,9 @@ after(() => {
   for (const r of roots) rmSync(r, { recursive: true, force: true });
 });
 
+/** Every file gets this modification time unless the fixture sets one, so two trees of the same content compare equal. */
+const PIN_MTIME_MS = Date.UTC(2026, 0, 2);
+
 function writeTree(files: readonly GeneratedFile[]): string {
   const root = mkdtempSync(join(tmpdir(), "cachewhy-codex-"));
   roots.push(root);
@@ -39,14 +42,29 @@ function writeTree(files: readonly GeneratedFile[]): string {
     const abs = join(root, ...f.path.split("/"));
     mkdirSync(dirname(abs), { recursive: true });
     writeFileSync(abs, f.content);
+    const m = (f.mtimeMs ?? PIN_MTIME_MS) / 1000;
+    utimesSync(abs, m, m);
   }
   return root;
 }
 
-async function run(files: readonly GeneratedFile[], opts?: Parameters<typeof parseCodex>[1]): Promise<CodexParseResult> {
+interface Run {
+  r: CodexParseResult;
+  /** File index (the canonical order of the parser: sorted by absolute path) of a generated file. */
+  indexOf: (generatedPath: string) => number;
+}
+
+async function runX(files: readonly GeneratedFile[]): Promise<Run> {
   const root = writeTree(files);
   const d = await discover({ codexDirs: [root], home: join(root, "no-home"), env: {} });
-  return parseCodex(d.files, opts);
+  const r = await parseCodex(d.files);
+  const abs = files.filter((f) => !f.unavailable).map((f) => join(root, ...f.path.split("/")));
+  const sorted = d.files.map((f) => f.path).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return { r, indexOf: (gp) => sorted.indexOf(abs[files.filter((f) => !f.unavailable).findIndex((f) => f.path === gp)] as string) };
+}
+
+async function run(files: readonly GeneratedFile[]): Promise<CodexParseResult> {
+  return (await runX(files)).r;
 }
 
 /** Order of the DiscoveredFile list must not matter, so the tests feed it reversed and shuffled too. */
@@ -138,10 +156,111 @@ function semantic(r: CodexParseResult): string {
       thread_totals: r.thread_totals,
       assumptions: r.assumptions,
       forked: r.forked_from_ids,
+      integrity: { chains: r.integrity.chains, family_groups: r.integrity.family_groups, triggers: r.integrity.triggers },
       coverage: logicalCoverage(r.coverage),
     },
     bigintReplacer,
   );
+}
+
+// ---- R0.9 closure (test side) ---------------------------------------------------------------------------------------
+// The graph owns the real taint computation. The tests of the parser only need the family closure over its facts, so a
+// small union-find over IntegrityFacts is enough. Liveness is not modelled: every fixture here has a pinned mtime.
+
+const thr = (id: string): string => id.slice("codex\u0000".length);
+
+function familyMap(r: CodexParseResult): Map<string, string> {
+  const parent = new Map<string, string>(r.integrity.chains.map((c) => [c, c]));
+  const find = (x: string): string => {
+    let y = x;
+    while (parent.get(y) !== y) y = parent.get(y) as string;
+    parent.set(x, y);
+    return y;
+  };
+  for (const g of r.integrity.family_groups) {
+    for (const c of g) assert.ok(parent.has(c), "a family group names only chains of the scan");
+    for (let i = 1; i < g.length; i++) {
+      const a = find(g[0] as string);
+      const b = find(g[i] as string);
+      if (a !== b) parent.set(a < b ? b : a, a < b ? a : b);
+    }
+  }
+  return new Map([...parent.keys()].map((c) => [c, find(c)]));
+}
+
+/** Thread id to the set of reasons that taint it (family closure, provider-wide reasons). Untainted threads are absent. */
+function taintOf(r: CodexParseResult): Map<string, Set<TaintReason>> {
+  const fam = familyMap(r);
+  const byFamily = new Map<string, Set<TaintReason>>();
+  const providerWide = new Set<TaintReason>();
+  const addFam = (c: string, reason: TaintReason): void => {
+    const f = fam.get(c);
+    if (f === undefined) return;
+    let set = byFamily.get(f);
+    if (set === undefined) byFamily.set(f, (set = new Set()));
+    set.add(reason);
+  };
+  for (const t of r.integrity.triggers) {
+    if (t.names === "provider") providerWide.add(t.reason);
+    else for (const c of t.names) addFam(c, t.reason);
+  }
+  for (const f of r.integrity.files) {
+    if (f.unparsed_lines === 0) continue;
+    if (f.named_chains.length === 0) providerWide.add("unparsed_line");
+    else for (const c of f.named_chains) addFam(c, "unparsed_line");
+  }
+  const out = new Map<string, Set<TaintReason>>();
+  for (const c of r.integrity.chains) {
+    const reasons = new Set<TaintReason>([...providerWide, ...(byFamily.get(fam.get(c) as string) ?? [])]);
+    if (reasons.size > 0) out.set(thr(c), reasons);
+  }
+  return out;
+}
+const taintedSet = (r: CodexParseResult): string[] => [...taintOf(r).keys()].sort();
+const reasonList = (r: CodexParseResult, thread: string): TaintReason[] =>
+  TAINT_REASONS.filter((x) => taintOf(r).get(thread)?.has(x) === true);
+/** The triggers of one reason, as sorted thread ids ("provider" for a trigger that names none). */
+const namesOf = (r: CodexParseResult, reason: TaintReason): string[] =>
+  r.integrity.triggers.filter((t) => t.reason === reason).flatMap((t) => (t.names === "provider" ? ["provider"] : t.names.map(thr))).sort();
+const tokensOf = (r: CodexParseResult): string =>
+  JSON.stringify(r.responses.map((x) => [x.key, x.exclusion, x.usage]).sort((p, q) => String(p[0]).localeCompare(String(q[0]))), bigintReplacer);
+/** The verified models an output may use: verified by the parser and not tainted (the graph overrides the rest). */
+function effectiveVerified(r: CodexParseResult): Map<string, string> {
+  const t = taintOf(r);
+  return new Map(r.responses.filter((x) => x.model.verified && !t.has(x.thread_id)).map((x) => [x.key, x.model.model as string]));
+}
+
+/** R4.10 op 5: a split file. Both halves keep the mtime (the tree writer pins every mtime). */
+interface SplitCase {
+  file: GeneratedFile;
+  at: number;
+  files: GeneratedFile[];
+  halves: [GeneratedFile, GeneratedFile];
+}
+function splitCases(files: readonly GeneratedFile[]): SplitCase[] {
+  const out: SplitCase[] = [];
+  for (const f of files) {
+    const ls = linesOf(f);
+    for (let at = 1; at < ls.length; at++) {
+      if (!carriesIdentity(ls.slice(0, at)) || !carriesIdentity(ls.slice(at))) continue;
+      const halves = splitFile(f, at);
+      out.push({ file: f, at, files: files.filter((g) => g !== f).concat(halves), halves });
+    }
+  }
+  return out;
+}
+
+/** R4.10: a split is dissolving iff the file was a stream conflict and every half has a smaller identity set, or the file names chains of two or more families and no half names chains of all of them. */
+async function dissolving(base: Run, c: SplitCase, split: Run): Promise<boolean> {
+  const bi = base.indexOf(c.file.path);
+  const hi = c.halves.map((h) => split.indexOf(h.path));
+  const fam = familyMap(base.r);
+  const named = base.r.integrity.files[bi]!.named_chains;
+  const famsOfFile = new Set(named.map((x) => fam.get(x)));
+  const halfFams = hi.map((i) => new Set(split.r.integrity.files[i]!.named_chains.map((x) => fam.get(x) ?? x)));
+  const second = famsOfFile.size >= 2 && !halfFams.some((h) => [...famsOfFile].every((f) => h.has(f as string)));
+  const first = base.r.files[bi]!.stream_assignment === "conflict" && hi.every((i) => split.r.files[i]!.stream_assignment !== "conflict");
+  return first || second;
 }
 
 /** Context around the first difference of two strings, for readable failures. */
@@ -202,7 +321,16 @@ function splitFile(f: GeneratedFile, at: number): [GeneratedFile, GeneratedFile]
     { path: `${stem}-b.jsonl`, content: ls.slice(at).join("\n") + "\n" },
   ];
 }
-const carriesIdentity = (ls: readonly string[]): boolean => ls.some((l) => l.includes('"type":"session_meta"') || l.includes('"type":"token_usage_record"'));
+/** R4.10 op 5: a half keeps at least one record that names a chain (a session_meta with a string id, or a usage record with a string thread_id). */
+const carriesIdentity = (ls: readonly string[]): boolean =>
+  ls.some((l) => {
+    try {
+      const o = JSON.parse(l) as { type?: unknown; payload?: { id?: unknown; thread_id?: unknown } };
+      return (o.type === "session_meta" && typeof o.payload?.id === "string") || (o.type === "token_usage_record" && typeof o.payload?.thread_id === "string");
+    } catch {
+      return false;
+    }
+  });
 
 // ---------------------------------------------------------------------------
 // 2. accounting
@@ -300,6 +428,9 @@ describe("accounting (R2.6 to R2.9)", () => {
     assert.equal(r.excluded[0]!.event_ms, T0 + 3000);
     assert.equal(r.excluded[0]!.ordinal, 3);
     assert.equal(r.excluded[0]!.chain.thread, "th-u");
+    // R2.13, R0.9: an unkeyed record with a known chain taints that chain, and only that family
+    assert.deepEqual(namesOf(r, "request_anomaly"), ["th-u"]);
+    assert.deepEqual(taintedSet(r), ["th-u"]);
   });
 
   it("a file with token_count events but no token_usage_record contributes nothing (R2.9)", async () => {
@@ -314,6 +445,16 @@ describe("accounting (R2.6 to R2.9)", () => {
     assert.equal(r.coverage.token_count_events_without_response_id, 2);
     assert.equal(r.files[0]!.without_response_id, true);
     assert.equal(r.coverage.tokens_unpriced, 0n);
+    // R2.9, R0.9 unlogged_usage: the chains named by the file
+    assert.deepEqual(namesOf(r, "unlogged_usage"), ["th-n"]);
+    assert.deepEqual(reasonList(r, "th-n"), ["unlogged_usage"]);
+  });
+
+  it("token_count events are counted as lines: a duplicated event adds one to the physical counter (R2.9, R17.6)", async () => {
+    const ev = ln("event_msg", 1, 1, { type: "token_count" });
+    const r = await run([raw("nocount-dup", [ln("session_meta", 0, 0, metaP("th-nd")), ev, ev, ln("event_msg", 2, 2, { type: "token_count" })])]);
+    assert.equal(r.coverage.files_without_response_id, 1);
+    assert.equal(r.coverage.token_count_events_without_response_id, 3);
   });
 
   it("incomplete usage is never read as 0 (R2.12) and reports present counters", async () => {
@@ -332,6 +473,7 @@ describe("accounting (R2.6 to R2.9)", () => {
     assert.equal(byKey(r, "ri2").exclusion, "usage_incomplete");
     assert.equal(r.coverage.tokens_in_incomplete_responses, 100n + 10n + 3n);
     assert.equal(r.coverage.records_usage_unmappable, 2);
+    assert.deepEqual(namesOf(r, "request_anomaly"), ["th-i"]); // R2.12, R0.9
   });
 
   it("R2.15 range: MAX_SAFE_INTEGER passes, MAX_SAFE_INTEGER + 1, negative, fractional and string-free huge values fail", async () => {
@@ -365,6 +507,7 @@ describe("accounting (R2.6 to R2.9)", () => {
     }
     assert.equal(r.coverage.responses_usage_range_failed, 4);
     assert.equal(r.coverage.tokens_in_invalid_responses, 0n); // raw values are not stored
+    assert.deepEqual(namesOf(r, "request_anomaly"), ["th-r", "th-r2"]); // R2.15, R0.9
   });
 
   it("R2.7 invariants: c + cw <= in, rs <= out, total == in + out, evaluated in BigInt", async () => {
@@ -385,6 +528,7 @@ describe("accounting (R2.6 to R2.9)", () => {
     }
     assert.equal(r.coverage.responses_usage_invariant_failed, 3);
     assert.equal(r.coverage.tokens_in_invalid_responses, 105n * 3n);
+    assert.deepEqual(namesOf(r, "request_anomaly"), ["th-v"]); // R2.7, R0.9
   });
 
   it("sums across responses are BigInt: two responses at MAX_SAFE_INTEGER add exactly (R2.16)", async () => {
@@ -410,17 +554,39 @@ describe("accounting (R2.6 to R2.9)", () => {
     assert.equal(byKey(r, "r1").exclusion, "usage_incomplete");
     assert.equal(r.coverage.records_usage_unmappable, 1);
     assert.equal(r.streams[0]!.ordinal_verified, false);
+    assert.deepEqual(reasonList(r, "th-bt"), ["ordinal_unverified", "request_anomaly"]); // R4.12, R2.12
   });
 
-  it("two own session_metas of one id with different session_ids make the stream unverified", async () => {
+  it("two own session_metas of one id with different session_ids: stream_unresolved naming that id (R4.11, R0.9)", async () => {
     const f = raw("sess", [
       ln("session_meta", 0, 0, metaP("th-s", { session_id: "sess-1" })),
       ln("session_meta", 1, 1, metaP("th-s", { session_id: "sess-2" })),
       ln("token_usage_record", 2, 2, turP("r1", "th-s", "T", usageP(10, 0, 0, 1, 0))),
     ]);
     const r = await run([f]);
-    assert.deepEqual(r.streams[0]!.integrity_reasons, ["divergent_session_meta"]);
+    assert.deepEqual(namesOf(r, "stream_unresolved"), ["th-s"]);
+    assert.deepEqual(taintedSet(r), ["th-s"]);
+    // R5.1: the display root is the smallest session id, the identity is the thread only
     assert.equal(r.streams[0]!.chain.root_session, "sess-1");
+    assert.deepEqual(r.integrity.chains, ["codex\u0000th-s"]);
+    assert.equal(byKey(r, "r1").usage!.input_uncached, 10n); // accounting does not depend on the verdict
+  });
+
+  it("a session_meta without a string id, and a usage record without a thread_id, are unattributed: a provider trigger (R2.13, R0.9)", async () => {
+    const f = raw("unattr", [
+      ln("session_meta", 0, 0, metaP("th-ok")),
+      ln("session_meta", 1, 1, { ...(metaP("x") as Record<string, unknown>), id: 7 }),
+      ln("token_usage_record", 2, 2, turP("r-ok", "th-ok", "T", usageP(10, 0, 0, 1, 0))),
+      ln("token_usage_record", 3, 3, { response_id: "r-nothread", session_id: "s", turn_id: "T", usage: usageP(900, 0, 0, 9, 0) }),
+    ]);
+    const r = await run([f]);
+    assert.deepEqual(namesOf(r, "unattributed_record"), ["provider"]);
+    assert.deepEqual(taintedSet(r), ["th-ok"]); // the provider reason taints every chain of the scan
+    assert.deepEqual(reasonList(r, "th-ok"), ["unattributed_record"]);
+    assert.equal(byKey(r, "r-ok").usage!.input_uncached, 10n); // tokens of the attributed record are kept
+    assert.equal(r.responses.length, 1); // the record without a thread is unkeyed for accounting
+    assert.equal(r.coverage.records_unkeyed, 1);
+    assert.equal(r.coverage.records_usage_bearing, 2);
   });
 
   it("an out-of-range thread total is treated as absent and counted (R2.15)", async () => {
@@ -515,7 +681,9 @@ describe("model attribution (R2.10, R2.17)", () => {
     const unmarked = await run([lines(false)]);
     assert.equal(unmarked.streams[0]!.ordinal_verified, false);
     assert.deepEqual(attr(unmarked, "r1"), ["own_turn", true, "model-a"]);
-    assert.equal(unmarked.coverage.streams_ordinal_unverified, 1);
+    // R4.12: the stream fails the check, so its chain is tainted and the graph replaces the row with chain_tainted
+    assert.deepEqual(namesOf(unmarked, "ordinal_unverified"), ["th-d"]);
+    assert.deepEqual(taintedSet(unmarked), ["th-d"]);
   });
 
   it("R2.17 fixture 2: a newer context of another turn does not unbind the record; a marker after the first own context does", async () => {
@@ -585,7 +753,8 @@ describe("model attribution (R2.10, R2.17)", () => {
     const collide = await run([raw("collide", [...base, ln("turn_context", 1, 1, tcP("T9", "model-b"))])]);
     assert.equal(collide.streams[0]!.ordinal_verified, false);
     assert.deepEqual(attr(collide, "r1"), ["carried_unverified", false, null]);
-    assert.equal(collide.coverage.streams_ordinal_unverified, 1);
+    assert.deepEqual(namesOf(collide, "ordinal_unverified"), ["th-j"]);
+    assert.deepEqual(namesOf(dup, "ordinal_unverified"), []); // a byte-identical duplicate is not a collision
   });
 
   it("R4.12 (c): timestamps that decrease along the ordinal order fail the stream; a missing ordinal on a decision record too", async () => {
@@ -650,7 +819,11 @@ describe("model attribution (R2.10, R2.17)", () => {
     });
     const r2 = await run(files);
     assert.deepEqual(attr(r2, "rf"), ["carried_unverified", false, null]);
-    assert.equal(r2.coverage.streams_fork_prefix_unresolved, 1);
+    // R4.9: a fork whose prefix cannot be cut is fork_prefix_unresolved and its family is tainted
+    assert.deepEqual(namesOf(r2, "fork_prefix_unresolved"), ["th-f2"]);
+    assert.deepEqual(taintedSet(r2), ["th-f2", "th-p"]);
+    assert.deepEqual(namesOf(r, "fork_prefix_unresolved"), []);
+    assert.deepEqual(taintedSet(r), []);
     const st = r2.streams.find((s) => s.chain.thread === "th-f2")!;
     assert.equal(st.fork!.prefix_resolved, false);
     assert.equal(st.fork!.history_start_ordinal, null);
@@ -667,7 +840,7 @@ describe("model attribution (R2.10, R2.17)", () => {
     assert.deepEqual(attr(r, "rf"), ["carried_verified", true, "model-a"]);
   });
 
-  it("a copy-exposed copy of a parent context with a different model never changes the parent (R4.13 (b))", async () => {
+  it("a copy-exposed copy of a parent context with a different model taints the family of parent and child (R4.13, R2.17 (d))", async () => {
     const parent = thread({ threadId: "th-p4" });
     parent.turnContext({ turnId: "TP", model: "model-a" });
     parent.tokenUsage({ responseId: "rp1", turnId: "TP" });
@@ -676,6 +849,7 @@ describe("model attribution (R2.10, R2.17)", () => {
     fork.tokenUsage({ responseId: "rf", turnId: "TF" });
     const base = await run(filesOf(parent, fork));
     assert.deepEqual(attr(base, "rp2"), ["carried_verified", true, "model-a"]);
+    assert.deepEqual(taintedSet(base), []);
     // Half of the fork file holds only the copied parent meta and a copied parent context of another model.
     const files = filesOf(parent, fork);
     const forkFile = files.find((f) => f.path.includes("th-f4"))!;
@@ -688,15 +862,21 @@ describe("model attribution (R2.10, R2.17)", () => {
     ]);
     const r = await run(split);
     assert.equal(r.coverage.files_copy_exposed, 1);
-    const p = r.streams.find((s) => s.chain.thread === "th-p4")!;
-    assert.equal(p.integrity_unverified, true);
-    assert.ok(p.integrity_reasons.includes("copy_exposed_file"));
-    // The foreign model never becomes a candidate, and nothing is added to the verified set of the parent.
-    // R2.10: an integrity_unverified stream verifies no model through any row, own_turn included.
-    assert.equal(byKey(r, "rp1").model.model, null);
-    assert.equal(byKey(r, "rp1").model.source, "stream_unverified");
+    assert.equal(r.files.filter((f) => f.copy_exposed).length, 1);
+    assert.deepEqual(namesOf(r, "copy_exposed"), ["th-p4"]); // the chains named by the exposed half
+    // the turn TP now has two models in the scan: R2.17 (d)
+    assert.deepEqual(namesOf(r, "turn_model_conflicted"), ["th-p4"]);
+    // the family closure reaches the child through forked_from_id (R0.9 link ii)
+    assert.deepEqual(taintedSet(r), ["th-f4", "th-p4"]);
+    // the copied context shares its envelope ordinal with the parent's own context but differs in the model: an R4.12
+    // collision inside the parent's logical stream, so the parent also fails the ordinal check
+    assert.deepEqual(reasonList(r, "th-f4"), ["copy_exposed", "turn_model_conflicted", "ordinal_unverified"]);
+    // nothing verified is added: the parser sees the foreign context in G(S) and drops the parent's own_turn
+    assert.deepEqual(attr(r, "rp1"), ["own_turn_unsettled", false, null]);
+    assert.equal(byKey(r, "rp1").model.candidate, null);
     assert.equal(byKey(r, "rp2").model.verified, false);
-    for (const x of r.responses) assert.notEqual(x.model.candidate, "model-z");
+    assert.equal(effectiveVerified(r).size, 0);
+    assert.equal(tokensOf(r), tokensOf(base)); // accounting is keyed by record identity
   });
 });
 
@@ -725,6 +905,9 @@ describe("duplicate response_id (R4.4)", () => {
     assert.equal(r.conflicts[0]!.effect, "excluded");
     assert.equal(r.coverage.responses_total, 1);
     assert.equal(r.coverage.responses_model_unverified, 0);
+    // R4.4, R0.9: every stream that holds an occurrence is tainted
+    assert.deepEqual(namesOf(r, "request_anomaly"), ["th-1", "th-2"]);
+    assert.deepEqual(taintedSet(r), ["th-1", "th-2"]);
   });
 
   it("equal usage in one thread differing only in turn_id: conflict_attribution", async () => {
@@ -740,6 +923,7 @@ describe("duplicate response_id (R4.4)", () => {
     assert.equal(r.responses[0]!.exclusion, "conflict_attribution");
     assert.equal(r.responses[0]!.time.event_ms, T0 + 2000); // earliest position of the chain
     assert.equal(r.coverage.requests_conflict_by_kind.conflict_attribution, 1);
+    assert.deepEqual(namesOf(r, "request_anomaly"), ["th-1"]);
   });
 
   it("different usage under one response_id: conflict_usage", async () => {
@@ -753,6 +937,7 @@ describe("duplicate response_id (R4.4)", () => {
     assert.equal(r.responses[0]!.exclusion, "conflict_usage");
     assert.equal(r.coverage.requests_conflict_by_kind.conflict_usage, 1);
     assert.equal(r.coverage.requests_conflict, 1);
+    assert.deepEqual(namesOf(r, "request_anomaly"), ["th-1"]);
   });
 
   it("an identical duplicate record is one response, however many lines or files carry it", async () => {
@@ -768,6 +953,13 @@ describe("duplicate response_id (R4.4)", () => {
     assert.equal(r.coverage.duplicate_records_collapsed, 1);
     assert.equal(r.coverage.requests_conflict, 0);
     assert.deepEqual(r.responses[0]!.provenance.files, [0, 1]);
+    assert.deepEqual(namesOf(r, "request_anomaly"), []);
+  });
+
+  it("the same response_id in two threads joins their families (R0.9 link iii)", async () => {
+    const u = usageP(100, 0, 0, 10, 0);
+    const r = await run(two(ln("token_usage_record", 2, 2, turP("same", "th-1", "T", u)), ln("token_usage_record", 2, 2, turP("same", "th-2", "T", u))));
+    assert.deepEqual(r.integrity.family_groups, [["codex\u0000th-1", "codex\u0000th-2"]]);
   });
 });
 
@@ -776,45 +968,60 @@ describe("duplicate response_id (R4.4)", () => {
 // ---------------------------------------------------------------------------
 
 describe("logical streams (R4.11, R4.13)", () => {
-  it("R2.10 fixture: a stream-conflict file makes the clean file's response stream_unverified, same under shuffle and splits", async () => {
+  it("R2.10 fixture: a stream-conflict file taints the family of the clean file's thread, at every shuffle and split", async () => {
     const f1 = raw("sc-f1", [
       ln("session_meta", 0, 0, metaP("th-X")),
       ln("turn_context", 1, 1, tcP("T", "model-a")),
       ln("token_usage_record", 2, 2, turP("rX", "th-X", "T", usageP(100, 0, 0, 10, 0))),
     ]);
     const f2 = raw("sc-f2", [
-      ln("session_meta", 0, 0, metaP("th-Y")),
+      ln("session_meta", 0, 0, metaP("th-Y", { session_id: "th-X" })),
       ln("token_usage_record", 1, 1, turP("rY", "th-X", "T2", usageP(50, 0, 0, 5, 0))),
       ln("event_msg", 2, 2, { type: "thread_settings_applied" }),
       ln("turn_context", 3, 3, tcP("T", "model-b")),
     ]);
     const r = await run([f1, f2]);
     assert.equal(r.coverage.files_stream_conflict, 1);
-    const x = byKey(r, "rX");
-    assert.deepEqual([x.model.source, x.model.verified, x.model.model], ["stream_unverified", false, null]);
-    assert.equal(r.streams.find((st) => st.chain.thread === "th-X")!.integrity_unverified, true);
-    // accounting never depends on the verdict: tokens are kept
-    assert.equal(x.usage!.input_uncached, 100n);
-    // shuffled file order: identical
+    assert.deepEqual(namesOf(r, "stream_unresolved"), ["th-X", "th-Y"]); // the ids of I(F)
+    assert.deepEqual(namesOf(r, "turn_model_conflicted"), ["th-X", "th-Y"]); // TM(T) = {model-a, model-b}, R2.17 (d)
+    assert.deepEqual(taintedSet(r), ["th-X", "th-Y"]);
+    // accounting never depends on the verdict: tokens are kept, rY is accounted by its own thread_id
+    assert.equal(byKey(r, "rX").usage!.input_uncached, 100n);
+    assert.equal(byKey(r, "rY").usage!.input_uncached, 50n);
+    // the contexts of the conflict file belong to no stream: the parser alone would verify rX, the graph overrides it
+    assert.equal(effectiveVerified(r).size, 0);
+    // shuffled file order: identical facts
     const r2 = await run([f2, f1]);
-    assert.deepEqual(r2.responses.map((y) => [y.key, y.model.source, y.model.verified]), r.responses.map((y) => [y.key, y.model.source, y.model.verified]));
-    // every split of f1 keeps the response unverified (a verified model never appears)
+    assert.equal(semantic(r2), semantic(r));
+    // every split of f1 keeps both chains tainted and the tokens identical
     for (let cut = 1; cut < 3; cut++) {
-      const [a, b] = splitFile(f1, cut);
-      const rs = await run([a, b, f2]);
-      assert.equal(byKey(rs, "rX").model.verified, false, `split at ${cut}`);
+      const [a1, b1] = splitFile(f1, cut);
+      const rs = await run([a1, b1, f2]);
+      assert.deepEqual(taintedSet(rs), ["th-X", "th-Y"], `split at ${cut}`);
+      assert.equal(tokensOf(rs), tokensOf(r));
+      assert.equal(effectiveVerified(rs).size, 0, `split at ${cut}`);
     }
   });
 
-  it("a file without any identity record is unassigned and contributes nothing", async () => {
+  it("a file without any identity record is unassigned and contributes nothing; it taints every Codex chain (R4.11, R0.9)", async () => {
     const f = raw("noid", [ln("response_item", 0, 0, { type: "message" }), ln("event_msg", 1, 1, { type: "task_started" })]);
     const r = await run([f]);
     assert.equal(r.coverage.files_unassigned_stream, 1);
     assert.equal(r.streams.length, 0);
     assert.equal(r.files[0]!.stream_assignment, "unassigned");
+    assert.deepEqual(namesOf(r, "unattributed_record"), ["provider"]);
+    // an empty file is unassigned too, but it holds no record that could belong to any thread
+    const empty = await run([{ path: "sessions/2026/01/01/rollout-2026-01-01T00-00-00-empty.jsonl", content: "" }]);
+    assert.equal(empty.coverage.files_unassigned_stream, 1);
+    assert.deepEqual(namesOf(empty, "unattributed_record"), []);
+    // the provider trigger reaches the clean thread of another file
+    const clean = raw("clean", [ln("session_meta", 0, 0, metaP("th-clean")), ln("token_usage_record", 1, 1, turP("rc", "th-clean", "T", usageP(10, 0, 0, 1, 0)))]);
+    const both = await run([f, clean]);
+    assert.deepEqual(reasonList(both, "th-clean"), ["unattributed_record"]);
+    assert.equal(byKey(both, "rc").usage!.input_uncached, 10n);
   });
 
-  it("two identities in one file: conflict, usage still accounted by its own thread_id, both streams unverified", async () => {
+  it("two identities in one file: conflict, usage still accounted by its own thread_id, both families tainted (R4.11)", async () => {
     const f = raw("conf", [
       ln("session_meta", 0, 0, metaP("th-x")),
       ln("turn_context", 1, 1, tcP("T", "model-a")),
@@ -827,24 +1034,31 @@ describe("logical streams (R4.11, R4.13)", () => {
     assert.equal(r.files.filter((x) => x.stream_assignment === "conflict").length, 1);
     assert.equal(byKey(r, "rx").usage!.input_uncached, 100n);
     assert.equal(byKey(r, "ry").usage!.input_uncached, 200n);
-    for (const s of r.streams) {
-      assert.equal(s.integrity_unverified, true);
-      assert.ok(s.integrity_reasons.includes("file_stream_conflict"));
-    }
-    assert.equal(r.coverage.streams_integrity_unverified, 2);
+    assert.deepEqual(namesOf(r, "stream_unresolved"), ["th-x", "th-y"]);
+    assert.deepEqual(taintedSet(r), ["th-x", "th-y"]);
     // Records other than session_meta and token_usage_record of a conflict file belong to no stream: no context for rx.
     assert.equal(byKey(r, "rx").model.verified, false);
+    assert.equal(r.streams.length, 2);
   });
 
-  it("two own session_metas with one id and different forked_from_id make the stream unverified", async () => {
+  it("two own session_metas with one id and different forked_from_id: stream_unresolved naming that id (R4.11)", async () => {
     const f = raw("div", [
       ln("session_meta", 0, 0, metaP("th-d", { forked_from_id: "th-other", subagent_history_start_ordinal: 0 })),
       ln("session_meta", 1, 1, metaP("th-d")),
       ln("token_usage_record", 2, 2, turP("r1", "th-d", "T", usageP(10, 0, 0, 1, 0))),
     ]);
     const r = await run([f]);
-    assert.equal(r.streams[0]!.integrity_unverified, true);
-    assert.deepEqual(r.streams[0]!.integrity_reasons, ["divergent_session_meta"]);
+    assert.deepEqual(namesOf(r, "stream_unresolved"), ["th-d"]);
+    assert.deepEqual(taintedSet(r), ["th-d"]);
+    // a difference in the history start alone is enough
+    const g = raw("div2", [
+      ln("session_meta", 0, 0, metaP("th-e", { forked_from_id: "th-par", subagent_history_start_ordinal: 0 })),
+      ln("session_meta", 1, 1, metaP("th-e", { forked_from_id: "th-par", subagent_history_start_ordinal: 1 })),
+    ]);
+    assert.deepEqual(namesOf(await run([g]), "stream_unresolved"), ["th-e"]);
+    // two own metas that agree on all three fields are no divergence even when other fields differ
+    const h = raw("div3", [ln("session_meta", 0, 0, metaP("th-g")), ln("session_meta", 1, 1, metaP("th-g", { timestamp: iso(9) }))]);
+    assert.deepEqual(namesOf(await run([h]), "stream_unresolved"), []);
   });
 
   it("a copied parent session_meta is not an own identity; the parent file that holds a usage record is not copy exposed", async () => {
@@ -856,10 +1070,14 @@ describe("logical streams (R4.11, R4.13)", () => {
     assert.equal(r.coverage.files_stream_conflict, 0);
     assert.equal(r.streams.length, 4);
     assert.deepEqual([...r.forked_from_ids], ["synthetic-thread-parent"]);
-    for (const s of r.streams) assert.equal(s.integrity_unverified, false);
+    assert.deepEqual(r.integrity.triggers, []); // a clean scan has no trigger
+    assert.deepEqual(taintedSet(r), []);
+    // the fork, the subagent and the parent are one family through forked_from_id and the spawn edge (R0.9 link ii)
+    const fam = familyMap(r);
+    assert.equal(fam.get("codex\u0000synthetic-thread-sub"), fam.get("codex\u0000synthetic-thread-parent"));
   });
 
-  it("a fork file split so that one half holds only the copied parent meta is copy exposed; the parent loses carried_verified, gains nothing", async () => {
+  it("R4.13: a fork file split so that one half holds only the copied parent meta is copy exposed; the family of parent and child is tainted", async () => {
     const parent = thread({ threadId: "th-pp" });
     parent.turnContext({ turnId: "TP", model: "model-a" });
     parent.tokenUsage({ responseId: "rp1", turnId: "TP" });
@@ -869,25 +1087,27 @@ describe("logical streams (R4.11, R4.13)", () => {
     const files = filesOf(parent, fork);
     const unsplit = await run(files);
     assert.equal(byKey(unsplit, "rp2").model.source, "carried_verified");
+    assert.deepEqual(taintedSet(unsplit), []);
     const ff = files.find((f) => f.path.includes("th-ff"))!;
     const [a, b] = splitFile(ff, 1); // a = copied parent meta only
     const r = await run(files.filter((f) => f !== ff).concat([a, b]));
     assert.equal(r.coverage.files_copy_exposed, 1);
     assert.equal(r.files.filter((f) => f.copy_exposed).length, 1);
-    assert.equal(r.streams.find((s) => s.chain.thread === "th-pp")!.integrity_unverified, true);
-    assert.equal(byKey(r, "rp2").model.verified, false);
-    assert.equal(byKey(r, "rp1").model.model, null); // R2.10: stream_unverified overrides own_turn
-    assert.equal(byKey(r, "rp1").model.source, "stream_unverified");
-    // the child is prefix_exposed (R4.13 (c)): its fork ancestors meet the copy-exposed file
-    assert.equal(byKey(r, "rf1").model.source, "prefix_exposed");
-    assert.equal(byKey(r, "rf1").model.verified, false);
-    assert.ok(r.streams.find((s) => s.chain.thread === "th-ff")!.integrity_reasons.includes("prefix_exposed"));
+    assert.deepEqual(namesOf(r, "copy_exposed"), ["th-pp"]);
+    assert.deepEqual(taintedSet(r), ["th-ff", "th-pp"]);
+    // a copied record keeps the envelope of the parent's record, so once the copied meta joins the parent's stream it is
+    // the parent's own session_meta again (equal records are one record, R4.12): copy exposure is the only reason
+    assert.deepEqual(reasonList(r, "th-ff"), ["copy_exposed"]);
+    assert.deepEqual(reasonList(r, "th-pp"), ["copy_exposed"]);
+    assert.equal(effectiveVerified(r).size, 0); // neither gains a verified model
     // tokens are identical
-    assert.deepEqual(
-      r.responses.map((x) => [x.key, x.usage]),
-      unsplit.responses.map((x) => [x.key, x.usage]),
-    );
+    assert.equal(tokensOf(r), tokensOf(unsplit));
     assert.equal(r.responses.find((x) => x.key === "rp1")!.provenance.from_copy_exposed_file, false);
+    // the half with the child's own meta and the copied context is not exposed: the parent id there is a copy
+    const [a2, b2] = splitFile(ff, 3); // a2 = copied meta, copied context, own meta
+    const r3 = await run(files.filter((f) => f !== ff).concat([a2, b2]));
+    assert.equal(r3.coverage.files_copy_exposed, 0);
+    assert.deepEqual(taintedSet(r3), []);
   });
 
   it("R15.7 fixture: a coverage-only file that forks a supported file with an own session_meta and no usage record makes it copy exposed", async () => {
@@ -899,14 +1119,18 @@ describe("logical streams (R4.11, R4.13)", () => {
     const r = await run([supported, covOnly]);
     const sup = r.files.find((f) => f.copy_exposed);
     assert.ok(sup);
+    assert.equal(sup.support, "full");
     assert.equal(r.coverage.files_copy_exposed, 1);
     assert.equal(r.responses.length, 0); // nothing accounted for the coverage-only file
     assert.equal(r.streams.length, 1); // no stream, link or accounting exists because of it
     assert.equal(r.streams[0]!.chain.thread, "th-sup");
-    assert.equal(r.streams[0]!.integrity_unverified, true);
     assert.deepEqual([...r.forked_from_ids], ["th-sup"]);
     assert.equal(r.coverage.requests_unverified_version, 1);
-    assert.equal(r.coverage.files_assigned_by_stream, 1);
+    assert.equal(r.coverage.files_assigned_by_stream, 2); // a coverage-only file is read with the same readers (R15.7)
+    assert.deepEqual(namesOf(r, "copy_exposed"), ["th-sup"]);
+    assert.deepEqual(namesOf(r, "version_unverified"), ["th-cov"]);
+    assert.deepEqual(taintedSet(r), ["th-cov", "th-sup"]);
+    assert.equal(r.files.filter((f) => f.support === "coverage_only").length, 1);
   });
 });
 
@@ -917,6 +1141,8 @@ describe("forks (R4.8, R4.9)", () => {
     parent.compacted({ windowNumber: 1 });
     parent.tokenUsage({ responseId: "rp1", turnId: "TP" });
     const fork = CodexThread.fork(parent, { threadId: "th-f5", threadSource: "user", prefixLen: 2 });
+    // a copied compaction marks itself as a copy (no latest usage record), so it is a record of its own (R4.9)
+    (fork.lines.find((l) => l.type === "compacted")!.payload as Record<string, unknown>)["latest_token_usage_record"] = null;
     fork.turnContext({ turnId: "TF", model: "model-a" });
     fork.tokenUsage({ responseId: "rf1", turnId: "TF", usage: { input: 5000, output: 50 } });
     fork.tokenUsage({ responseId: "rf2", turnId: "TF" });
@@ -1039,7 +1265,7 @@ describe("linkage (R5.2, R5.6)", () => {
 });
 
 describe("versions (R15.7)", () => {
-  it("a coverage-only version is counted, never accounted, and acts as an excluded request inside a supported thread", async () => {
+  it("a coverage-only thread is counted, never accounted; the supported thread next to it is untouched in accounting but its family is not", async () => {
     const sup = raw("v-sup", [
       ln("session_meta", 0, 0, metaP("th-v")),
       ln("turn_context", 1, 1, tcP("T", "model-a")),
@@ -1047,24 +1273,63 @@ describe("versions (R15.7)", () => {
       ln("token_usage_record", 4, 4, turP("r3", "th-v", "T", usageP(10, 0, 0, 1, 0))),
     ]);
     const old = raw("v-old", [
-      ln("session_meta", 0, 3, metaP("th-v", { cli_version: "0.1.0" })),
-      ln("token_usage_record", 1, 3, turP("r2", "th-v", "T", usageP(900, 0, 0, 9, 0))),
-      ln("token_usage_record", 2, 3, turP("r2b", "th-w", "T", usageP(900, 0, 0, 9, 0))),
+      ln("session_meta", 0, 3, metaP("th-w", { cli_version: "0.1.0" })),
+      ln("token_usage_record", 1, 3, turP("r2", "th-w", "T", usageP(900, 0, 0, 9, 0))),
     ]);
     const odd = raw("v-odd", [ln("session_meta", 0, 0, metaP("th-o", { cli_version: "not a version" })), ln("response_item", 1, 1)]);
     const r = await run([sup, old, odd]);
     assert.deepEqual(r.responses.map((x) => x.key).sort(), ["r1", "r3"]);
-    assert.equal(r.coverage.requests_unverified_version, 2);
-    assert.equal(r.coverage.lines_unverified_version, 5);
+    assert.equal(r.coverage.requests_unverified_version, 1); // distinct keys
+    assert.equal(r.coverage.lines_unverified_version, 1); // token_usage_record lines of unverified threads
     assert.equal(r.coverage.versions["0.158.0"], 4);
-    assert.equal(r.coverage.versions["0.1.0"], 3);
+    assert.equal(r.coverage.versions["0.1.0"], 2);
     assert.equal(r.coverage.versions["unlisted"], 2);
     assert.ok(r.assumptions.includes("unverified_version"));
-    // r2 lies between r1 and r3 in the supported stream th-v: an excluded request (R6.2)
-    assert.deepEqual(r.excluded.map((e) => [e.reason, e.chain.thread, e.event_ms]), [["unverified_version", "th-v", T0 + 3000]]);
+    // R15.7: an unverified record adds no excluded request and no stream; it only withdraws output through R0.9
+    assert.deepEqual(r.excluded, []);
+    assert.deepEqual(r.streams.map((x) => x.chain.thread), ["th-v"]);
+    assert.deepEqual(namesOf(r, "version_unverified"), ["th-o", "th-w"]);
+    assert.deepEqual(taintedSet(r), ["th-o", "th-w"]); // no link joins th-v to them
     assert.equal(r.coverage.records_usage_bearing, 2);
     assert.equal(r.files.filter((f) => f.support === "coverage_only").length, 2);
-    assert.equal(r.coverage.files_unassigned_stream, 0); // coverage-only files are not an identity problem
+    assert.equal(r.coverage.files_unassigned_stream, 0); // coverage-only files are read like any other
+  });
+
+  it("V(S) is the set of every session_meta of the scan: one unlisted label makes the whole thread unverified, copies included (R15.7)", async () => {
+    const sup = raw("v2-sup", [
+      ln("session_meta", 0, 0, metaP("th-v")),
+      ln("turn_context", 1, 1, tcP("T", "model-a")),
+      ln("token_usage_record", 2, 2, turP("r1", "th-v", "T", usageP(10, 0, 0, 1, 0))),
+      ln("token_usage_record", 4, 4, turP("r3", "th-v", "T", usageP(10, 0, 0, 1, 0))),
+    ]);
+    const old = raw("v2-old", [
+      ln("session_meta", 0, 3, metaP("th-v", { cli_version: "0.1.0" })),
+      ln("token_usage_record", 1, 3, turP("r2", "th-v", "T", usageP(900, 0, 0, 9, 0))),
+    ]);
+    const r = await run([sup, old]);
+    assert.equal(r.responses.length, 0); // nothing of th-v is accounted, including r1 and r3 of the supported file
+    assert.equal(r.streams.length, 0);
+    assert.equal(r.coverage.requests_unverified_version, 3);
+    assert.equal(r.coverage.lines_unverified_version, 3);
+    assert.deepEqual(namesOf(r, "version_unverified"), ["th-v"]);
+    assert.deepEqual(taintedSet(r), ["th-v"]);
+    assert.equal(r.coverage.records_usage_bearing, 0);
+    // order, duplication and splitting change neither status
+    for (const files of [[old, sup], [sup, old, { ...old, path: old.path.replace("v2-old", "v2-old2") }]]) {
+      const x = await run(files);
+      assert.equal(x.responses.length, 0);
+      assert.equal(x.coverage.requests_unverified_version, 3);
+    }
+    // a copied parent meta of an unlisted version in a fork file makes the parent unverified as well
+    const parent = raw("v2-par", [ln("session_meta", 0, 0, metaP("th-par")), ln("token_usage_record", 1, 1, turP("rp", "th-par", "T", usageP(10, 0, 0, 1, 0)))]);
+    const child = raw("v2-child", [
+      ln("session_meta", 0, 1, metaP("th-par", { cli_version: "0.1.0" })),
+      ln("session_meta", 1, 2, metaP("th-kid", { forked_from_id: "th-par", subagent_history_start_ordinal: 1 })),
+    ]);
+    const c = await run([parent, child]);
+    assert.equal(c.responses.length, 0);
+    assert.deepEqual(namesOf(c, "version_unverified"), ["th-par"]);
+    assert.deepEqual(taintedSet(c), ["th-kid", "th-par"]); // the child is in the family through forked_from_id
   });
 
   it("a thread whose own session_meta is missing from the scan is unversioned: coverage only", async () => {
@@ -1074,27 +1339,28 @@ describe("versions (R15.7)", () => {
     assert.equal(r.streams.length, 0);
     assert.equal(r.coverage.requests_unverified_version, 1);
     assert.equal(r.coverage.files_assigned_by_stream, 1);
+    assert.deepEqual(namesOf(r, "version_unverified"), ["th-h"]);
   });
 
-  it("--fast skips files older than since minus 7 days and prints mtime_prefilter_on", async () => {
+  it("R5.9: no prefilter exists. An old file is read and accounted, and the parser takes no window", async () => {
     const root = writeTree([
       raw("old", [ln("session_meta", 0, 0, metaP("th-old")), ln("token_usage_record", 1, 1, turP("ro", "th-old", "T", usageP(10, 0, 0, 1, 0)))]),
       raw("new", [ln("session_meta", 0, 0, metaP("th-new")), ln("token_usage_record", 1, 1, turP("rn", "th-new", "T", usageP(10, 0, 0, 1, 0)))]),
     ]);
-    const d = await discover({ codexDirs: [root], home: join(root, "no-home"), env: {} });
     const since = Date.UTC(2026, 5, 1);
+    const d = await discover({ codexDirs: [root], home: join(root, "no-home"), env: {} });
     for (const f of d.files) {
-      const m = f.path.includes("-old") ? since - 8 * 86_400_000 : since - 6 * 86_400_000;
+      const m = f.path.includes("-old") ? since - 400 * 86_400_000 : since - 6 * 86_400_000;
       utimesSync(f.path, m / 1000, m / 1000);
     }
     const d2 = await discover({ codexDirs: [root], home: join(root, "no-home"), env: {} });
-    const win = { since_ms: since, until_ms: since + 86_400_000 };
-    const fast = await parseCodex(d2.files, { window: win, fastPrefilter: true, now_ms: since });
-    assert.deepEqual(fast.responses.map((x) => x.key), ["rn"]);
-    assert.ok(fast.assumptions.includes("mtime_prefilter_on"));
-    const full = await parseCodex(d2.files, { window: win });
-    assert.deepEqual(full.responses.map((x) => x.key).sort(), ["rn", "ro"]);
-    assert.ok(!full.assumptions.includes("mtime_prefilter_on"));
+    const r = await parseCodex(d2.files, {});
+    assert.deepEqual(r.responses.map((x) => x.key).sort(), ["rn", "ro"]);
+    assert.ok(!r.assumptions.includes("unverified_version"));
+    assert.equal(r.coverage.files_total, 2);
+    // the file modification time is reported as a fact for R0.9 and is not read by the parser's decisions
+    assert.deepEqual(r.integrity.files.map((f) => f.mtime_ms).sort((a, b) => a - b), [since - 400 * 86_400_000, since - 6 * 86_400_000]);
+    assert.deepEqual(r.files.map((f) => f.mtime_ms).sort((a, b) => a - b), r.integrity.files.map((f) => f.mtime_ms).sort((a, b) => a - b));
   });
 });
 
@@ -1120,6 +1386,26 @@ describe("parse failures (R1.3, R1.4)", () => {
     assert.equal(r.coverage.known_type_count, 2);
     assert.equal(r.coverage.unlisted_type_count, 2);
     assert.equal(byKey(r, "r1").exclusion, null);
+    // R1.3, R0.9: the file facts carry the lost lines and the chains the file names; liveness is the graph's decision
+    assert.equal(r.integrity.files.length, 1);
+    assert.equal(r.integrity.files[0]!.unparsed_lines, 2);
+    assert.deepEqual(r.integrity.files[0]!.named_chains, ["codex\u0000th-b"]);
+    assert.equal(r.integrity.files[0]!.readable, true);
+    assert.equal(r.integrity.files[0]!.mtime_ms, PIN_MTIME_MS);
+    assert.deepEqual(taintedSet(r), ["th-b"]); // unparsed_line, as the graph would derive it from the file facts
+    assert.deepEqual(reasonList(r, "th-b"), ["unparsed_line"]);
+    assert.deepEqual(r.integrity.triggers, []); // unparsed_line is derived from FileFacts, never a trigger
+  });
+
+  it("a duplicated unparseable line adds to the unparsed count of its file and nothing else (R17.6)", async () => {
+    const mk = (n: number): GeneratedFile => raw("bad-dup", [ln("session_meta", 0, 0, metaP("th-bd")), ...Array(n).fill("{oops"), ln("token_usage_record", 1, 1, turP("r1", "th-bd", "T", usageP(10, 0, 0, 1, 0)))]);
+    const one = await run([mk(1)]);
+    const three = await run([mk(3)]);
+    assert.equal(one.integrity.files[0]!.unparsed_lines, 1);
+    assert.equal(three.integrity.files[0]!.unparsed_lines, 3);
+    assert.equal(three.coverage.lines_parse_error, one.coverage.lines_parse_error + 2);
+    assert.equal(three.coverage.lines_duplicate_collapsed, 0);
+    assert.equal(tokensOf(three), tokensOf(one));
   });
 
   it("a final line without newline that parses is a normal record", async () => {
@@ -1143,6 +1429,8 @@ describe("parse failures (R1.3, R1.4)", () => {
     assert.equal(r.coverage.files_total, 1);
     assert.equal(r.coverage.files_unreadable, 1);
     assert.equal(r.files[0]!.readable, false);
+    assert.deepEqual(namesOf(r, "file_unreadable"), ["provider"]); // R0.9, R17.1
+    assert.deepEqual(r.integrity.files.map((f) => [f.readable, f.unparsed_lines, f.named_chains.length]), [[false, 0, 0]]);
     assert.equal(r.responses.length, 0);
     const empty = await parseCodex([]);
     assert.equal(empty.coverage.files_total, 0);
@@ -1266,73 +1554,780 @@ describe("metamorphic: shuffle, reorder, re-serialize, duplicate (R4.10, R17.6)"
   });
 });
 
+/** R17.6 counters of R2.9 after a split, from the line contents of the halves. */
+function orphanCounts(files: readonly GeneratedFile[]): { files: number; events: number } {
+  let nFiles = 0;
+  let events = 0;
+  for (const f of files) {
+    const ls = linesOf(f);
+    const tok = ls.filter((l) => l.includes('"type":"token_count"')).length;
+    const hasTur = ls.some((l) => l.includes('"type":"token_usage_record"'));
+    if (tok > 0 && !hasTur) {
+      nFiles++;
+      events += tok;
+    }
+  }
+  return { files: nFiles, events };
+}
+
 describe("metamorphic: splitting at every line boundary (R4.10, R4.13, R17.7)", () => {
   for (const [name, build] of SCENARIOS) {
     it(`${name}: every split position obeys the split contract`, async () => {
       const files = plain(build());
-      const base = await run(files);
-      const baseSem = semantic(base);
-      const tokensOf = (r: CodexParseResult): string =>
-        JSON.stringify(r.responses.map((x) => [x.key, x.exclusion, x.usage]).sort((p, q) => String(p[0]).localeCompare(String(q[0]))), bigintReplacer);
-      const baseTokens = tokensOf(base);
-      const verifiedOf = (r: CodexParseResult): Map<string, string> => new Map(r.responses.filter((x) => x.model.verified).map((x) => [x.key, x.model.model!]));
-      const baseVerified = verifiedOf(base);
+      const base = await runX(files);
+      const baseSem = semantic(base.r);
+      const baseTokens = tokensOf(base.r);
+      const baseTaint = new Set(taintedSet(base.r));
+      const baseVerified = effectiveVerified(base.r);
+      assert.equal(baseTaint.size, 0, `${name}: the unsplit scenario is clean`);
       let positions = 0;
       let unaffected = 0;
       let withdrawn = 0;
-      for (const [fi, f] of files.entries()) {
-        const ls = linesOf(f);
-        for (let at = 1; at < ls.length; at++) {
-          if (!carriesIdentity(ls.slice(0, at)) || !carriesIdentity(ls.slice(at))) continue;
-          positions++;
-          const [a, b] = splitFile(f, at);
-          const r = await run(files.filter((_, i) => i !== fi).concat([a, b]));
-          const label = `${name} file ${fi} at ${at}`;
-          // token totals are identical for every split (accounting is keyed by record identity)
-          assert.equal(tokensOf(r), baseTokens, `${label}: tokens`);
-          assert.equal(r.coverage.lines_total, base.coverage.lines_total, `${label}: lines_total`);
-          assert.equal(r.coverage.known_type_count, base.coverage.known_type_count);
-          assert.equal(r.coverage.files_total, base.coverage.files_total + 1);
-          assert.equal(r.coverage.responses_total, base.coverage.responses_total);
-          assert.equal(r.coverage.requests_total, base.coverage.requests_total);
-          const resolved = r.coverage.files_stream_conflict === 0 && r.coverage.files_copy_exposed === 0 && r.coverage.files_unassigned_stream === 0;
-          if (resolved) {
-            // every half resolves to one identity and none is copy exposed: nothing changes
-            unaffected++;
-            same(semantic(r), baseSem, `${label}: resolved split must be identical`);
-            assert.equal(r.coverage.files_assigned_by_stream, base.coverage.files_assigned_by_stream + 1);
-          } else {
-            withdrawn++;
-            // monotone: verified models, verified links and integrity only move towards withdrawal, values on the common part are equal
-            for (const [k, m] of verifiedOf(r)) assert.equal(baseVerified.get(k), m, `${label}: verified model of ${k} added or changed`);
-            assert.ok(r.coverage.responses_model_unverified >= base.coverage.responses_model_unverified, `${label}: unverified models`);
-            assert.ok(r.coverage.streams_integrity_unverified >= base.coverage.streams_integrity_unverified, `${label}: integrity`);
-            assert.ok(r.coverage.links_verified <= base.coverage.links_verified, `${label}: links`);
-            assert.equal(r.coverage.links_verified + r.coverage.links_unlinked, base.coverage.links_verified + base.coverage.links_unlinked);
-            const baseIntegrity = new Map(base.streams.map((s) => [s.chain.thread, s.integrity_unverified]));
-            for (const s of r.streams) if (baseIntegrity.get(s.chain.thread)) assert.equal(s.integrity_unverified, true, `${label}: integrity of ${s.chain.thread}`);
-            assert.equal(r.coverage.streams_total, base.coverage.streams_total);
-            assert.equal(r.coverage.records_unkeyed, base.coverage.records_unkeyed);
-            assert.equal(r.coverage.requests_conflict, base.coverage.requests_conflict);
-          }
+      for (const c of splitCases(files)) {
+        positions++;
+        const sp = await runX(c.files);
+        const r = sp.r;
+        const label = `${name} ${c.file.path} at ${c.at}`;
+        // accounting is keyed by record identity: token totals are identical for every split, dissolving or not
+        assert.equal(tokensOf(r), baseTokens, `${label}: tokens`);
+        assert.equal(r.coverage.lines_total, base.r.coverage.lines_total, `${label}: lines_total`);
+        assert.equal(r.coverage.known_type_count, base.r.coverage.known_type_count);
+        assert.equal(r.coverage.files_total, base.r.coverage.files_total + 1);
+        assert.equal(r.coverage.responses_total, base.r.coverage.responses_total);
+        assert.equal(r.coverage.requests_total, base.r.coverage.requests_total);
+        assert.equal(r.coverage.records_unkeyed, base.r.coverage.records_unkeyed);
+        assert.equal(r.coverage.requests_conflict, base.r.coverage.requests_conflict);
+        assert.equal(r.coverage.requests_unverified_version, base.r.coverage.requests_unverified_version);
+        assert.equal(r.coverage.lines_unverified_version, base.r.coverage.lines_unverified_version);
+        assert.equal(r.streams.length, base.r.streams.length);
+        // R17.6: the two counters of R2.9 change by the exact rule
+        const orphans = orphanCounts(c.files);
+        assert.equal(r.coverage.files_without_response_id, orphans.files, `${label}: files_without_response_id`);
+        assert.equal(r.coverage.token_count_events_without_response_id, orphans.events, `${label}: token_count events`);
+        if (await dissolving(base, c, sp)) continue; // only the record-set guarantees above apply
+        // taint monotonicity (R0.9): the tainted set can only grow
+        const taint = new Set(taintedSet(r));
+        for (const t of baseTaint) assert.ok(taint.has(t), `${label}: ${t} left the tainted set`);
+        // split monotonicity: the verified set shrinks, with equal values on the common part
+        for (const [k, m] of effectiveVerified(r)) assert.equal(baseVerified.get(k), m, `${label}: verified model of ${k} added or changed`);
+        // structural facts do not depend on the split
+        assert.equal(r.coverage.links_verified, base.r.coverage.links_verified, `${label}: links`);
+        assert.equal(r.coverage.links_unlinked, base.r.coverage.links_unlinked);
+        assert.deepEqual(r.integrity.chains, base.r.integrity.chains, `${label}: chains`);
+        assert.deepEqual(familyMap(r), familyMap(base.r), `${label}: families`);
+        if (taint.size === 0) {
+          // invariance: a split that taints no new chain changes nothing but the physical counters
+          unaffected++;
+          same(semantic(r), baseSem, `${label}: untainted split must be identical`);
+          assert.equal(r.coverage.files_assigned_by_stream, base.r.coverage.files_assigned_by_stream + 1);
+        } else {
+          withdrawn++;
+          assert.ok(r.coverage.responses_model_unverified >= 0);
         }
       }
       assert.ok(positions > 5, `${name}: enough split positions (${positions})`);
-      assert.ok(unaffected > 0, `${name}: some resolved splits (${unaffected})`);
+      assert.ok(unaffected > 0, `${name}: some untainted splits (${unaffected})`);
       if (name !== "codex-basic") assert.ok(withdrawn > 0, `${name}: some withdrawing splits (${withdrawn})`);
     });
   }
 
-  it("the multi-file thread of codex-basic: any cut keeps one identity per half and changes nothing", async () => {
+  it("the multi-file thread of codex-basic: merging its two files gives the same semantic output", async () => {
     const files = plain(scenarios.find((s) => s.name === "codex-basic")!.build());
     const base = await run(files);
-    // the thread is already split in two files in the fixture: merging gives the same semantic output
     const mainFiles = files.filter((f) => f.path.includes("synthetic-thread-main"));
     assert.equal(mainFiles.length, 2);
     const merged: GeneratedFile = { path: "sessions/2026/01/01/rollout-2026-01-01T00-00-00-synthetic-thread-main.jsonl", content: mainFiles.flatMap(linesOf).join("\n") + "\n" };
     const r = await run(files.filter((f) => !mainFiles.includes(f)).concat([merged]));
     assert.equal(semantic(r), semantic(base));
     assert.equal(r.coverage.files_total, base.coverage.files_total - 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7b. R0.9, R2.17, R4.10 fixtures at parser level (every one shuffled, duplicated and split at every line boundary)
+// ---------------------------------------------------------------------------
+
+interface Fixture {
+  name: string;
+  files: GeneratedFile[];
+}
+
+/** Shuffle, file order, key order and duplication of a line leave the facts unchanged (R4.10 ops 1 to 4). */
+async function checkOps(fx: Fixture): Promise<void> {
+  const base = await run(fx.files);
+  const sem = semantic(base);
+  for (const seed of [11, 12]) {
+    const r = await run(fx.files.map((f) => withLines(f, shuffled(linesOf(f), seed + f.path.length))));
+    same(semantic(r), sem, `${fx.name}: line shuffle ${seed}`);
+  }
+  same(semantic(await runWithOrder(fx.files, "desc")), sem, `${fx.name}: file order`);
+  const rekey = (l: string): string => {
+    try {
+      return JSON.stringify(reverseKeys(JSON.parse(l)));
+    } catch {
+      return l;
+    }
+  };
+  same(semantic(await run(fx.files.map((f) => withLines(f, linesOf(f).map(rekey))))), sem, `${fx.name}: key order`);
+  for (const [fi, f] of fx.files.entries()) {
+    const ls = linesOf(f);
+    const idx = Math.floor(ls.length / 2);
+    if (idx >= ls.length - 1) continue;
+    const dup = ls.slice(0, idx + 1).concat([ls[idx]!, ls[idx]!], ls.slice(idx + 1));
+    same(semantic(await run(fx.files.map((g, gi) => (gi === fi ? withLines(g, dup) : g)))), sem, `${fx.name}: duplicated line ${idx} of file ${fi}`);
+  }
+}
+
+/**
+ * Every split position of every file: tokens identical; for a split that is not dissolving the tainted set contains the
+ * unsplit one. \`expected\` is the stored expectation of the position, when the fixture gives one.
+ */
+async function checkSplits(
+  fx: Fixture,
+  expected?: (c: SplitCase, r: CodexParseResult, dissolved: boolean) => void,
+): Promise<number> {
+  const base = await runX(fx.files);
+  const baseTaint = new Set(taintedSet(base.r));
+  const baseTokens = tokensOf(base.r);
+  const baseVerified = effectiveVerified(base.r);
+  let n = 0;
+  for (const c of splitCases(fx.files)) {
+    n++;
+    const sp = await runX(c.files);
+    const label = `${fx.name}: ${c.file.path} at ${c.at}`;
+    assert.equal(tokensOf(sp.r), baseTokens, `${label}: tokens`);
+    const dis = await dissolving(base, c, sp);
+    if (!dis) {
+      const t = new Set(taintedSet(sp.r));
+      for (const x of baseTaint) assert.ok(t.has(x), `${label}: ${x} left the tainted set`);
+      for (const [k, m] of effectiveVerified(sp.r)) assert.equal(baseVerified.get(k), m, `${label}: verified model of ${k}`);
+    }
+    expected?.(c, sp.r, dis);
+  }
+  return n;
+}
+
+const usageBig = (inp: number, c: number): object => usageP(inp, c, 0, 10, 0);
+const SESS = "sess-shared";
+
+describe("R0.9 fixture (1): the round 10 counterexample, three variants", () => {
+  const supportedFile = (): GeneratedFile =>
+    raw("x-main", [
+      ln("session_meta", 0, 0, metaP("th-X", { session_id: SESS })),
+      ln("turn_context", 1, 1, tcP("T", "model-a")),
+      ln("token_usage_record", 2, 10, turP("P", "th-X", "T", usageBig(30000, 20000), { session_id: SESS })),
+      ln("token_usage_record", 3, 30, turP("C", "th-X", "T", usageBig(60000, 0), { session_id: SESS })),
+    ]);
+  const old = (name: string, lines: (object | string)[]): GeneratedFile => raw(name, lines);
+  const variants: Record<string, Fixture> = {
+    a: {
+      name: "(1a)",
+      files: [
+        supportedFile(),
+        old("x-159", [
+          ln("session_meta", 0, 5, metaP("th-X", { session_id: SESS, cli_version: "0.159.0" })),
+          ln("token_usage_record", 1, 20, turP("Q", "th-X", "T2", usageBig(60000, 60000), { session_id: SESS })),
+        ]),
+      ],
+    },
+    b: {
+      name: "(1b)",
+      files: [
+        supportedFile(),
+        old("x-159", [
+          ln("session_meta", 0, 5, metaP("th-Y", { session_id: SESS, cli_version: "0.159.0" })),
+          ln("token_usage_record", 1, 20, { response_id: "Q", session_id: SESS, turn_id: "T2", usage: usageBig(60000, 60000) }),
+        ]),
+      ],
+    },
+    c: {
+      name: "(1c)",
+      files: [
+        supportedFile(),
+        old("x-159", [
+          ln("session_meta", 0, 5, metaP("th-Y", { session_id: SESS, cli_version: "0.159.0" })),
+          ln("token_usage_record", 1, 20, turP("Q", "th-Y", "T2", usageBig(60000, 60000), { session_id: SESS })),
+        ]),
+      ],
+    },
+  };
+
+  it("(a) the 0.159.0 file holds session_meta(X): X is of an unverified version, nothing of X is accounted", async () => {
+    const fx = variants["a"]!;
+    const r = await run(fx.files);
+    assert.equal(r.responses.length, 0);
+    assert.equal(r.streams.length, 0);
+    assert.equal(r.coverage.requests_unverified_version, 3); // P, C and Q
+    assert.deepEqual(namesOf(r, "version_unverified"), ["th-X"]);
+    assert.deepEqual(taintedSet(r), ["th-X"]);
+    await checkOps(fx);
+    assert.ok((await checkSplits(fx, (_c, sp) => assert.equal(sp.responses.length, 0))) > 3);
+  });
+
+  it("(b) session_meta(Y) with the same session_id and a usage record without thread_id: a provider trigger, P and C keep their tokens", async () => {
+    const fx = variants["b"]!;
+    const r = await run(fx.files);
+    assert.deepEqual(r.responses.map((x) => x.key), ["P", "C"]);
+    assert.equal(byKey(r, "P").usage!.cache_read, 20000n);
+    assert.equal(byKey(r, "C").usage!.input_uncached, 60000n);
+    assert.deepEqual(namesOf(r, "unattributed_record"), ["provider"]);
+    assert.deepEqual(namesOf(r, "version_unverified"), ["th-Y"]);
+    assert.equal(r.coverage.records_unkeyed, 1);
+    assert.deepEqual(taintedSet(r), ["th-X", "th-Y"]);
+    assert.deepEqual(reasonList(r, "th-X"), ["version_unverified", "unattributed_record"]); // the family of Y, and the provider
+    assert.equal(effectiveVerified(r).size, 0);
+    await checkOps(fx);
+    await checkSplits(fx);
+  });
+
+  it("(c) session_meta(Y) with readable ids: version_unverified names Y and the shared session_id links X and Y", async () => {
+    const fx = variants["c"]!;
+    const r = await run(fx.files);
+    assert.deepEqual(r.responses.map((x) => x.key), ["P", "C"]);
+    assert.equal(r.coverage.requests_unverified_version, 1); // Q
+    assert.deepEqual(namesOf(r, "version_unverified"), ["th-Y"]);
+    assert.deepEqual(r.integrity.family_groups, [["codex\u0000th-X", "codex\u0000th-Y"]]);
+    assert.deepEqual(taintedSet(r), ["th-X", "th-Y"]);
+    assert.deepEqual(reasonList(r, "th-X"), ["version_unverified"]);
+    assert.equal(effectiveVerified(r).size, 0);
+    await checkOps(fx);
+    await checkSplits(fx);
+  });
+});
+
+describe("R0.9 fixtures (4), (5), (6)", () => {
+  const thread1 = (): GeneratedFile[] =>
+    filesOf(
+      (() => {
+        const t = thread({ threadId: "th-ok" });
+        t.turnContext({ turnId: "T", model: "model-a" });
+        t.tokenUsage({ responseId: "P", turnId: "T", usage: { input: 30000, cached: 20000, output: 10 } });
+        t.tokenUsage({ responseId: "C", turnId: "T", usage: { input: 60000, cached: 0, output: 10 } });
+        return t;
+      })(),
+    );
+
+  it("(4) an unreadable archived file taints every Codex chain; token totals are unchanged", async () => {
+    const clean = thread1();
+    const bad: GeneratedFile = { path: "archived_sessions/rollout-2026-01-01T00-00-00-broken.jsonl.zst", content: "this is not a zstd frame" };
+    const without = await run(clean);
+    const fx: Fixture = { name: "(4)", files: [...clean, bad] };
+    const r = await run(fx.files);
+    assert.equal(r.coverage.files_unreadable, 1);
+    assert.equal(r.files.filter((f) => !f.readable).length, 1);
+    assert.deepEqual(namesOf(r, "file_unreadable"), ["provider"]);
+    assert.deepEqual(taintedSet(r), ["th-ok"]);
+    assert.deepEqual(reasonList(r, "th-ok"), ["file_unreadable"]);
+    assert.equal(tokensOf(r), tokensOf(without));
+    assert.equal(r.integrity.files.filter((f) => !f.readable).length, 1);
+    assert.deepEqual(taintedSet(without), []);
+    await checkOps(fx);
+    await checkSplits(fx);
+  });
+
+  it("(4) a truncated archive that yielded some lines before failing is unreadable as a whole: nothing of it is accounted (R0.2)", async (ctx) => {
+    const t = thread({ threadId: "th-zt" });
+    t.turnContext({ turnId: "T", model: "model-a" });
+    for (let i = 0; i < 40; i++) t.tokenUsage({ responseId: `zt${i}`, turnId: "T", usage: { input: 1000 + i, output: 5 } });
+    const text = filesOf(t)[0]!.content as string;
+    const z = zstdCompress(text);
+    if (z === null) {
+      ctx.diagnostic("no zstd compressor on this Node: only the garbage-archive path is exercised");
+      return;
+    }
+    const clean = thread1();
+    const bad: GeneratedFile = { path: "archived_sessions/rollout-2026-01-01T00-00-00-trunc.jsonl.zst", content: z.subarray(0, Math.max(1, z.length - 6)) };
+    const r = await run([...clean, bad]);
+    assert.equal(r.coverage.files_unreadable, 1);
+    assert.deepEqual(namesOf(r, "file_unreadable"), ["provider"]);
+    assert.equal(r.responses.filter((x) => x.thread_id === "th-zt").length, 0); // no partial accounting of an unreadable file
+    assert.deepEqual(r.responses.map((x) => x.key), ["P", "C"]);
+  });
+
+  it("(5) a second file of the thread with only session_meta and token_count events: unlogged_usage naming the thread", async () => {
+    const main = raw("u-main", [
+      ln("session_meta", 0, 0, metaP("th-u")),
+      ln("turn_context", 1, 1, tcP("T", "model-a")),
+      ln("token_usage_record", 2, 10, turP("P", "th-u", "T", usageBig(30000, 20000))),
+      ln("token_usage_record", 3, 30, turP("C", "th-u", "T", usageBig(60000, 0))),
+    ]);
+    const second = raw("u-second", [
+      ln("session_meta", 0, 0, metaP("th-u")),
+      ln("event_msg", 4, 20, { type: "token_count" }),
+      ln("event_msg", 5, 21, { type: "token_count" }),
+    ]);
+    const fx: Fixture = { name: "(5)", files: [main, second] };
+    const r = await run(fx.files);
+    assert.equal(r.coverage.files_without_response_id, 1);
+    assert.equal(r.coverage.token_count_events_without_response_id, 2);
+    assert.deepEqual(namesOf(r, "unlogged_usage"), ["th-u"]);
+    assert.deepEqual(taintedSet(r), ["th-u"]);
+    assert.deepEqual(r.responses.map((x) => x.key), ["P", "C"]);
+    await checkOps(fx);
+    await checkSplits(fx);
+  });
+
+  it("(6) a clean family and a tainted family in one scan: the clean family's facts equal those of a scan that holds only it", async () => {
+    const cleanFiles = thread1();
+    const dirty = raw("d-main", [
+      ln("session_meta", 0, 0, metaP("th-dirty")),
+      ln("turn_context", 1, 1, tcP("T9", "model-b")),
+      ln("token_usage_record", 2, 2, turP("D1", "th-dirty", "T9", usageP(100, 200, 0, 5, 0))), // cached > input: R2.7
+      ln("token_usage_record", 3, 3, turP("D2", "th-dirty", "T9", usageP(100, 0, 0, 5, 0))),
+    ]);
+    const alone = await run(cleanFiles);
+    const fx: Fixture = { name: "(6)", files: [...cleanFiles, dirty] };
+    const both = await run(fx.files);
+    assert.deepEqual(taintedSet(both), ["th-dirty"]);
+    assert.deepEqual(reasonList(both, "th-dirty"), ["request_anomaly"]);
+    const pick = (r: CodexParseResult): string => JSON.stringify(r.responses.filter((x) => x.thread_id === "th-ok").map((x) => ({ ...x, provenance: null })), bigintReplacer);
+    assert.equal(pick(both), pick(alone));
+    assert.deepEqual([...effectiveVerified(both).keys()].sort(), [...effectiveVerified(alone).keys()].sort());
+    assert.ok(effectiveVerified(both).size > 0);
+    await checkOps(fx);
+    await checkSplits(fx);
+  });
+});
+
+describe("R4.10 counter fixture of R2.9: five records, stored values for every split position", () => {
+  const five = (): GeneratedFile =>
+    raw("five", [
+      ln("session_meta", 0, 0, metaP("th-5")),
+      ln("event_msg", 1, 1, { type: "token_count" }),
+      ln("turn_context", 2, 2, tcP("T", "model-a")),
+      ln("token_usage_record", 3, 3, turP("r5", "th-5", "T", usageP(100, 10, 0, 5, 0))),
+      ln("event_msg", 4, 4, { type: "token_count" }),
+    ]);
+
+  it("unsplit: 0 and 0, untainted; after record 1: 0 and 0, untainted, identical output; after record 2 and 3: 1 and 1, unlogged_usage", async () => {
+    const f = five();
+    const base = await run([f]);
+    assert.equal(base.coverage.files_without_response_id, 0);
+    assert.equal(base.coverage.token_count_events_without_response_id, 0);
+    assert.deepEqual(taintedSet(base), []);
+    assert.deepEqual(effectiveVerified(base).get("r5"), "model-a");
+    const stored: Record<number, { files: number; events: number; tainted: boolean }> = {
+      1: { files: 0, events: 0, tainted: false },
+      2: { files: 1, events: 1, tainted: true },
+      3: { files: 1, events: 1, tainted: true },
+    };
+    const cases = splitCases([f]);
+    assert.deepEqual(cases.map((c) => c.at), [1, 2, 3]); // after record 4 the second half names no chain (R4.10 op 5)
+    for (const c of cases) {
+      const r = await run(c.files);
+      const e = stored[c.at]!;
+      assert.equal(r.coverage.files_without_response_id, e.files, `after record ${c.at}`);
+      assert.equal(r.coverage.token_count_events_without_response_id, e.events, `after record ${c.at}`);
+      assert.deepEqual(taintedSet(r), e.tainted ? ["th-5"] : [], `after record ${c.at}`);
+      if (e.tainted) assert.deepEqual(reasonList(r, "th-5"), ["unlogged_usage"]);
+      assert.equal(tokensOf(r), tokensOf(base));
+      assert.equal(effectiveVerified(r).size, e.tainted ? 0 : 1);
+      if (!e.tainted) same(semantic(r), semantic(base), `after record ${c.at}`);
+    }
+  });
+});
+
+describe("R2.17 fixtures at parser level (exact model_source, triggers, every split position)", () => {
+  const src = (r: CodexParseResult, k: string): [string, string | null, boolean] => {
+    const m = byKey(r, k).model;
+    return [m.source, m.candidate, m.verified];
+  };
+  const markerLine = (o: number, sec: number): Record<string, unknown> => ln("event_msg", o, sec, { type: "thread_settings_applied" });
+
+  it("(1) context A, marker, context B, usage record of one turn: TM(T) = {A, B}, tokens only, at every position", async () => {
+    const fx: Fixture = {
+      name: "R2.17(1)",
+      files: [
+        raw("m1", [
+          ln("session_meta", 0, 0, metaP("th-1")),
+          ln("turn_context", 1, 1, tcP("T", "model-a")),
+          markerLine(2, 2),
+          ln("turn_context", 3, 3, tcP("T", "model-b")),
+          ln("token_usage_record", 4, 4, turP("r", "th-1", "T", usageP(100, 0, 0, 5, 0))),
+        ]),
+      ],
+    };
+    const r = await run(fx.files);
+    assert.deepEqual(src(r, "r"), ["own_turn_unsettled", null, false]);
+    assert.deepEqual(namesOf(r, "turn_model_conflicted"), ["th-1"]);
+    assert.deepEqual(taintedSet(r), ["th-1"]);
+    await checkOps(fx);
+    const n = await checkSplits(fx, (_c, sp) => {
+      assert.deepEqual(taintedSet(sp), ["th-1"]);
+      assert.equal(effectiveVerified(sp).size, 0);
+    });
+    assert.ok(n >= 3);
+  });
+
+  it("(2) a newer context of another turn does not unbind the record (own_turn); a marker after the first own context makes it own_turn_unsettled", async () => {
+    const mk = (marker: boolean): Fixture => ({
+      name: `R2.17(2) marker=${marker}`,
+      files: [
+        raw(marker ? "m2m" : "m2", [
+          ln("session_meta", 0, 0, metaP("th-2")),
+          ln("turn_context", 1, 1, tcP("T1", "model-a")),
+          ...(marker ? [markerLine(2, 2)] : []),
+          ln("turn_context", marker ? 3 : 2, 3, tcP("T2", "model-b")),
+          ln("token_usage_record", marker ? 4 : 3, 4, turP("r", "th-2", "T1", usageP(100, 0, 0, 5, 0))),
+        ]),
+      ],
+    });
+    for (const marker of [false, true]) {
+      const fx = mk(marker);
+      const r = await run(fx.files);
+      assert.deepEqual(src(r, "r"), marker ? ["own_turn_unsettled", "model-a", false] : ["own_turn", "model-a", true]);
+      assert.deepEqual(taintedSet(r), []);
+      await checkOps(fx);
+      // a single thread in one file: every split leaves the stream, its model attribution and the taint unchanged
+      await checkSplits(fx, (_c, sp) => {
+        assert.deepEqual(src(sp, "r"), src(r, "r"));
+        assert.deepEqual(taintedSet(sp), []);
+      });
+    }
+  });
+
+  it("(3) two models, then a record of a turn without its own context: carried_unverified; (4) one model and no marker: carried_verified", async () => {
+    const mk = (m2: string): Fixture => ({
+      name: `R2.17(3/4) ${m2}`,
+      files: [
+        raw(`m3-${m2}`, [
+          ln("session_meta", 0, 0, metaP("th-3")),
+          ln("turn_context", 1, 1, tcP("T1", "model-a")),
+          ln("turn_context", 2, 2, tcP("T2", m2)),
+          ln("token_usage_record", 3, 3, turP("r", "th-3", "T3", usageP(100, 0, 0, 5, 0))),
+        ]),
+      ],
+    });
+    const three = await run(mk("model-b").files);
+    assert.deepEqual(src(three, "r"), ["carried_unverified", "model-b", false]);
+    const four = await run(mk("model-a").files);
+    assert.deepEqual(src(four, "r"), ["carried_verified", "model-a", true]);
+    for (const fx of [mk("model-b"), mk("model-a")]) {
+      await checkOps(fx);
+      const base = await run(fx.files);
+      await checkSplits(fx, (_c, sp) => {
+        assert.deepEqual(src(sp, "r"), src(base, "r"));
+        assert.deepEqual(taintedSet(sp), []);
+      });
+    }
+  });
+
+  describe("(5) the two-model fork", () => {
+    const build = (childModel: string): { fx: Fixture; parentFile: string } => {
+      const parent = thread({ threadId: "th-P" });
+      parent.turnContext({ turnId: "TP", model: "model-a" });
+      parent.tokenUsage({ responseId: "rp", turnId: "TP" });
+      const fork = CodexThread.fork(parent, { threadId: "th-C", threadSource: "user", prefixLen: 1 });
+      fork.turnContext({ turnId: "T1", model: childModel });
+      fork.tokenUsage({ responseId: "r1", turnId: "T1" });
+      fork.tokenUsage({ responseId: "r2", turnId: "T2" });
+      fork.tokenUsage({ responseId: "r3", turnId: "T3" });
+      return { fx: { name: `R2.17(5) child ${childModel}`, files: filesOf(parent, fork) }, parentFile: "th-P" };
+    };
+
+    it("child context B: r1 own_turn B, r2 and r3 carried_unverified (G(S) holds A and B)", async () => {
+      const { fx } = build("model-b");
+      const r = await run(fx.files);
+      assert.deepEqual(src(r, "r1"), ["own_turn", "model-b", true]);
+      assert.deepEqual(src(r, "r2"), ["carried_unverified", "model-b", false]);
+      assert.deepEqual(src(r, "r3"), ["carried_unverified", "model-b", false]);
+      assert.deepEqual(src(r, "rp"), ["own_turn", "model-a", true]);
+      assert.deepEqual(taintedSet(r), []);
+      await checkOps(fx);
+    });
+
+    it("child context A: r2 and r3 carried_verified A", async () => {
+      const { fx } = build("model-a");
+      const r = await run(fx.files);
+      assert.deepEqual(src(r, "r2"), ["carried_verified", "model-a", true]);
+      assert.deepEqual(taintedSet(r), []);
+      await checkOps(fx);
+    });
+
+    it("stored result of every split position: positions 1 and 2 leave a half with only the copied parent meta (copy exposed, family of parent and child tainted); the others change nothing", async () => {
+      for (const model of ["model-a", "model-b"]) {
+        const { fx } = build(model);
+        const base = await run(fx.files);
+        const forkLines = fx.files.filter((f) => f.path.includes("th-C")).flatMap(linesOf);
+        assert.ok(forkLines[0]!.includes('"id":"th-P"')); // the copied parent meta
+        let seen = 0;
+        await checkSplits(fx, (c, sp) => {
+          if (!c.file.path.includes("th-C")) return;
+          seen++;
+          const exposed = c.at <= 2; // [copied meta] and [copied meta, copied context] hold no usage record of the parent
+          assert.equal(sp.coverage.files_copy_exposed, exposed ? 1 : 0, `${model} at ${c.at}`);
+          assert.deepEqual(taintedSet(sp), exposed ? ["th-C", "th-P"] : [], `${model} at ${c.at}`);
+          assert.deepEqual(namesOf(sp, "copy_exposed"), exposed ? ["th-P"] : []);
+          if (exposed) assert.equal(effectiveVerified(sp).size, 0);
+          else assert.deepEqual([...effectiveVerified(sp)], [...effectiveVerified(base)]);
+        });
+        assert.equal(seen, forkLines.length - 1);
+      }
+    });
+
+    it("copy_differs: the copied context carries another model; copy exposed at every exposed position, ordinal_unverified only where the copied context lands in the parent's stream", async () => {
+      const parent = thread({ threadId: "th-P" });
+      parent.turnContext({ turnId: "TP", model: "model-a" });
+      parent.tokenUsage({ responseId: "rp", turnId: "TP" });
+      const fork = CodexThread.fork(parent, { threadId: "th-C", threadSource: "user", prefixLen: 1 });
+      (fork.lines[1]!.payload as Record<string, unknown>)["model"] = "model-b"; // the copy differs from the parent's genuine context
+      fork.turnContext({ turnId: "T1", model: "model-b" });
+      fork.tokenUsage({ responseId: "r1", turnId: "T1" });
+      const fx: Fixture = { name: "R2.17(5) copy_differs", files: filesOf(parent, fork) };
+      const base = await run(fx.files);
+      // unsplit: the copy is in the fork's stream next to its own session_meta; TM(TP) = {A, B} taints the family
+      assert.deepEqual(taintedSet(base), ["th-C", "th-P"]);
+      assert.deepEqual(reasonList(base, "th-C"), ["turn_model_conflicted"]);
+      assert.deepEqual(reasonList(base, "th-P"), ["turn_model_conflicted"]);
+      let seen = 0;
+      await checkSplits(fx, (c, sp) => {
+        seen++;
+        const inFork = c.file.path.includes("th-C");
+        const exposed = c.at <= 2; // fork file: copied meta; copied meta and copied context. Parent file: first half has no usage record
+        const want: TaintReason[] = exposed ? ["copy_exposed", "turn_model_conflicted"] : ["turn_model_conflicted"];
+        // the copied context (model B) next to the parent's own context (model A) with the same ordinal: a collision (R4.12 (b))
+        if (inFork && c.at === 2) want.push("ordinal_unverified");
+        const label = `${inFork ? "fork" : "parent"} at ${c.at}`;
+        assert.deepEqual(reasonList(sp, "th-C"), want, label);
+        assert.deepEqual(reasonList(sp, "th-P"), want, label);
+        assert.equal(effectiveVerified(sp).size, 0, label);
+      });
+      assert.ok(seen >= 6);
+    });
+  });
+
+  // (6) and (7): shared session so that the families of X and Y are one family (the fixtures speak of "the families of X and Y")
+  const fix6 = (): Fixture => ({
+    name: "R2.17(6)",
+    files: [
+      raw("f6-1", [
+        ln("session_meta", 0, 0, metaP("th-X", { session_id: SESS })),
+        ln("turn_context", 1, 1, tcP("T", "model-a")),
+        ln("token_usage_record", 2, 2, turP("rX", "th-X", "T", usageP(100, 0, 0, 10, 0), { session_id: SESS })),
+      ]),
+      raw("f6-2", [
+        ln("session_meta", 0, 3, metaP("th-Y", { session_id: SESS })),
+        ln("token_usage_record", 3, 4, turP("rQ", "th-X", "T2", usageP(50, 0, 0, 5, 0), { session_id: SESS })),
+        markerLine(4, 5),
+        ln("turn_context", 5, 6, tcP("T", "model-b")),
+      ]),
+    ],
+  });
+
+  it("(6) F2 is a stream conflict and TM(T) = {A, B}: X and Y are tainted unsplit and at every split position, tokens kept", async () => {
+    const fx = fix6();
+    const r = await run(fx.files);
+    assert.deepEqual(taintedSet(r), ["th-X", "th-Y"]);
+    assert.deepEqual(namesOf(r, "stream_unresolved"), ["th-X", "th-Y"]);
+    await checkOps(fx);
+    let dissolved = 0;
+    const n = await checkSplits(fx, (_c, sp, dis) => {
+      assert.equal(effectiveVerified(sp).size, 0);
+      // tainted at every position, including the splits that give each half of F2 one identity (R2.17 (6))
+      assert.deepEqual(taintedSet(sp), ["th-X", "th-Y"]);
+      if (dis) {
+        // a dissolving split leaves only the record-set reason (the stream conflict is gone)
+        dissolved++;
+        assert.deepEqual(reasonList(sp, "th-X"), ["turn_model_conflicted"]);
+        assert.deepEqual(reasonList(sp, "th-Y"), ["turn_model_conflicted"]);
+      }
+    });
+    assert.equal(n, 3); // F1 at 1 and 2, F2 at 1 (the other cuts of F2 leave a half that names no chain, R4.10 op 5)
+    assert.ok(dissolved >= 1, "a split that gives each half of F2 one identity was exercised");
+  });
+
+  // Q < P < C in time. F2 is the earlier file and uses the low ordinals, F1 continues the ordinals from 4 on, so every stream that
+  // results from a split keeps monotone timestamps along its ordinals.
+  const fix7 = (): Fixture => ({
+    name: "R2.17(7)",
+    files: [
+      raw("f7-1", [
+        ln("session_meta", 4, 10, metaP("th-X", { session_id: SESS })),
+        ln("turn_context", 5, 11, tcP("T", "model-a")),
+        ln("token_usage_record", 6, 12, turP("P", "th-X", "T", usageP(30000, 20000, 0, 10, 0), { session_id: SESS })),
+        ln("turn_context", 7, 13, tcP("TC", "model-b")),
+        ln("token_usage_record", 8, 14, turP("C", "th-X", "TC", usageP(60000, 0, 0, 10, 0), { session_id: SESS })),
+      ]),
+      raw("f7-2", [
+        ln("session_meta", 0, 0, metaP("th-Y", { session_id: SESS })),
+        ln("turn_context", 1, 1, tcP("T", "model-b")),
+        markerLine(2, 2),
+        ln("token_usage_record", 3, 3, turP("Q", "th-X", "T2", usageP(60000, 60000, 0, 10, 0), { session_id: SESS })),
+      ]),
+    ],
+  });
+
+  it("(7) the split counterexample: TM(T) = {A, B} and P names X, so X is tainted at every position; no verified model for P, C or Q", async () => {
+    const fx = fix7();
+    const r = await run(fx.files);
+    assert.deepEqual(taintedSet(r), ["th-X", "th-Y"]);
+    assert.deepEqual(namesOf(r, "turn_model_conflicted"), ["th-X", "th-Y"]);
+    assert.equal(effectiveVerified(r).size, 0);
+    await checkOps(fx);
+    const n = await checkSplits(fx, (_c, sp, dis) => {
+      assert.ok(taintedSet(sp).includes("th-X"));
+      assert.equal(effectiveVerified(sp).size, 0);
+      if (dis) assert.deepEqual(reasonList(sp, "th-X"), ["turn_model_conflicted"]);
+    });
+    assert.ok(n >= 6);
+  });
+
+  const fix8 = (): Fixture => ({
+    name: "R2.17(8)",
+    files: [
+      raw("f8-1", [
+        ln("session_meta", 0, 0, metaP("th-X", { session_id: SESS })),
+        ln("turn_context", 1, 1, tcP("T", "model-a")),
+        ln("token_usage_record", 2, 2, turP("P", "th-X", "T", usageP(100, 0, 0, 10, 0), { session_id: SESS })),
+      ]),
+      raw("f8-2", [
+        ln("session_meta", 0, 3, metaP("th-Y", { session_id: SESS })),
+        markerLine(3, 4),
+        ln("token_usage_record", 4, 5, turP("Q", "th-X", "T2", usageP(50, 0, 0, 5, 0), { session_id: SESS })),
+      ]),
+    ],
+  });
+
+  it("(8) the dissolving fixture: unsplit F2 is a stream conflict; both splits of F2 verify P as own_turn; splits of F1 keep the taint", async () => {
+    const fx = fix8();
+    const r = await run(fx.files);
+    assert.deepEqual(namesOf(r, "stream_unresolved"), ["th-X", "th-Y"]);
+    assert.deepEqual(taintedSet(r), ["th-X", "th-Y"]);
+    assert.equal(effectiveVerified(r).size, 0);
+    assert.deepEqual(src(r, "P"), ["own_turn", "model-a", true]); // the parser verifies it; the taint withdraws it
+    const base = await runX(fx.files);
+    const seen: string[] = [];
+    await checkSplits(fx, (c, sp, dis) => {
+      const key = `${c.file.path.includes("f8-2") ? "F2" : "F1"}@${c.at}`;
+      seen.push(`${key}:${dis ? "dissolving" : "plain"}`);
+      assert.equal(tokensOf(sp), tokensOf(base.r));
+      if (c.file.path.includes("f8-2")) {
+        assert.ok(dis, `${key} dissolves the stream conflict`);
+        // stored: nothing is tainted any more, P is own_turn and verified, the marker lies after P
+        assert.deepEqual(taintedSet(sp), [], key);
+        assert.deepEqual(namesOf(sp, "stream_unresolved"), [], key);
+        // after the meta of Y the marker joins the stream of X (Q carried_unverified); after the marker it stays with Y (Q carried_verified)
+        if (c.at === 1) {
+          assert.deepEqual([...effectiveVerified(sp)], [["P", "model-a"]], key);
+          assert.deepEqual(src(sp, "Q"), ["carried_unverified", "model-a", false], key);
+        } else {
+          assert.deepEqual([...effectiveVerified(sp)], [["P", "model-a"], ["Q", "model-a"]], key);
+          assert.deepEqual(src(sp, "Q"), ["carried_verified", "model-a", true], key);
+        }
+      } else {
+        assert.ok(!dis, key);
+        assert.deepEqual(taintedSet(sp), ["th-X", "th-Y"], key);
+      }
+    });
+    assert.deepEqual(seen.sort(), ["F1@1:plain", "F1@2:plain", "F2@1:dissolving", "F2@2:dissolving"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7b. answers of the orchestrator on revision 11 (stored decisions)
+// ---------------------------------------------------------------------------
+
+describe("revision 11 decisions", () => {
+  it("R2.17 (d): a turn_context without a usable model is a null member of TM(T), so model A plus null is turn_model_conflicted", async () => {
+    for (const bad of [undefined, 7, "Not A Model!"]) {
+      const tcNoModel: Record<string, unknown> = { ...(tcP("T", "model-a") as Record<string, unknown>), model: bad };
+      if (bad === undefined) delete tcNoModel["model"];
+      const f = raw("nullm", [
+        ln("session_meta", 0, 0, metaP("th-n")),
+        ln("turn_context", 1, 1, tcP("T", "model-a")),
+        ln("turn_context", 2, 2, tcNoModel),
+        ln("token_usage_record", 3, 3, turP("r", "th-n", "T", usageP(10, 0, 0, 1, 0))),
+      ]);
+      const r = await run([f]);
+      assert.deepEqual(namesOf(r, "turn_model_conflicted"), ["th-n"], String(bad));
+      assert.equal(effectiveVerified(r).size, 0, String(bad));
+      assert.equal(byKey(r, "r").usage!.input_uncached, 10n);
+    }
+    // two usable models that normalize to one id are no conflict
+    const ok = raw("nullm-ok", [
+      ln("session_meta", 0, 0, metaP("th-n")),
+      ln("turn_context", 1, 1, tcP("T", "model-a")),
+      ln("turn_context", 2, 2, tcP("T", "model-a-20250101")),
+      ln("token_usage_record", 3, 3, turP("r", "th-n", "T", usageP(10, 0, 0, 1, 0))),
+    ]);
+    assert.deepEqual(namesOf(await run([ok]), "turn_model_conflicted"), []);
+  });
+
+  it("a top-level parent_thread_id of a session_meta is not a family link (R0.9 (ii) is closed)", async () => {
+    const a = raw("pt-a", [ln("session_meta", 0, 0, metaP("th-a", { session_id: "s-a" })), ln("token_usage_record", 1, 1, turP("ra", "th-a", "T", usageP(10, 0, 0, 1, 0)))]);
+    const b = raw("pt-b", [
+      ln("session_meta", 0, 0, metaP("th-b", { session_id: "s-b", parent_thread_id: "th-a" })),
+      ln("token_usage_record", 1, 1, turP("rb", "th-b", "T", usageP(10, 0, 0, 1, 0))),
+    ]);
+    const r = await run([a, b]);
+    assert.deepEqual(r.integrity.family_groups, []);
+    assert.notEqual(familyMap(r).get("codex\u0000th-a"), familyMap(r).get("codex\u0000th-b"));
+  });
+
+  it("R4.11: a missing session_id, forked_from_id or history start is a value of its own", async () => {
+    const mk = (a: object, b: object) => [
+      raw("mv-1", [ln("session_meta", 0, 0, metaP("th-m", a)), ln("token_usage_record", 2, 2, turP("r1", "th-m", "T", usageP(10, 0, 0, 1, 0)))]),
+      raw("mv-2", [ln("session_meta", 1, 1, metaP("th-m", b)), ln("token_usage_record", 3, 3, turP("r2", "th-m", "T", usageP(10, 0, 0, 1, 0)))]),
+    ];
+    const cases: Array<[string, object, object]> = [
+      ["session_id", { session_id: "s-1" }, { session_id: undefined }],
+      ["forked_from_id", { forked_from_id: "th-par", subagent_history_start_ordinal: 1 }, { subagent_history_start_ordinal: 1 }],
+      ["history start", { forked_from_id: "th-par", subagent_history_start_ordinal: 1 }, { forked_from_id: "th-par" }],
+    ];
+    for (const [what, a, b] of cases) {
+      const r = await run(mk(a, b));
+      assert.deepEqual(namesOf(r, "stream_unresolved"), ["th-m"], what);
+    }
+    // the same values in both are no conflict
+    const same = await run(mk({ session_id: "s-1" }, { session_id: "s-1" }));
+    assert.deepEqual(namesOf(same, "stream_unresolved"), []);
+  });
+
+  it("R15.7: request-level triggers and excluded records exist only for supported-version threads; an unverified thread gets version_unverified only", async () => {
+    const f = raw("uv", [
+      ln("session_meta", 0, 0, metaP("th-old", { cli_version: "0.1.0" })),
+      ln("token_usage_record", 1, 1, turP(null, "th-old", "T", usageP(10, 0, 0, 1, 0))), // unkeyed
+      ln("token_usage_record", 2, 2, turP("dup", "th-old", "T", usageP(10, 0, 0, 1, 0))),
+      ln("token_usage_record", 3, 3, turP("dup", "th-old", "T", usageP(20, 0, 0, 1, 0))), // conflicting copy
+      ln("token_usage_record", 4, 4, turP("bad", "th-old", "T", usageP(10, 5, 0, 1, 0, 99))), // invariant failure
+    ]);
+    const r = await run([f]);
+    assert.deepEqual(r.integrity.triggers.map((t) => t.reason), ["version_unverified"]);
+    assert.deepEqual(r.excluded, []);
+    assert.deepEqual(r.responses, []);
+    assert.deepEqual(r.conflicts, []);
+    assert.equal(r.coverage.requests_conflict, 0);
+    assert.equal(r.coverage.responses_usage_invariant_failed, 0);
+    assert.equal(r.coverage.records_unkeyed, 0);
+    assert.equal(r.coverage.records_usage_bearing, 0);
+    assert.equal(r.coverage.lines_unverified_version, 4);
+    assert.equal(r.coverage.requests_unverified_version, 2); // distinct keys of keyed records
+    assert.ok(r.assumptions.includes("unverified_version"));
+  });
+
+  it("R15.7: the unverified_version assumption holds whenever an unverified chain exists, even one without a keyed request or usage line", async () => {
+    const r = await run([raw("uv2", [ln("session_meta", 0, 0, metaP("th-old2", { cli_version: "0.1.0" }))])]);
+    assert.equal(r.coverage.requests_unverified_version, 0);
+    assert.equal(r.coverage.lines_unverified_version, 0);
+    assert.ok(r.assumptions.includes("unverified_version"));
+    const clean = await run([raw("uv3", [ln("session_meta", 0, 0, metaP("th-ok2"))])]);
+    assert.ok(!clean.assumptions.includes("unverified_version"));
+  });
+
+  it("R2.13: a usage record without a thread_id counts as usage-bearing and unkeyed, not unmappable, and taints every Codex chain", async () => {
+    const f = raw("nothr", [
+      ln("session_meta", 0, 0, metaP("th-k")),
+      ln("token_usage_record", 1, 1, turP("rk", "th-k", "T", usageP(10, 0, 0, 1, 0))),
+      // no thread_id, and an incomplete usage object that would be unmappable if it had a thread
+      ln("token_usage_record", 2, 2, { response_id: "rz", session_id: "s", turn_id: "T", usage: { input_tokens: 5 } }),
+    ]);
+    const r = await run([f]);
+    assert.equal(r.coverage.records_usage_bearing, 2);
+    assert.equal(r.coverage.records_unkeyed, 1);
+    assert.equal(r.coverage.records_usage_unmappable, 0);
+    assert.deepEqual(namesOf(r, "unattributed_record"), ["provider"]);
+    assert.deepEqual(reasonList(r, "th-k"), ["unattributed_record"]);
+    assert.deepEqual(r.excluded, []);
   });
 });
 

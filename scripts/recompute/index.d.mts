@@ -4,6 +4,21 @@
 export const SPEC_ID: "spec-1";
 export const RECOMPUTE_SCHEMA: "cachewhy-recompute/1";
 
+/** The closed taint enum of R0.9, in spec order. */
+export type RecomputeTaintReason =
+  | "stream_unresolved"
+  | "copy_exposed"
+  | "turn_model_conflicted"
+  | "ordinal_unverified"
+  | "fork_prefix_unresolved"
+  | "request_anomaly"
+  | "ownership_ambiguous"
+  | "version_unverified"
+  | "unparsed_line"
+  | "unlogged_usage"
+  | "unattributed_record"
+  | "file_unreadable";
+
 export interface RecomputeOptions {
   /** Claude config dirs (containing projects/) or projects dirs. */
   claudeDirs?: string[];
@@ -15,13 +30,17 @@ export interface RecomputeOptions {
   until?: string | number | null;
   /** Parsed pricing table object or a path to table.json. Default: src/pricing/table.json next to the repo root. */
   table?: object | string;
-  /** `strict` (default) applies R15.7. `all` treats every product version as supported (synthetic fixtures only). */
-  versionPolicy?: "strict" | "all";
   /**
    * Test-only (R3.4): `standard` marks the Codex service tier as verified Standard so the row selection of R3.6 and
    * R3.10 runs. Without it every Codex response is unpriced with reason `modifier_unverified`. There is no CLI flag.
    */
   codexTierForTest?: "standard";
+  /**
+   * Test-only (R0.9, live families): the run start in epoch ms or as an ISO instant. Default: the clock, read once per
+   * run. A file is live when it holds an unparseable line, names a chain, and its mtime is positive and at most 600 s before this
+   * instant (a later mtime counts as live; a missing mtime, 0 or a failed stat never does). There is no CLI flag and no environment variable.
+   */
+  runStartMs?: number | string;
 }
 
 export interface RecomputeBuckets {
@@ -40,18 +59,26 @@ export interface RecomputeBuckets {
   reasoning: bigint | null;
 }
 
+/** One number only (R3.5): no range exists. `tokens_unpriced` is the response's tokens (context plus output or its lower bound). */
 export type RecomputePrice =
-  | { priced: true; lo: bigint; hi: bigint; output_excluded: boolean; tokens_unpriced: 0n }
+  | { priced: true; pico: bigint; tokens_unpriced: 0n }
   | { priced: false; reason: string; tokens_unpriced: bigint };
 
 export interface RecomputeResponse {
   provider: "claude" | "codex";
   /** Raw request key. Internal to the process: toJson hashes it unless asked not to. */
   key: string;
-  /** True for a unique, kept response in the window that adds to the totals. */
+  /** True for a unique, kept response in the window of a live-free family that adds to the totals. */
   counted: boolean;
-  /** `counted` or `excluded:<reason>`. */
+  /** `counted`, `live_skipped` or `excluded:<reason>`. */
   status: string;
+  /** R0.9: the chain (owner stream) of a kept response, null for an excluded one. */
+  chain?: string | null;
+  /** R0.9: the family of the chain is tainted. Tainted responses keep their buckets and are unpriced `chain_tainted`. */
+  tainted: boolean;
+  taint_reasons: RecomputeTaintReason[];
+  /** R0.9: the response belongs to a live family and was removed from the totals (`counted` is false). */
+  live_skipped: boolean;
   kind?: string;
   model?: string | null;
   model_label?: string;
@@ -66,15 +93,14 @@ export interface RecomputeAgg {
   responses: number;
   responses_priced: number;
   responses_unpriced: number;
-  responses_priced_without_output_term: number;
   tokens: Record<string, string>;
   context_tokens: string;
   tokens_total: string;
   tokens_unpriced: string;
   unpriced_share_exceeds_c24: boolean;
   reasoning_informational: string;
-  usd_pico_lo: string;
-  usd_pico_hi: string;
+  /** Sum of the priced responses in picodollars (R3.8). */
+  usd_pico: string;
 }
 
 export interface RecomputeProvider {
@@ -84,16 +110,35 @@ export interface RecomputeProvider {
   unpriced_by_reason: Record<string, { responses: number; tokens_unpriced: string }>;
 }
 
+/** The R0.9 coverage counters every provider carries (token amounts are decimal strings, R17.1). */
+export interface RecomputeTaintCoverage {
+  chains_total: number;
+  chains_tainted: number;
+  chains_tainted_by_reason: Record<RecomputeTaintReason, number>;
+  families_total: number;
+  families_tainted: number;
+  families_live_skipped: number;
+  responses_in_tainted_chains: number;
+  tokens_in_tainted_chains: string;
+  requests_unpriced_tainted: number;
+  responses_live_skipped: number;
+  tokens_live_skipped: string;
+  /** R16.1 / C36: 10 * tainted families > 3 * families, or 10 * tainted tokens > 3 * tokens (BigInt). */
+  taint_warn: boolean;
+}
+
 export interface RecomputeResult {
   schema: typeof RECOMPUTE_SCHEMA;
   spec: typeof SPEC_ID;
   table_version: string;
-  version_policy: "strict" | "all";
   window: { since: string | null; until: string | null };
   price_mode: string;
   providers: { claude: RecomputeProvider; codex: RecomputeProvider };
-  coverage: { claude: Record<string, unknown>; codex: Record<string, unknown> };
-  /** Every keyed response seen, counted or excluded. Not part of the JSON unless asked for. */
+  coverage: {
+    claude: RecomputeTaintCoverage & Record<string, unknown>;
+    codex: RecomputeTaintCoverage & Record<string, unknown>;
+  };
+  /** Every keyed response seen, counted, excluded or live-skipped. Not part of the JSON unless asked for. */
   responses: RecomputeResponse[];
 }
 
@@ -101,7 +146,6 @@ export interface RecomputeJson {
   schema: string;
   spec: string;
   table_version: string;
-  version_policy: string;
   window: { since: string | null; until: string | null };
   price_mode: string;
   providers: RecomputeResult["providers"];
@@ -110,9 +154,17 @@ export interface RecomputeJson {
 }
 
 export function recompute(opts?: RecomputeOptions): RecomputeResult;
-/** Files in the layout of the fixture builder: `projects/...`, `sessions/...`, `archived_sessions/...`. */
+/**
+ * Files in the layout of the fixture builder: `projects/...`, `sessions/...`, `archived_sessions/...`. `mtimeMs` is the
+ * file modification time (R0.9 live test, the only use of one); without it, or with 0, a file is never live.
+ * `unreadable: true` is a test hook: the file exists but cannot be read (R0.9 `file_unreadable`).
+ */
 export function recomputeFiles(
-  files: ReadonlyArray<{ path: string; content: string | Uint8Array }>,
+  files: ReadonlyArray<{ path: string; content: string | Uint8Array; mtimeMs?: number; unreadable?: boolean }>,
   opts?: RecomputeOptions,
 ): RecomputeResult;
-export function toJson(result: RecomputeResult, opts?: { perResponse?: boolean; rawKeys?: boolean }): RecomputeJson;
+/**
+ * `salt` is a test-only parameter (R14.4: 16 random bytes per call by default, never stored). `rawKeys` is an in-process
+ * option for synthetic data; the CLI has no flag for it and refuses `--raw-keys`.
+ */
+export function toJson(result: RecomputeResult, opts?: { perResponse?: boolean; rawKeys?: boolean; salt?: string | Uint8Array }): RecomputeJson;

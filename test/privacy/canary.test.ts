@@ -477,11 +477,16 @@ test("canary trees: every command output and every error path stays clean", asyn
   const { dir } = canaryTrees(c);
   try {
     const outputs: string[] = [];
-    const harness = (): { h: CliIO; out: string[]; err: string[] } => {
+    const harness = (now?: () => number): { h: CliIO; out: string[]; err: string[] } => {
       const out: string[] = [];
       const err: string[] = [];
-      return { h: { out: (x) => out.push(x), err: (x) => err.push(x), env: {}, isTTY: false }, out, err };
+      return { h: { out: (x) => out.push(x), err: (x) => err.push(x), env: {}, isTTY: false, ...(now ? { now } : {}) }, out, err };
     };
+    // The generated files were just written, so their truncated tails are live (R0.9, C35) at the real clock. A run
+    // start two days later makes the same files stale: their families are tainted, the taint lines and the warning
+    // (R16.1) print, and none of them may carry a planted canary.
+    const later = (): number => Date.now() + 2 * 86_400_000;
+    let warned = 0;
     const none = join(dir, "does-not-exist");
     for (const sc of scenarios) {
       const root = join(dir, sc.name);
@@ -498,7 +503,19 @@ test("canary trees: every command output and every error path stays clean", asyn
         assert.ok(t.out.join("").length > 0);
         outputs.push(...t.out, ...t.err);
       }
+      for (const extra of [[], ["--json"], ["--no-color"], ["--agent", "claude", "--json"]]) {
+        const t = harness(later);
+        assert.equal(await run(["summary", ...extra, ...dirs], t.h), 0);
+        const text = t.out.join("\n");
+        assert.ok(text.length > 0);
+        if (/^Warning: /m.test(text)) warned++;
+        outputs.push(...t.out, ...t.err);
+      }
+      const d = harness(later);
+      assert.equal(await run(["doctor", "--json", ...dirs], d.h), 0);
+      outputs.push(...d.out, ...d.err);
     }
+    assert.ok(warned > 0, "the taint warning line was exercised");
     for (const argv of [["pricing"], ["summary", "--demo"], ["session", "synthetic-x"], ["evidence", "synthetic-x"], ["nope"], ["--since", "bad"], ["--since", "2030-01-01", "--until", "2020-01-01"], ["doctor", "--agent", "bad"]]) {
       const t = harness();
       await run(argv, t.h);

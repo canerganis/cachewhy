@@ -1,4 +1,4 @@
-// Shared domain types for cachewhy. Binding spec: docs/methodology.md (spec-1, revision 7).
+// Shared domain types for cachewhy. Binding spec: docs/methodology.md (spec-1, revision 11).
 //
 // Rules for this file:
 // - Types, enum value lists, the pre-registered constants (section 0.3) and a few pure helpers only.
@@ -55,7 +55,7 @@ export interface TimeWindow {
 // ---------------------------------------------------------------------------
 
 /**
- * Constants C1 to C34 under their spec names. Retired ids C4 and C5 do not exist.
+ * Constants C1 to C36 under their spec names. Retired ids C4, C5 and C29 do not exist.
  * Seconds are plain numbers, token thresholds are bigint, ratios are exact rationals.
  * C13, C14 and C16 are Wilson bounds on run counts and are the only floats (section 0.3).
  */
@@ -86,12 +86,15 @@ export const CONSTANTS = {
   /** C26, R3.4 */ HAIKU_TIER_SPLIT: 100000n,
   /** C27, R11.7 */ COMPACT_WALK_HOPS: 200,
   /** C28, R17.3 */ NO_FINAL_MARKER_MIN: 100,
-  /** C29, R5.9 */ FAST_PREFILTER_DAYS: 7,
   /** C30, R12.2 */ FILLER_MULT: 3,
   /** C31, R12.9 */ HANDCHECK_TOP: 20,
   /** C32, R3.4, R3.8 */ GEO_US_MULT: rat(11, 10),
   /** C33, R13.4 */ RECON_UNEXPLAINED_TOL: rat(1, 200),
   /** C34, R6.8 */ START_BOUND_VIOLATIONS_MAX: 0,
+  /** C35, R0.9: a file with an unparseable line modified at most this long before the run start is live (seconds) */
+  LIVE_WINDOW_S: 600,
+  /** C36, R16.1: share of families or of tokens in tainted chains above which the headline leads with a warning */
+  TAINT_WARN_SHARE: rat(3, 10),
 } as const;
 
 /** Section 0.2, full support. Any other version is coverage only (R15.7). */
@@ -136,10 +139,8 @@ export const MODEL_SOURCES = [
   "carried_verified",
   "carried_unverified",
   "inherited_prefix",
-  /** Fork whose fork ancestors meet a copy-exposed file (R4.13 (c)). Overrides every other row. Never verified. */
-  "prefix_exposed",
-  /** Stream is integrity_unverified for any other reason (R4.11). Overrides every other row. Never verified. */
-  "stream_unverified",
+  /** The chain is tainted (R0.9). Overrides every other row. Never verified. */
+  "chain_tainted",
   "none",
 ] as const;
 export type ModelSource = (typeof MODEL_SOURCES)[number];
@@ -167,14 +168,14 @@ export type ExcludedRecordReason = (typeof EXCLUDED_RECORD_REASONS)[number];
 
 /** Non-exclusion flags on a kept response. */
 export const RESPONSE_FLAGS = [
-  "bucket_mismatch", // R2.1: kept and priced, excluded from detection and boundaries (E0)
+  "bucket_mismatch", // R2.1: the bucket sum is used; the chain is tainted (R0.9 request_anomaly), tokens only
   "w_unknown_ttl", // R2.1: cache_creation object absent
   "output_unknown", // R2.3: no final copy
   "conflict_output", // R4.2: output unknown, tokens kept
   "conflict_iterations", // R4.2: output unknown, response kept
   "conflict_modifier", // R4.2: unpriced_modifier
   "conflict_diagnostics", // R4.2, R10.4: no diagnostics evidence
-  "speed_assumed", // R3.12: no final copy, so no verified speed, geo or tier (the name is historical: nothing is assumed)
+  "no_final_copy", // R3.12: no copy carries usage.speed, so no verified speed, geo or tier (nothing is assumed)
   "classifier_attached", // R5.5
   "ownership_ambiguous", // R4.6
   "fork_first_own", // R4.8, R4.9: first own request after a replayed prefix
@@ -226,26 +227,8 @@ export const UNLINKED_REASONS = [
 ] as const;
 export type UnlinkedReason = (typeof UNLINKED_REASONS)[number];
 
-export const STREAM_INTEGRITY_REASONS = [
-  "file_stream_conflict", // R4.11 |I(F)| >= 2
-  "copy_exposed_file", // R4.13
-  "divergent_session_meta", // R4.11 same id, different forked_from_id or history start
-  "prefix_exposed", // R4.13 (c) fork exposure
-  "stream_missing", // a response whose chain has no Stream record (synthesized, unverified)
-] as const;
-export type StreamIntegrityReason = (typeof STREAM_INTEGRITY_REASONS)[number];
-
 /** R7.2 E0 gate codes. Counted in coverage.requests_gate_abstained. */
-export const GATE_ABSTAIN_CODES = [
-  "stream_unresolved",
-  "ownership_ambiguous",
-  "order_tie",
-  "conflict",
-  "usage_incomplete",
-  "usage_invalid",
-  "unverified_version",
-  "gap_has_excluded",
-] as const;
+export const GATE_ABSTAIN_CODES = ["chain_tainted", "order_tie"] as const;
 export type GateAbstainCode = (typeof GATE_ABSTAIN_CODES)[number];
 
 /** R7.2, R7.6. Superset of the gate codes. Counted in coverage.pairs_abstained. */
@@ -256,6 +239,7 @@ export const ABSTAIN_CODES = [
   "prev_no_cache",
   "model_unknown",
   "unknown_min_length",
+  "usage_incomplete",
 ] as const;
 export type AbstainCode = (typeof ABSTAIN_CODES)[number];
 
@@ -361,7 +345,6 @@ export type PairTag = (typeof PAIR_TAGS)[number];
 
 /** Printed assumption codes (R14.5 `assumptions`). */
 export const ASSUMPTIONS = [
-  "no_batch_assumed",
   "no_regional_surcharge_assumed",
   "parent_record_precedes_request",
   "read_region_is_prefix_of_previous",
@@ -371,7 +354,7 @@ export const ASSUMPTIONS = [
   "claude_ttl_options_5m_1h",
   "diag_basis_is_chain_previous",
   "unverified_version",
-  "mtime_prefilter_on",
+  "live_session_skipped",
 ] as const;
 export type Assumption = (typeof ASSUMPTIONS)[number];
 
@@ -387,6 +370,23 @@ export type DriftCode = (typeof DRIFT_CODES)[number];
 
 export const HEADLINE_STATUSES = ["ok", "withheld"] as const;
 export type HeadlineStatus = (typeof HEADLINE_STATUSES)[number];
+
+/** R0.9. The closed enum of taint reasons, in spec table order (the order used wherever reasons are listed). */
+export const TAINT_REASONS = [
+  "stream_unresolved",
+  "copy_exposed",
+  "turn_model_conflicted",
+  "ordinal_unverified",
+  "fork_prefix_unresolved",
+  "request_anomaly",
+  "ownership_ambiguous",
+  "version_unverified",
+  "unparsed_line",
+  "unlogged_usage",
+  "unattributed_record",
+  "file_unreadable",
+] as const;
+export type TaintReason = (typeof TAINT_REASONS)[number];
 
 // ---------------------------------------------------------------------------
 // 4. Pricing table (JSON shape of src/pricing/table.json) and the prepared price book
@@ -420,6 +420,8 @@ export interface TableLongContext extends TableVerifiable {
   readonly scope?: "request" | "session" | "unknown";
   readonly scope_verified?: boolean;
   readonly scope_source_id?: string;
+  /** R3.2: a long-context row stores its own multiplier object (the ratio test uses it, not the entry's). */
+  readonly multipliers?: Readonly<Record<string, string | null>> | null;
 }
 
 export interface TableModelEntry extends TableVerifiable {
@@ -431,9 +433,24 @@ export interface TableModelEntry extends TableVerifiable {
   readonly multipliers?: Readonly<Record<string, string | null>> | null;
   /** R7.2 `M`. `null` means unknown (E6 abstains). */
   readonly min_cacheable_tokens: number | null;
-  readonly tiers?: (TableVerifiable & { readonly split_tokens: number; readonly high: TablePriceRow }) | null;
+  readonly tiers?:
+    | (TableVerifiable & {
+        readonly split_tokens: number;
+        readonly high: TablePriceRow;
+        /** R3.2: the entry's multipliers stored beside the high row; a test asserts the equality. */
+        readonly high_multipliers?: Readonly<Record<string, string | null>> | null;
+      })
+    | null;
   readonly long_context?: TableLongContext | null;
-  readonly fast?: (TableVerifiable & { readonly prices_usd_per_mtok: TablePriceRow }) | null;
+  readonly fast?:
+    | (TableVerifiable & {
+        readonly prices_usd_per_mtok: TablePriceRow;
+        /** R3.2: the entry's multipliers stored beside the row; a test asserts the equality. */
+        readonly multipliers?: Readonly<Record<string, string | null>> | null;
+        /** R3.4: the geo multiplier applies to this fast row (needed for speed fast with inference_geo us). */
+        readonly geo_us_applies?: boolean;
+      })
+    | null;
   readonly geo_us?: (TableVerifiable & { readonly applies: boolean; readonly multiplier?: string }) | null;
   /** R3.4: explicit price rows per service tier value. */
   readonly service_tier?: Readonly<Partial<Record<ServiceTier, TableVerifiable & { readonly prices_usd_per_mtok: TablePriceRow }>>> | null;
@@ -486,6 +503,8 @@ export interface ModelPrice {
   readonly tier_split: bigint | null;
   readonly long_context: LongContextPrice | null;
   readonly geo_us_applies: boolean;
+  /** R3.4: the fast row of the entry carries `geo_us_applies: true` (and the fast object is verified). */
+  readonly fast_geo_us_applies: boolean;
   readonly service_tier_rows: Readonly<Partial<Record<ServiceTier, PriceRow>>>;
 }
 
@@ -514,6 +533,26 @@ export interface ChainKey {
 /** Canonical single string for a chain key, usable as a Map key. */
 export function chainKeyString(k: ChainKey): string {
   return `${k.provider}\u0000${k.root_session}\u0000${k.thread}`;
+}
+
+/**
+ * Family node id (R0.9). Claude: `claude\0<sessionId>\0<agentId|main>`. Codex: `codex\0<thread_id>`. Codex leaves
+ * `root_session` out on purpose: a thread can carry divergent `session_id` values (R4.11) and the thread is the
+ * identity. Raw ids, internal only (R14.4).
+ */
+export type ChainId = string;
+
+/** Pure: the family node id of a chain key. */
+export function chainIdOf(k: ChainKey): ChainId {
+  return k.provider === "codex" ? `codex\u0000${k.thread}` : `claude\u0000${k.root_session}\u0000${k.thread}`;
+}
+
+/**
+ * The single per-response token measure (R3.9, R0.9 coverage): `ctx` plus output, the lower bound where the output
+ * is unknown. Used for tokens_unpriced, tokens_in_tainted_chains, tokens_live_skipped and tokens_total.
+ */
+export function responseTokens(u: UsageBuckets): Tokens {
+  return contextTokens(u) + (u.output ?? u.output_lower_bound);
 }
 
 /**
@@ -546,7 +585,7 @@ export interface UsageBuckets {
 }
 
 export interface Modifiers {
-  /** `null` is absent (R3.4: standard assumed, flag `speed_assumed`). */
+  /** `null` is absent. Nothing is assumed (R3.12): pricing treats an absent modifier as `modifier_unverified`. */
   readonly speed: Speed | null;
   readonly inference_geo: Geo | null;
   readonly service_tier: ServiceTier | null;
@@ -725,6 +764,11 @@ export interface FileInfo {
   /** R2.9: Codex file with token_count events but no token_usage_record. */
   readonly without_response_id: boolean;
   readonly lines: number;
+  /**
+   * Modification time of the file (R0.9: the only use of a file mtime in this spec, live families). Copied from
+   * `DiscoveredFile.mtimeMs`; never read from the log content.
+   */
+  readonly mtime_ms: EpochMs;
 }
 
 /** R4.9. Codex fork facts of a stream. */
@@ -743,11 +787,8 @@ export interface Stream {
   readonly files: readonly FileIndex[];
   /** R4.6: minimum timestamp over all records of all files of the stream. */
   readonly start_ms: EpochMs | null;
-  /** R4.12. Always null for Claude, which has no ordinal. */
+  /** R4.12. Always null for Claude, which has no ordinal. A failing stream is tainted `ordinal_unverified` (R0.9). */
   readonly ordinal_verified: boolean | null;
-  /** R4.11, R4.13. Every request of such a stream abstains `stream_unresolved`. */
-  readonly integrity_unverified: boolean;
-  readonly integrity_reasons: readonly StreamIntegrityReason[];
   /** Codex only, null when the thread is not a fork (R4.9). */
   readonly fork: ForkInfo | null;
   /** Codex `thread_settings_applied` presence in the stream (R2.10, R2.17). */
@@ -777,6 +818,11 @@ export interface ClaudeUuidNode {
   readonly is_compact_summary: boolean;
   readonly is_compact_boundary: boolean;
   readonly chain: ChainKey | null;
+  /**
+   * R6.3: the records of this uuid disagree on timestamp, parent or logical parent, so the uuid does not resolve.
+   * `ts_ms`, `parent_uuid` and `logical_parent_uuid` are then null and a walk through the node is `unknown` (R11.7).
+   */
+  readonly unresolved: boolean;
 }
 
 /** Claude `compact_boundary` system record (R1.2, R11.7). Duplicates collapsed on uuid, owned by the owning stream. */
@@ -867,7 +913,6 @@ export const COVERAGE_COUNT_FIELDS = [
   "requests_unverified_version",
   "requests_gate_abstained",
   "responses_bucket_mismatch",
-  "responses_speed_assumed",
   "responses_usage_range_failed",
   /** Numerator part of drift_invariant: responses failing R2.7 (R2.15 and R2.1 and key conflicts are counted separately). */
   "responses_usage_invariant_failed",
@@ -882,10 +927,17 @@ export const COVERAGE_COUNT_FIELDS = [
   "links_verified",
   "links_directory_only",
   "links_unlinked",
-  "streams_total",
-  "streams_integrity_unverified",
-  "streams_ordinal_unverified",
-  "streams_fork_prefix_unresolved",
+  /** R0.9 coverage. Chains and families of live families are in none of these (counted in the live counters). */
+  "chains_total",
+  "chains_tainted",
+  "families_total",
+  "families_tainted",
+  "responses_in_tainted_chains",
+  /** R0.9 effect 2: replaces every other unpriced reason for a response of a tainted chain. */
+  "requests_unpriced_tainted",
+  /** R0.9 live families: whole scan for families, the totals set (owner, kept, in window) for responses. */
+  "families_live_skipped",
+  "responses_live_skipped",
   "pairs_total",
   "pairs_eligible",
   "pairs_abstained",
@@ -902,6 +954,10 @@ export const COVERAGE_TOKEN_FIELDS = [
   "tokens_unpriced",
   "tokens_in_incomplete_responses",
   "tokens_in_invalid_responses",
+  /** R0.9: `responseTokens` summed over the totals-set responses of tainted chains. */
+  "tokens_in_tainted_chains",
+  /** R0.9: `responseTokens` summed over the totals-set responses of live families. */
+  "tokens_live_skipped",
 ] as const;
 export type CoverageTokenField = (typeof COVERAGE_TOKEN_FIELDS)[number];
 
@@ -937,6 +993,8 @@ export const UNPRICED_MODIFIER_REASONS = [
   "long_context_unverified",
   "cache_write_price_na",
   "tier_unverified",
+  /** R3.5: a write of unknown TTL class (the `cache_creation` object is absent): no range is produced. */
+  "bucket_unknown",
   /** R3.12 (Claude without a final copy) and R3.4 (every Codex response: the service tier is not observable). */
   "modifier_unverified",
 ] as const;
@@ -949,6 +1007,8 @@ export type CoverageCounters = Record<CoverageCountField, number> &
   Record<CoverageTokenField, Tokens> & {
     /** Reason counts. The totals are the matching plain counters (they must equal the sum). */
     requests_unpriced_modifier_by_reason: Record<UnpricedModifierReason, number>;
+    /** R0.9: a chain with several reasons counts once under each. The total is `chains_tainted`. */
+    chains_tainted_by_reason: Record<TaintReason, number>;
     requests_conflict_by_kind: Record<ConflictKind, number>;
     links_unlinked_by_reason: Record<UnlinkedReason, number>;
     pairs_abstained_by_code: Record<AbstainCode, number>;
@@ -971,7 +1031,10 @@ export function emptyCoverage(): CoverageCounters {
     tokens_unpriced: 0n,
     tokens_in_incomplete_responses: 0n,
     tokens_in_invalid_responses: 0n,
+    tokens_in_tainted_chains: 0n,
+    tokens_live_skipped: 0n,
     requests_unpriced_modifier_by_reason: zeroCounts(UNPRICED_MODIFIER_REASONS),
+    chains_tainted_by_reason: zeroCounts(TAINT_REASONS),
     requests_conflict_by_kind: zeroCounts(CONFLICT_KINDS),
     links_unlinked_by_reason: zeroCounts(UNLINKED_REASONS),
     pairs_abstained_by_code: zeroCounts(ABSTAIN_CODES),
@@ -991,6 +1054,7 @@ export function mergeCoverage(a: CoverageCounters, b: CoverageCounters): Coverag
     for (const k of keys) dst[k] = x[k] + y[k];
   };
   addMap(out.requests_unpriced_modifier_by_reason, a.requests_unpriced_modifier_by_reason, b.requests_unpriced_modifier_by_reason, UNPRICED_MODIFIER_REASONS);
+  addMap(out.chains_tainted_by_reason, a.chains_tainted_by_reason, b.chains_tainted_by_reason, TAINT_REASONS);
   addMap(out.requests_conflict_by_kind, a.requests_conflict_by_kind, b.requests_conflict_by_kind, CONFLICT_KINDS);
   addMap(out.links_unlinked_by_reason, a.links_unlinked_by_reason, b.links_unlinked_by_reason, UNLINKED_REASONS);
   addMap(out.pairs_abstained_by_code, a.pairs_abstained_by_code, b.pairs_abstained_by_code, ABSTAIN_CODES);
@@ -1015,16 +1079,113 @@ export interface DriftFinding {
 // 8. Parser interfaces
 // ---------------------------------------------------------------------------
 
-export interface ParseOptions {
-  /**
-   * Report window. The parser reads all files in full (R5.10). It uses the window only for the optional mtime
-   * prefilter (R5.9 `--fast`). Event times are never filtered by the parser.
-   */
-  readonly window?: TimeWindow | null;
-  /** `--fast`: skip files with mtime older than `since` minus C29. Adds assumption `mtime_prefilter_on`. */
-  readonly fastPrefilter?: boolean;
-  /** Clock for the prefilter. Default Date.now(). Tests pass a fixed value. */
-  readonly now_ms?: EpochMs;
+/**
+ * Parser options. Empty on purpose: every file is read in full and the window is applied by the graph, never by the
+ * parser (R5.9, R5.10). The bag is reserved for test-only parameters, which are function parameters and never an
+ * environment variable or a CLI flag.
+ */
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
+export interface ParseOptions {}
+
+/**
+ * One taint trigger of R0.9 (the table's "Trigger" and "Chains it names" columns). `unparsed_line` is not a trigger:
+ * it is derived from `FileFacts` because liveness (R0.9) decides whether it applies. `names` is the list of chains the
+ * reason names, or `"provider"` for a reason that names none (it then taints every chain of the provider).
+ */
+export interface TaintTrigger {
+  readonly reason: Exclude<TaintReason, "unparsed_line">;
+  readonly names: readonly ChainId[] | "provider";
+}
+
+/** Per-physical-file facts for R0.9 (liveness, `unparsed_line`, `file_unreadable`). */
+export interface FileFacts {
+  readonly index: FileIndex;
+  readonly provider: Provider;
+  /** From the file system, never from the log content. */
+  readonly mtime_ms: EpochMs;
+  /** R0.9 "Named chains": sorted, unique. */
+  readonly named_chains: readonly ChainId[];
+  /** Lines that fail to parse (`lines_parse_error`) plus a truncated tail of this physical file (R1.3). */
+  readonly unparsed_lines: number;
+  readonly readable: boolean;
+}
+
+/**
+ * What a parser tells the graph about integrity (R0.9). Everything here is a property of the record set or of a file
+ * condition, computed over every parsed record of the scan whatever its version (R15.7).
+ */
+export interface IntegrityFacts {
+  readonly provider: Provider;
+  /** Every chain seen by a structural read of any version (R15.7). Sorted, unique. */
+  readonly chains: readonly ChainId[];
+  /** Groups of chains that are linked to each other. Each group is fully connected: R0.9 links (i), (ii) and (iii). */
+  readonly family_groups: readonly (readonly ChainId[])[];
+  readonly triggers: readonly TaintTrigger[];
+  readonly files: readonly FileFacts[];
+}
+
+/** The taint result for one chain (R0.9). */
+export interface ChainTaint {
+  readonly chain: ChainId;
+  /** Family number, assigned after sorting the chain ids, so it does not depend on input order. */
+  readonly family: number;
+  readonly tainted: boolean;
+  /** In `TAINT_REASONS` order. */
+  readonly reasons: readonly TaintReason[];
+  /** True iff the family is live. A live family is removed from the analysis. */
+  readonly live: boolean;
+}
+
+/** Taint of one provider. Chain and family counters exclude live families (R0.9 Coverage). */
+export interface ProviderTaint {
+  readonly provider: Provider;
+  readonly chains: ReadonlyMap<ChainId, ChainTaint>;
+  readonly families_total: number;
+  readonly families_tainted: number;
+  readonly families_live: number;
+  readonly chains_total: number;
+  readonly chains_tainted: number;
+  readonly chains_tainted_by_reason: Record<TaintReason, number>;
+  /** Reasons that taint the whole provider (a trigger naming `"provider"`, or `unparsed_line` of a file naming no chain). */
+  readonly provider_wide_reasons: readonly TaintReason[];
+}
+
+/**
+ * Logical counters that the report windows and thins out (R17.3 "in the window", R0.9 "removed from the analysis
+ * entirely"). The parser counts them scan-wide in `coverage`; it also records each increment in the ledger with the
+ * event time and the chain it belongs to, and the report rebuilds these fields from the ledger entries whose event time
+ * is in the window and whose chain is not in a live family. Every other counter keeps its parser value.
+ */
+export const LEDGER_COUNT_FIELDS = [
+  "records_usage_bearing",
+  "records_usage_unmappable",
+  "records_unkeyed",
+  "responses_total",
+  "requests_with_final_marker",
+  "responses_usage_range_failed",
+  "responses_usage_invariant_failed",
+  "responses_bucket_mismatch",
+  /** Requests with at least one conflict code except `conflict_diagnostics` (one per request, not one per code). */
+  "requests_conflict",
+  "requests_conflict_modifier",
+  "replay_requests_excluded",
+  "replay_ownership_ambiguous",
+  "api_error_records",
+  "fields_range_failed",
+] as const;
+export type LedgerCountField = (typeof LEDGER_COUNT_FIELDS)[number];
+
+/** One logical increment of the ledger counters. Unknown event time (`t_ms` null) is in every window (abstain). */
+export interface LedgerEntry {
+  /** Event time of the record or response. Null when no timestamp parsed: such an entry is never filtered out. */
+  readonly t_ms: EpochMs | null;
+  /** The chain the record or response belongs to. Null: no chain (provider-wide), never live. */
+  readonly chain: ChainId | null;
+  readonly n: Readonly<Partial<Record<LedgerCountField, number>>>;
+  /** Every conflict code of the request (the by-kind counts add one per code). */
+  readonly conflict_kinds?: readonly ConflictKind[];
+  readonly tokens_incomplete?: Tokens;
+  readonly tokens_invalid?: Tokens;
 }
 
 /** Output common to both providers. */
@@ -1040,8 +1201,12 @@ export interface ParseResult {
   readonly links: readonly Link[];
   readonly streams: readonly Stream[];
   readonly files: readonly FileInfo[];
-  /** Assumption codes the parse itself requires (for example `unverified_version`, `mtime_prefilter_on`). */
+  /** Assumption codes the parse itself requires (for example `unverified_version`). */
   readonly assumptions: readonly Assumption[];
+  /** R0.9: chains, family links, taint triggers and per-file facts. */
+  readonly integrity: IntegrityFacts;
+  /** Event-time and chain ledger of the logical counters in `LEDGER_COUNT_FIELDS` (see there). Unsorted. */
+  readonly ledger: readonly LedgerEntry[];
 }
 
 export interface ClaudeParseResult extends ParseResult {
@@ -1127,6 +1292,12 @@ export interface Chain {
   readonly stream: Stream;
   /** Response indices (into Graph.responses) in the order of R6.1: (event_time asc, key asc). */
   readonly order: readonly number[];
+  /** R0.9: family number (see `ChainTaint.family`). */
+  readonly family: number;
+  /** R0.9: the chain is tainted. Its responses keep their tokens and lose model, dollars and every verdict. */
+  readonly tainted: boolean;
+  /** R0.9: the reasons that apply, in `TAINT_REASONS` order. Empty iff not tainted. */
+  readonly taint_reasons: readonly TaintReason[];
 }
 
 export interface Graph {
@@ -1143,15 +1314,30 @@ export interface Graph {
   readonly codex: {
     readonly compactions: readonly CodexCompaction[];
   };
-  /** Assumption codes carried from the parsers. */
+  /** Assumption codes carried from the parsers, plus `live_session_skipped` (R0.9). */
   readonly assumptions: readonly Assumption[];
+  /** R0.9. Chain, family and live counts per provider. Live families are excluded from the totals. */
+  readonly taint: Readonly<Record<Provider, ProviderTaint>>;
+  /**
+   * Graph-level coverage counters per provider (R0.9, R5.3, R5.6): `chains_*`, `families_*`, the three `*_live_skipped`
+   * counters, `chains_tainted_by_reason` and the `links_*` counters after the cross-chain link checks. Every other
+   * field is zero here. The `links_*` values REPLACE those of the parser; the other fields have no parser counterpart.
+   * The response-level taint counters (`responses_in_tainted_chains`, `tokens_in_tainted_chains`,
+   * `requests_unpriced_tainted`) are computed by the report builder from the graph and the priced responses.
+   */
+  readonly coverage_by_provider: Readonly<Record<Provider, CoverageCounters>>;
 }
 
 export interface GraphOptions {
   readonly window: TimeWindow;
+  /** R0.9 run start. Read once per run by the CLI; tests inject it. A function parameter, never a flag or env variable. */
+  readonly run_start_ms: EpochMs;
 }
 
-/** buildGraph(parse results, opts): ownership, chain order, P(C), ties, excluded-between, TTL sets, gap bounds. */
+/**
+ * buildGraph(parse results, opts): taint and live families (R0.9), ownership, chain order, P(C), ties,
+ * excluded-between, TTL sets, gap bounds.
+ */
 export type BuildGraph = (parsed: readonly ParseResult[], opts: GraphOptions) => Graph;
 
 // ---------------------------------------------------------------------------
@@ -1175,7 +1361,7 @@ export const UNPRICED_REASONS = [
   "model_unknown", // model not verified (R2.10)
   "unknown_model", // no table row (R3.3)
   "unpriced_modifier", // see PricedResponse.modifier_reason
-  "output_unknown", // only for the output term, R2.3
+  "chain_tainted", // R0.9 effect 2: replaces every other reason for a response of a tainted chain
 ] as const;
 export type UnpricedReason = (typeof UNPRICED_REASONS)[number];
 
@@ -1205,15 +1391,8 @@ export interface PricedResponse {
   readonly key: string;
   readonly chain: ChainKey;
   readonly table_version: string;
-  /**
-   * Total cost (R3.5, R3.6). When `cost_hi` is non-null this is the low end (unknown TTL write priced at 5m).
-   * The output term is omitted when output is unknown (`output_excluded`).
-   */
+  /** Total cost (R3.5, R3.6). One number or unpriced: no range and no omitted term exists (revision 11). */
   readonly cost: PricedAmount;
-  /** High end of the range for `w_unknown_ttl` (R3.5). Null when there is no such write. */
-  readonly cost_hi: PricedAmount | null;
-  /** Output term left out because output is unknown (R2.3, R16.1). */
-  readonly output_excluded: boolean;
   readonly modifier_reason: UnpricedModifierReason | null;
   /** Null when unpriced. */
   readonly rates: ResolvedRates | null;
@@ -1371,9 +1550,13 @@ export interface ModelTotals {
   /** `total_input` plus output (the lower bound where the output is unknown): the denominator of R3.9. */
   readonly tokens_total: Tokens;
   readonly usd_pico: Pico | null;
-  readonly usd_pico_hi: Pico | null;
   readonly tokens_unpriced: Tokens;
   readonly output_unknown: number;
+  /**
+   * False for a row that holds responses of tainted chains or an unverified model (R0.9 effect 1). A Claude row is
+   * keyed by the candidate model, so it can hold tainted responses and is then not verified.
+   */
+  readonly model_verified: boolean;
 }
 
 /** Per-provider totals (R14.5 `totals`). Sums run over `countsInTotals` responses inside the window (R5.8, R5.10). */
@@ -1389,10 +1572,8 @@ export interface ProviderTotals {
   readonly tokens_total: Tokens;
   /** One row per model, sorted by model id; the unverified row (`null`) last. */
   readonly models: readonly ModelTotals[];
-  /** Picodollars, low end. Null when nothing was priced. */
+  /** Picodollars. Null when nothing was priced. */
   readonly usd_pico: Pico | null;
-  /** High end when unknown-TTL writes exist (R3.5), else equal to `usd_pico`. */
-  readonly usd_pico_hi: Pico | null;
   readonly tokens_unpriced: Tokens;
   /** Responses with unknown output (R16.1 `V`). */
   readonly output_unknown: number;
@@ -1442,6 +1623,24 @@ export interface HeadlineFigures {
   readonly hi_d: Pico;
   readonly hi_c: Pico;
   readonly clo_c: Pico;
+  /** R0.9, R16.1. Per provider; chain and family counts exclude live families. All token values are `responseTokens`. */
+  readonly taint_by_provider: Readonly<
+    Record<
+      Provider,
+      {
+        readonly chains_total: number;
+        readonly chains_tainted: number;
+        readonly families_total: number;
+        readonly families_tainted: number;
+        readonly responses_in_tainted_chains: number;
+        readonly tokens_in_tainted_chains: Tokens;
+        readonly tokens_total: Tokens;
+        readonly families_live_skipped: number;
+        /** C36 exceeded: `10 * families_tainted > 3 * families_total` or `10 * tokens_in_tainted_chains > 3 * tokens_total`. */
+        readonly warn: boolean;
+      }
+    >
+  >;
 }
 
 export const REPORT_COMMANDS = ["default", "session", "evidence", "doctor", "pricing"] as const;

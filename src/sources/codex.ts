@@ -1,13 +1,20 @@
-// Codex rollout parser (spec-1, revision 7). Binding spec: docs/methodology.md. Rule ids are cited in comments.
+// Codex rollout parser (spec-1, revision 11). Binding spec: docs/methodology.md. Rule ids are cited in comments.
 //
 // Contract:
 // - Reads `codex-*` files of a DiscoveredFile list (plain .jsonl and archived .jsonl.zst through src/io/lines.ts).
-// - Never throws on bad input: failures become coverage counters (R1.3, R17.1).
+// - Never throws on bad input: failures become coverage counters (R1.3, R17.1) and taint facts (R0.9).
 // - Keeps only the fields of R1.2. Message text, paths and every other free text are parsed and dropped.
 // - Accounting source is `token_usage_record.usage` keyed by `response_id` (R2.9). Cumulative totals are never summed.
+// - Every file is read in full, whatever its version or position (R5.9, R15.7). Every file is parsed with the same
+//   readers (structural read, R15.7). Version status is a property of the record set: V(S) is the set of `cli_version`
+//   labels of every `session_meta` with `id = S` in the scan, own or copied (R15.7).
 // - Every decision is a function of the SET of distinct records (R4.12 equality), never of line order, file order or
 //   how a thread is split over files (R4.10). Files are indexed in a canonical order (sorted by path) so that the
 //   index is independent of the order of the input list.
+// - Integrity (R0.9): the parser does not decide taint. It reports `IntegrityFacts`: the chains seen, the family groups
+//   (links (i), (ii), (iii)), the taint triggers and per-file facts. The graph turns them into taint. A trigger names
+//   one chain (or the provider), so the trigger list is a set that only grows under a split (R4.10).
+//   Model attribution (R2.10) is computed as if the chain were untainted; the graph overrides it with `chain_tainted`.
 //
 // Output is deterministic: responses, streams, links and the other lists are sorted.
 
@@ -15,10 +22,12 @@ import { newLineStats, readLines } from "../io/lines.js";
 import type { DiscoveredFile } from "../discover.js";
 import {
   CODEX_FULL_VERSIONS,
-  CONSTANTS,
   EFFORTS,
+  TAINT_REASONS,
+  chainIdOf,
   emptyCoverage,
   type Assumption,
+  type ChainId,
   type ChainKey,
   type CodexCompaction,
   type CodexParseResult,
@@ -27,8 +36,11 @@ import {
   type DedupConflict,
   type Effort,
   type ExcludedRecord,
+  type FileFacts,
   type FileInfo,
   type ForkInfo,
+  type IntegrityFacts,
+  type LedgerEntry,
   type Link,
   type ModelAttribution,
   type ModelSource,
@@ -37,8 +49,9 @@ import {
   type RequestKind,
   type ResponseFlag,
   type Stream,
-  type StreamIntegrityReason,
   type SupportLevel,
+  type TaintReason,
+  type TaintTrigger,
   type UnlinkedReason,
   type UsageBuckets,
 } from "../model/types.js";
@@ -119,6 +132,11 @@ const U_OUT = 3;
 const U_RS = 4;
 const U_TOTAL = 5;
 
+/** R0.9 family node id of a Codex thread: the thread only, never the session (a thread can carry several, R4.11). */
+function cid(thread: string): ChainId {
+  return chainIdOf({ provider: "codex", root_session: "", thread });
+}
+
 // ---------------------------------------------------------------------------
 // Records (R1.2 allowlist, R4.12 projection)
 // ---------------------------------------------------------------------------
@@ -157,6 +175,9 @@ interface TurF {
   us: FieldState[];
   tt: number | null;
   tt_state: FieldState;
+  /** R1.2, R4.12: the integer members of `thread_token_usage` and `turn_token_usage` (sorted by name). Part of the
+   * retained projection, so two occurrences that differ here are not the same record (R4.4). Never printed. */
+  cum: string;
 }
 interface CompF {
   window_number: number | null;
@@ -200,6 +221,19 @@ function isDecision(r: Rec): boolean {
 function fieldState(v: unknown): FieldState {
   if (typeof v !== "number") return "missing";
   return Number.isSafeInteger(v) && v >= 0 ? "ok" : "range";
+}
+
+/** Integer members of a cumulative counter object, sorted by member name, as a stable string (R1.2, R4.12). */
+function cumMembers(v: unknown): string | null {
+  if (!isObj(v)) return v === undefined ? null : "!";
+  // A member outside R2.15 is reduced to the state `"r"`; its raw value is not kept.
+  const out: Array<[string, number | "r"]> = [];
+  for (const k of Object.keys(v)) {
+    const x = (v as Obj)[k];
+    if (typeof x === "number" && Number.isInteger(x)) out.push([k, Number.isSafeInteger(x) && x >= 0 ? x + 0 : "r"]);
+  }
+  out.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return JSON.stringify(out);
 }
 
 function draftOf(obj: unknown): Draft {
@@ -296,10 +330,12 @@ function draftOf(obj: unknown): Draft {
         us,
         tt: tt_state === "ok" ? (ttRaw as number) : null,
         tt_state,
+        cum: JSON.stringify([cumMembers(tu), cumMembers(p["turn_token_usage"])]),
       };
       const key = JSON.stringify([
         "token_usage_record", tsKey, ordKey, tur.response_id, tur.thread_id, tur.session_id, tur.turn_id,
         us.map((s, i) => (s === "ok" ? u[i] : s === "range" ? "r" : null)), tt_state === "ok" ? tur.tt : tt_state === "range" ? "r" : null,
+        tur.cum,
       ]);
       return { kind: "tur", known: true, key, ...base, tur };
     }
@@ -341,13 +377,19 @@ interface ScannedFile {
   recs: Set<Rec>;
   meta_lines: Map<string, number>;
   other_lines: number;
+  /** Parsed `token_count` event lines of this physical file (R2.9, R17.6 physical line counter). */
+  tokcount_lines: number;
+}
+
+function blankScanned(df: DiscoveredFile, index: number): ScannedFile {
+  return {
+    index, df, readable: true, lines: 0, parse_errors: 0, truncated_tail: 0, known: 0, unlisted: 0,
+    recs: new Set(), meta_lines: new Map(), other_lines: 0, tokcount_lines: 0,
+  };
 }
 
 async function scanFile(df: DiscoveredFile, index: number, intern: Map<string, Rec>): Promise<ScannedFile> {
-  const sf: ScannedFile = {
-    index, df, readable: true, lines: 0, parse_errors: 0, truncated_tail: 0, known: 0, unlisted: 0,
-    recs: new Set(), meta_lines: new Map(), other_lines: 0,
-  };
+  const sf = blankScanned(df, index);
   const stats = newLineStats();
   const drafts: Draft[] = [];
   let lines = 0;
@@ -391,6 +433,7 @@ async function scanFile(df: DiscoveredFile, index: number, intern: Map<string, R
     rec.lines++;
     rec.files.add(index);
     sf.recs.add(rec);
+    if (d.kind === "tokcount") sf.tokcount_lines++;
     if (d.kind === "meta" && d.meta) sf.meta_lines.set(d.meta.label, (sf.meta_lines.get(d.meta.label) ?? 0) + 1);
     else sf.other_lines++;
   }
@@ -403,13 +446,18 @@ async function scanFile(df: DiscoveredFile, index: number, intern: Map<string, R
 
 interface FileA {
   sf: ScannedFile;
-  /** R15.7: has session_meta records and none of a supported version. */
-  coverage_only: boolean;
+  /** Every session_meta of the file with a string id (own or copied). */
+  metas: Rec[];
+  /** R4.11: session_meta records of the file that are not a copied parent. */
+  own_metas: Rec[];
   own_ids: Set<string>;
   tur_ids: Set<string>;
   ident: Set<string>;
+  /** R0.9 named chains: every session_meta id (own or copied) and every token_usage_record thread_id. Thread ids. */
+  named: Set<string>;
   assignment: "assigned" | "unassigned" | "conflict";
   copy_exposed: boolean;
+  has_tur: boolean;
   /** Stream id this file is assigned to (|I| = 1), else null. */
   stream: string | null;
   versions: string[];
@@ -422,19 +470,17 @@ interface StreamB {
   assigned: number[];
   own_metas: Rec[];
   tur: Rec[];
-  integrity: Set<StreamIntegrityReason>;
-  supported: boolean;
   root: string;
-  primary: Rec;
+  /** The session_meta that describes the thread: an own one, else a copied one (the id is in V(S), so one exists). */
+  pm: MetaF;
   label: string;
   ord_verified: boolean;
   fork: { from: string; hist: number | null; resolved: boolean } | null;
-  tcs: Rec[]; // certain provenance, sorted by position
+  /** G(S) (R2.17 (c)): every turn_context of the files assigned to the stream, sorted by position. */
+  tcs: Rec[];
   tcs_by_turn: Map<string, Rec[]>;
   markers: Rec[]; // sorted by position
-  single_model: string | null; // R2.17 (b): one valid model over all certain tcs (and the guard extras)
-  /** Guard only: models of turn contexts held by files that may hold this stream's copied prefix (see guardExtras). */
-  extra_models_by_turn: Map<string, Set<string | null>>;
+  single_model: string | null; // R2.17 (b): one valid model over G(S)
   start_ms: number | null;
   chain: ChainKey;
 }
@@ -482,22 +528,42 @@ function ordinalVerified(recs: readonly Rec[]): boolean {
   return true;
 }
 
+/** Collects R0.9 triggers as a set of single-name triggers, so that a split can only add to the set (R4.10). */
+class TriggerSet {
+  private readonly map = new Map<string, TaintTrigger>();
+
+  /** A reason that names the given threads (thread ids, not yet chain ids). An empty list names nothing. */
+  threads(reason: TaintTrigger["reason"], threads: Iterable<string>): void {
+    for (const t of threads) {
+      const id = cid(t);
+      this.map.set(`${reason}\u0000${id}`, { reason, names: [id] });
+    }
+  }
+
+  /** A reason that names no chain: it taints every chain of the provider (R0.9). */
+  provider(reason: TaintTrigger["reason"]): void {
+    this.map.set(`${reason}\u0000*`, { reason, names: "provider" });
+  }
+
+  list(): TaintTrigger[] {
+    const order = (r: TaintReason): number => TAINT_REASONS.indexOf(r);
+    return [...this.map.entries()]
+      .sort(([ka, a], [kb, b]) => order(a.reason) - order(b.reason) || (ka < kb ? -1 : ka > kb ? 1 : 0))
+      .map(([, v]) => v);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // parseCodex
 // ---------------------------------------------------------------------------
 
-export async function parseCodex(files: readonly DiscoveredFile[], opts: ParseOptions = {}): Promise<CodexParseResult> {
+export async function parseCodex(files: readonly DiscoveredFile[], _opts: ParseOptions = {}): Promise<CodexParseResult> {
   const cov = emptyCoverage();
   const assumptions = new Set<Assumption>();
+  const triggers = new TriggerSet();
 
-  // Canonical file order: independent of the order of the input list (R4.10).
-  let input = files.filter((f) => f.agent === "codex").slice().sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  // R5.9 --fast: skip files whose mtime is older than `since` minus C29.
-  if (opts.fastPrefilter === true && opts.window) {
-    const cutoff = opts.window.since_ms - CONSTANTS.FAST_PREFILTER_DAYS * 86_400_000;
-    input = input.filter((f) => f.mtimeMs >= cutoff);
-    assumptions.add("mtime_prefilter_on");
-  }
+  // Canonical file order: independent of the order of the input list (R4.10). Every file is read (R5.9).
+  const input = files.filter((f) => f.agent === "codex").slice().sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
   const intern = new Map<string, Rec>();
   const scanned: ScannedFile[] = [];
@@ -506,7 +572,9 @@ export async function parseCodex(files: readonly DiscoveredFile[], opts: ParseOp
     try {
       scanned.push(await scanFile(df, i, intern));
     } catch {
-      scanned.push({ index: i, df, readable: false, lines: 0, parse_errors: 0, truncated_tail: 0, known: 0, unlisted: 0, recs: new Set(), meta_lines: new Map(), other_lines: 0 });
+      const bad = blankScanned(df, i);
+      bad.readable = false;
+      scanned.push(bad);
     }
   }
 
@@ -515,6 +583,7 @@ export async function parseCodex(files: readonly DiscoveredFile[], opts: ParseOp
   for (const sf of scanned) {
     if (!sf.readable) {
       cov.files_unreadable++;
+      triggers.provider("file_unreadable"); // R0.9, R0.2, R17.1: an unreadable file taints every Codex chain
       continue;
     }
     cov.lines_total += sf.lines;
@@ -532,42 +601,65 @@ export async function parseCodex(files: readonly DiscoveredFile[], opts: ParseOp
 
   // ---- FS (R4.13): every forked_from_id of any session_meta of any version ------------------------------------
   const FS = new Set<string>();
-  for (const rec of intern.values()) {
-    if (rec.kind === "meta" && rec.meta && rec.meta.forked_from_id !== null) FS.add(rec.meta.forked_from_id);
+  // ---- V(S) (R15.7): cli_version labels of every session_meta with id = S, own or copied ------------------------
+  const versionsOf = new Map<string, Set<string>>();
+  const metasById = new Map<string, Rec[]>();
+  for (const rec of [...intern.values()].sort(cmpKey)) {
+    if (rec.kind !== "meta" || !rec.meta) continue;
+    const m = rec.meta;
+    if (m.forked_from_id !== null) FS.add(m.forked_from_id);
+    if (m.id === null) {
+      triggers.provider("unattributed_record"); // R0.9, R2.13: a session_meta without a string id
+      continue;
+    }
+    let vs = versionsOf.get(m.id);
+    if (vs === undefined) versionsOf.set(m.id, (vs = new Set()));
+    vs.add(m.label);
+    const arr = metasById.get(m.id);
+    if (arr) arr.push(rec);
+    else metasById.set(m.id, [rec]);
   }
+  /** R15.7: S is of a supported version iff V(S) is non-empty and every member has full support. */
+  const supported = (id: string): boolean => {
+    const vs = versionsOf.get(id);
+    if (vs === undefined || vs.size === 0) return false;
+    for (const v of vs) if (!FULL_VERSIONS.has(v)) return false;
+    return true;
+  };
 
-  // ---- per-file identity (R4.11, R4.13, R15.7) ----------------------------------------------------------------
+  // ---- per-file identity (R4.11, R4.13), for every file whatever its version (R15.7) ---------------------------
   const fileA: FileA[] = [];
   for (const sf of scanned) {
     if (!sf.readable) continue;
-    const metas = [...sf.recs].filter((r) => r.kind === "meta" && r.meta);
-    const supportedMetas = metas.filter((r) => FULL_VERSIONS.has((r.meta as MetaF).label) && (r.meta as MetaF).id !== null);
-    const supportedAny = metas.some((r) => FULL_VERSIONS.has((r.meta as MetaF).label));
-    const coverage_only = metas.length > 0 && !supportedAny;
+    const metas = [...sf.recs].filter((r) => r.kind === "meta" && r.meta && r.meta.id !== null).sort(cmpKey);
     const own_ids = new Set<string>();
+    const own_metas: Rec[] = [];
     const tur_ids = new Set<string>();
-    if (!coverage_only) {
-      // R4.11: a session_meta is non-own iff another (distinct) session_meta of the file forks from its id.
-      for (const m of supportedMetas) {
-        const mid = (m.meta as MetaF).id as string;
-        const nonOwn = supportedMetas.some((m2) => m2 !== m && (m2.meta as MetaF).forked_from_id === mid);
-        if (!nonOwn) own_ids.add(mid);
+    let hasTur = false;
+    // R4.11: a session_meta is non-own iff another (distinct) session_meta of the file forks from its id.
+    for (const m of metas) {
+      const mid = (m.meta as MetaF).id as string;
+      const nonOwn = metas.some((m2) => m2 !== m && (m2.meta as MetaF).forked_from_id === mid);
+      if (!nonOwn) {
+        own_ids.add(mid);
+        own_metas.push(m);
       }
-      for (const r of sf.recs) if (r.kind === "tur" && r.tur && r.tur.thread_id !== null) tur_ids.add(r.tur.thread_id);
+    }
+    for (const r of sf.recs) {
+      if (r.kind !== "tur" || !r.tur) continue;
+      hasTur = true;
+      if (r.tur.thread_id !== null) tur_ids.add(r.tur.thread_id);
     }
     const ident = new Set<string>([...own_ids, ...tur_ids]);
-    let assignment: FileA["assignment"] = ident.size === 1 ? "assigned" : ident.size === 0 ? "unassigned" : "conflict";
-    // R4.13 copy exposure.
+    const assignment: FileA["assignment"] = ident.size === 1 ? "assigned" : ident.size === 0 ? "unassigned" : "conflict";
+    // R4.13 copy exposure: decided over the whole scan (FS), never inside one file.
     let copy_exposed = false;
-    if (!coverage_only) {
-      for (const x of own_ids) {
-        if (FS.has(x) && !tur_ids.has(x)) copy_exposed = true;
-      }
-    }
-    if (coverage_only) assignment = "unassigned";
+    for (const x of own_ids) if (FS.has(x) && !tur_ids.has(x)) copy_exposed = true;
+    const named = new Set<string>(ident);
+    for (const m of metas) named.add((m.meta as MetaF).id as string);
     fileA.push({
-      sf, coverage_only, own_ids, tur_ids, ident, assignment, copy_exposed,
-      stream: !coverage_only && assignment === "assigned" ? (ident.values().next().value as string) : null,
+      sf, metas, own_metas, own_ids, tur_ids, ident, named, assignment, copy_exposed, has_tur: hasTur,
+      stream: assignment === "assigned" ? (ident.values().next().value as string) : null,
       versions: sortedUnique(metas.map((r) => (r.meta as MetaF).label)),
       label: "unlisted",
     });
@@ -575,79 +667,119 @@ export async function parseCodex(files: readonly DiscoveredFile[], opts: ParseOp
   const fileAByIndex = new Map<number, FileA>(fileA.map((f) => [f.sf.index, f]));
 
   for (const fa of fileA) {
-    if (fa.coverage_only) continue;
     if (fa.assignment === "assigned") cov.files_assigned_by_stream++;
-    else if (fa.assignment === "unassigned") cov.files_unassigned_stream++;
-    else cov.files_stream_conflict++;
-    if (fa.copy_exposed) cov.files_copy_exposed++;
+    else if (fa.assignment === "unassigned") {
+      cov.files_unassigned_stream++;
+      // R0.9 unattributed_record: a non-empty file whose identity set is empty. Its records can belong to any thread.
+      if (fa.sf.recs.size > 0) triggers.provider("unattributed_record");
+    } else {
+      cov.files_stream_conflict++;
+      triggers.threads("stream_unresolved", fa.ident); // R4.11: the ids of I(F)
+    }
+    if (fa.copy_exposed) {
+      cov.files_copy_exposed++;
+      triggers.threads("copy_exposed", fa.named); // R4.13: the chains named by F
+    }
+  }
+
+  // ---- R4.11: two own session_metas with one id that differ in session_id, forked_from_id or history start --------
+  {
+    const ownById = new Map<string, Rec[]>();
+    for (const fa of fileA) {
+      for (const m of fa.own_metas) {
+        const id = (m.meta as MetaF).id as string;
+        const arr = ownById.get(id);
+        if (arr) {
+          if (!arr.includes(m)) arr.push(m);
+        } else ownById.set(id, [m]);
+      }
+    }
+    for (const [id, ms] of ownById) {
+      if (ms.length < 2) continue;
+      // A missing value is a value of its own: abstaining on a doubt (R4.11).
+      const sess = new Set(ms.map((m) => (m.meta as MetaF).session_id));
+      const forks = new Set(ms.map((m) => (m.meta as MetaF).forked_from_id));
+      const hists = new Set(ms.map((m) => (m.meta as MetaF).hist_start));
+      if (sess.size > 1 || forks.size > 1 || hists.size > 1) triggers.threads("stream_unresolved", [id]);
+    }
+  }
+
+  // ---- chains seen by a structural read of any version (R15.7, R0.9) ----------------------------------------------
+  const chainThreads = new Set<string>();
+  for (const fa of fileA) for (const t of fa.named) chainThreads.add(t);
+  for (const t of chainThreads) {
+    // R15.7 / R0.9 version_unverified: a stream of a version without full support. V(S) can be empty only for a
+    // thread that has token_usage_records and no session_meta at all anywhere in the scan.
+    if (!supported(t)) triggers.threads("version_unverified", [t]);
+  }
+
+  // ---- R2.17 (d) turn model conflict (scan-wide, every file of every version) ------------------------------------
+  {
+    const modelsByTurn = new Map<string, Set<string | null>>();
+    for (const rec of intern.values()) {
+      if (rec.kind !== "tc" || !rec.tc || rec.tc.turn_id === null) continue;
+      // A context without a usable model is a null member of TM(T), so model A plus null conflicts (R2.17 (d), decided).
+      let set = modelsByTurn.get(rec.tc.turn_id);
+      if (set === undefined) modelsByTurn.set(rec.tc.turn_id, (set = new Set()));
+      set.add(rec.tc.model);
+    }
+    const conflicted = new Set<string>();
+    for (const [t, set] of modelsByTurn) if (set.size >= 2) conflicted.add(t);
+    if (conflicted.size > 0) {
+      for (const fa of fileA) {
+        let holds = false;
+        for (const r of fa.sf.recs) {
+          const t = r.kind === "tc" ? r.tc?.turn_id : r.kind === "tur" ? r.tur?.turn_id : null;
+          if (t !== null && t !== undefined && conflicted.has(t)) {
+            holds = true;
+            break;
+          }
+        }
+        if (holds) triggers.threads("turn_model_conflicted", fa.named);
+      }
+    }
   }
 
   // ---- logical streams (R4.11) ---------------------------------------------------------------------------------
+  // A stream exists for a thread of a supported version that has an own session_meta or a token_usage_record. The
+  // version status is taken from V(S) alone (R15.7), so it does not depend on which file holds which record.
   const builds = new Map<string, StreamB>();
-  const ensure = (id: string): StreamB => {
-    let s = builds.get(id);
-    if (s === undefined) {
-      s = {
-        id, files: new Set(), assigned: [], own_metas: [], tur: [], integrity: new Set(), supported: false, root: id,
-        primary: undefined as unknown as Rec, label: "unlisted", ord_verified: false, fork: null, tcs: [], tcs_by_turn: new Map(),
-        markers: [], single_model: null, extra_models_by_turn: new Map(), start_ms: null, chain: { provider: "codex", root_session: id, thread: id },
-      };
-      builds.set(id, s);
+  const turByThread = new Map<string, Rec[]>();
+  for (const rec of [...intern.values()].sort(cmpKey)) {
+    if (rec.kind !== "tur" || !rec.tur || rec.tur.thread_id === null) continue;
+    const arr = turByThread.get(rec.tur.thread_id);
+    if (arr) arr.push(rec);
+    else turByThread.set(rec.tur.thread_id, [rec]);
+  }
+  const candidateIds = new Set<string>(turByThread.keys());
+  for (const fa of fileA) for (const id of fa.own_ids) candidateIds.add(id);
+  for (const id of [...candidateIds].sort()) {
+    if (!supported(id)) continue;
+    const own: Rec[] = [];
+    const filesOfStream = new Set<number>();
+    const assigned: number[] = [];
+    for (const fa of fileA) {
+      if (!fa.ident.has(id)) continue;
+      filesOfStream.add(fa.sf.index);
+      if (fa.assignment === "assigned") assigned.push(fa.sf.index);
+      for (const m of fa.own_metas) if ((m.meta as MetaF).id === id && !own.includes(m)) own.push(m);
     }
-    return s;
-  };
-  const turRecs: Rec[] = [];
-  for (const fa of fileA) {
-    if (fa.coverage_only) continue;
-    for (const id of fa.ident) {
-      const s = ensure(id);
-      s.files.add(fa.sf.index);
-      if (fa.assignment === "conflict") s.integrity.add("file_stream_conflict");
-      if (fa.assignment === "assigned") s.assigned.push(fa.sf.index);
-    }
-    // R4.13 (a): every stream whose id is in own_ids(F) intersect FS, for a copy-exposed F
-    if (fa.copy_exposed) for (const x of fa.own_ids) if (FS.has(x)) ensure(x).integrity.add("copy_exposed_file");
-    // own session_metas of this file (also in a conflict file, R4.11: the identity is read from them)
-    const metas = [...fa.sf.recs].filter((r) => r.kind === "meta" && r.meta);
-    const supportedMetas = metas.filter((r) => FULL_VERSIONS.has((r.meta as MetaF).label) && (r.meta as MetaF).id !== null);
-    for (const m of supportedMetas) {
-      const mid = (m.meta as MetaF).id as string;
-      if (fa.own_ids.has(mid) && !ensure(mid).own_metas.includes(m)) ensure(mid).own_metas.push(m);
-    }
+    own.sort(cmpKey);
+    const copies = (metasById.get(id) ?? []).slice().sort(cmpKey);
+    const pool = own.length > 0 ? own : copies;
+    const primary = pool.find((m) => (m.meta as MetaF).forked_from_id !== null) ?? (pool[0] as Rec);
+    builds.set(id, {
+      id, files: filesOfStream, assigned, own_metas: own, tur: turByThread.get(id) ?? [], root: id,
+      pm: primary.meta as MetaF, label: "unlisted", ord_verified: false, fork: null, tcs: [], tcs_by_turn: new Map(),
+      markers: [], single_model: null, start_ms: null, chain: { provider: "codex", root_session: id, thread: id },
+    });
   }
-  // token_usage_records: accounted by their own thread_id, whatever the file (R2.9, R4.11)
-  for (const rec of intern.values()) {
-    if (rec.kind !== "tur" || !rec.tur) continue;
-    turRecs.push(rec);
-  }
-  turRecs.sort(cmpKey);
-  const verifiedFileOf = (rec: Rec): boolean => [...rec.files].some((fi) => {
-    const fa = fileAByIndex.get(fi);
-    return fa !== undefined && !fa.coverage_only;
-  });
-  for (const rec of turRecs) {
-    const tur = rec.tur as TurF;
-    if (!verifiedFileOf(rec) || tur.thread_id === null) continue;
-    ensure(tur.thread_id).tur.push(rec);
-  }
-
-  const streams: StreamB[] = [];
-  for (const s of [...builds.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
-    s.own_metas.sort(cmpKey);
-    s.supported = s.own_metas.length > 0; // R15.7: a stream exists only through a supported own session_meta
-    if (!s.supported) continue;
-    streams.push(s);
-  }
-  const streamById = new Map<string, StreamB>(streams.map((s) => [s.id, s]));
+  const streams: StreamB[] = [...builds.values()];
+  const streamById = builds;
 
   for (const s of streams) {
-    // primary own meta: the one with a fork reference if any, deterministic by key
-    s.primary = s.own_metas.find((m) => (m.meta as MetaF).forked_from_id !== null) ?? (s.own_metas[0] as Rec);
-    const sessionIds = sortedUnique(s.own_metas.map((m) => (m.meta as MetaF).session_id).filter((x): x is string => x !== null));
-    if (sessionIds.length > 1) s.integrity.add("divergent_session_meta");
-    const forks = new Set(s.own_metas.map((m) => (m.meta as MetaF).forked_from_id));
-    const hists = new Set(s.own_metas.map((m) => (m.meta as MetaF).hist_start));
-    if (forks.size > 1 || hists.size > 1) s.integrity.add("divergent_session_meta"); // R4.11
+    const pm = s.pm;
+    const sessionIds = sortedUnique((s.own_metas.length > 0 ? s.own_metas : (metasById.get(s.id) ?? [])).map((m) => (m.meta as MetaF).session_id).filter((x): x is string => x !== null));
     let root = sessionIds[0];
     if (root === undefined) {
       const turSessions = sortedUnique(s.tur.map((r) => (r.tur as TurF).session_id).filter((x): x is string => x !== null));
@@ -655,58 +787,31 @@ export async function parseCodex(files: readonly DiscoveredFile[], opts: ParseOp
     }
     s.root = root;
     s.chain = { provider: "codex", root_session: root, thread: s.id };
-    s.label = sortedUnique(s.own_metas.map((m) => (m.meta as MetaF).label))[0] ?? "unlisted";
+    s.label = sortedUnique((s.own_metas.length > 0 ? s.own_metas : (metasById.get(s.id) ?? [])).map((m) => (m.meta as MetaF).label))[0] ?? "unlisted";
 
-    // Guard extras (split monotonicity, R4.10, R4.13). A copy-exposed file whose copied prefix may belong to this fork,
-    // and a file that resolves to several identities including this one, hold records that this stream cannot be
-    // shown not to own. They are never candidates (certain provenance only) but they count in every guard:
-    // the ordinal check (R4.12), the one-model guards (R2.17) and the settings markers (R2.10). In an unsplit scan
-    // such files are absent in the normal case, so the rule equals the spec text there.
-    const forkFrom = (s.primary.meta as MetaF).forked_from_id;
-    const extraRecs = new Set<Rec>();
-    for (const fa of fileA) {
-      if (fa.coverage_only || fa.stream === s.id) continue;
-      const exposedPrefix = fa.copy_exposed && forkFrom !== null && fa.own_ids.has(forkFrom);
-      const multi = fa.assignment === "conflict" && fa.ident.has(s.id);
-      if (exposedPrefix || multi) for (const r of fa.sf.recs) extraRecs.add(r);
-    }
     // records of the stream (R4.11): assigned files, own session_metas, its token_usage_records
     const recSet = new Set<Rec>();
     for (const fi of s.assigned) for (const r of (fileAByIndex.get(fi) as FileA).sf.recs) recSet.add(r);
     for (const m of s.own_metas) recSet.add(m);
     for (const r of s.tur) recSet.add(r);
-    for (const r of extraRecs) recSet.add(r);
     const recs = [...recSet];
     s.ord_verified = ordinalVerified(recs);
+    if (!s.ord_verified) triggers.threads("ordinal_unverified", [s.id]); // R4.12
     let start: number | null = null;
     for (const r of recs) if (r.ts !== null && (start === null || r.ts < start)) start = r.ts;
     s.start_ms = start;
 
-    // certain-provenance turn contexts (R4.13 (b)) and markers
-    const exposedFiles = new Set(s.assigned.filter((fi) => (fileAByIndex.get(fi) as FileA).copy_exposed));
-    const certain = new Set<Rec>();
+    // G(S): every turn_context of the assigned files, copied prefix included (R2.17 (c)); markers likewise.
+    const tcSet = new Set<Rec>();
     const markerSet = new Set<Rec>();
     for (const fi of s.assigned) {
-      const fa = fileAByIndex.get(fi) as FileA;
-      for (const r of fa.sf.recs) {
+      for (const r of (fileAByIndex.get(fi) as FileA).sf.recs) {
         if (r.kind === "marker") markerSet.add(r);
-        if (r.kind === "tc" && !exposedFiles.has(fi)) {
-          // a record shared with a copy-exposed file is still certain through the file that is not exposed
-          certain.add(r);
-        }
+        else if (r.kind === "tc") tcSet.add(r);
       }
     }
-    s.tcs = [...certain].sort((a, b) => cmpPos(a, b) || cmpKey(a, b));
-    for (const r of extraRecs) if (r.kind === "marker") markerSet.add(r);
+    s.tcs = [...tcSet].sort((a, b) => cmpPos(a, b) || cmpKey(a, b));
     s.markers = [...markerSet].sort((a, b) => cmpPos(a, b) || cmpKey(a, b));
-    for (const r of extraRecs) {
-      if (r.kind !== "tc" || certain.has(r)) continue;
-      const t = (r.tc as TcF).turn_id;
-      if (t === null) continue;
-      let set = s.extra_models_by_turn.get(t);
-      if (!set) s.extra_models_by_turn.set(t, (set = new Set()));
-      set.add((r.tc as TcF).model);
-    }
     for (const tc of s.tcs) {
       const t = (tc.tc as TcF).turn_id;
       if (t === null) continue;
@@ -716,106 +821,47 @@ export async function parseCodex(files: readonly DiscoveredFile[], opts: ParseOp
     }
     const models = new Set<string>();
     let anyInvalid = false;
-    const seeModel = (m: string | null): void => {
+    for (const tc of s.tcs) {
+      const m = (tc.tc as TcF).model;
       if (m === null) anyInvalid = true;
       else models.add(m);
-    };
-    for (const tc of s.tcs) seeModel((tc.tc as TcF).model);
-    for (const r of extraRecs) if (r.kind === "tc" && !certain.has(r)) seeModel((r.tc as TcF).model);
+    }
     s.single_model = !anyInvalid && models.size === 1 ? ([...models][0] as string) : null;
 
-    // fork facts (R4.9)
-    const pm = s.primary.meta as MetaF;
+    // fork facts (R4.9): a fork whose prefix cannot be cut is fork_prefix_unresolved and tainted (R0.9)
     if (pm.forked_from_id !== null) {
       const resolved = s.ord_verified && pm.hist_start !== null;
       s.fork = { from: pm.forked_from_id, hist: pm.hist_start, resolved };
+      if (!resolved) triggers.threads("fork_prefix_unresolved", [s.id]);
     }
   }
 
-  // ---- R4.13 (c): fork exposure -----------------------------------------------------------------------------------
-  // A fork stream S is prefix_exposed iff a copy-exposed file has an own id that is a fork ancestor of S. FA(S) is the
-  // forked_from_id of S and, recursively, the forked_from_id of every own session_meta of the scan whose id is already
-  // in FA(S) (a cycle stops the recursion). A set property of the scan, independent of order.
-  {
-    const exposedOwn = new Set<string>();
-    for (const fa of fileA) if (fa.copy_exposed) for (const x of fa.own_ids) exposedOwn.add(x);
-    if (exposedOwn.size > 0) {
-      const forkParents = new Map<string, Set<string>>();
-      for (const fa of fileA) {
-        if (fa.coverage_only) continue;
-        for (const r of fa.sf.recs) {
-          if (r.kind !== "meta" || !r.meta) continue;
-          const m = r.meta as MetaF;
-          if (m.id === null || m.forked_from_id === null || !fa.own_ids.has(m.id) || !FULL_VERSIONS.has(m.label)) continue;
-          let set = forkParents.get(m.id);
-          if (!set) forkParents.set(m.id, (set = new Set()));
-          set.add(m.forked_from_id);
-        }
-      }
-      for (const st of streams) {
-        if (st.fork === null) continue;
-        const fa = new Set<string>([st.fork.from]);
-        const queue = [st.fork.from];
-        while (queue.length > 0) {
-          const id = queue.pop() as string;
-          for (const up of forkParents.get(id) ?? []) {
-            if (!fa.has(up)) {
-              fa.add(up);
-              queue.push(up);
-            }
-          }
-        }
-        if ([...fa].some((x) => exposedOwn.has(x))) st.integrity.add("prefix_exposed");
-      }
-    }
-  }
-
-  // ---- unlisted-version copies of copy exposure for copy-exposed streams, versions per file ---------------------
-  // line labels for lines that are not session_meta (R15.7)
+  // ---- line labels (R15.7) and the version map of coverage -------------------------------------------------------
   for (const fa of fileA) {
-    const metas = [...fa.sf.recs].filter((r) => r.kind === "meta" && r.meta);
-    const own = metas.filter((r) => fa.own_ids.has((r.meta as MetaF).id ?? "\u0000"));
-    const pick = fa.coverage_only ? metas : own.length > 0 ? own : metas;
+    const own = fa.own_metas;
+    const pick = own.length > 0 ? own : fa.metas;
     const labels = sortedUnique(pick.map((r) => (r.meta as MetaF).label));
     if (labels.length > 0) fa.label = labels[0] as string;
     else if (fa.stream !== null && streamById.has(fa.stream)) fa.label = (streamById.get(fa.stream) as StreamB).label;
     else fa.label = "unlisted";
   }
   for (const fa of fileA) {
-    for (const [label, n] of fa.sf.meta_lines) {
-      cov.versions[label] = (cov.versions[label] ?? 0) + n;
-      if (!FULL_VERSIONS.has(label)) cov.lines_unverified_version += n;
-    }
-    if (fa.sf.other_lines > 0) {
-      cov.versions[fa.label] = (cov.versions[fa.label] ?? 0) + fa.sf.other_lines;
-      if (!FULL_VERSIONS.has(fa.label)) cov.lines_unverified_version += fa.sf.other_lines;
-    }
+    for (const [label, n] of fa.sf.meta_lines) cov.versions[label] = (cov.versions[label] ?? 0) + n;
+    if (fa.sf.other_lines > 0) cov.versions[fa.label] = (cov.versions[fa.label] ?? 0) + fa.sf.other_lines;
   }
 
-  for (const s of streams) {
-    cov.streams_total++;
-    if (!s.ord_verified) cov.streams_ordinal_unverified++;
-    if (s.fork && !s.fork.resolved) cov.streams_fork_prefix_unresolved++;
-  }
-
-  // ---- files without response id (R2.9) ------------------------------------------------------------------------
-  const orphanTokenCounts = new Set<Rec>();
-  for (const sf of scanned) {
-    if (!sf.readable) continue;
-    let hasTur = false;
-    const tokcounts: Rec[] = [];
-    for (const r of sf.recs) {
-      if (r.kind === "tur") hasTur = true;
-      else if (r.kind === "tokcount") tokcounts.push(r);
-    }
-    if (tokcounts.length > 0 && !hasTur) {
+  // ---- files without response id (R2.9): physical, per file -------------------------------------------------------
+  for (const fa of fileA) {
+    if (fa.sf.tokcount_lines > 0 && !fa.has_tur) {
       cov.files_without_response_id++;
-      for (const r of tokcounts) orphanTokenCounts.add(r);
+      cov.token_count_events_without_response_id += fa.sf.tokcount_lines;
+      // R0.9 unlogged_usage: the chains named by F, or the provider when F names none.
+      if (fa.named.size > 0) triggers.threads("unlogged_usage", fa.named);
+      else triggers.provider("unlogged_usage");
     }
   }
-  cov.token_count_events_without_response_id = orphanTokenCounts.size;
 
-  // ---- model attribution (R2.10, R2.17) ------------------------------------------------------------------------
+  // ---- model attribution (R2.10, R2.17), computed as for an untainted stream; the graph overrides it --------------
   interface Attr {
     source: ModelSource;
     candidate: string | null;
@@ -824,18 +870,14 @@ export async function parseCodex(files: readonly DiscoveredFile[], opts: ParseOp
   }
   const attribute = (s: StreamB, rec: Rec): Attr => {
     const tur = rec.tur as TurF;
-    // R2.10: an integrity_unverified stream verifies no model through any row. These two rows override all others.
-    if (s.integrity.has("prefix_exposed")) return { source: "prefix_exposed", candidate: null, verified: false, ctx: null };
-    if (s.integrity.size > 0) return { source: "stream_unverified", candidate: null, verified: false, ctx: null };
     const hasMarker = s.markers.length > 0;
     const own = tur.turn_id !== null ? s.tcs_by_turn.get(tur.turn_id) : undefined;
     if (own !== undefined && own.length > 0) {
       const earliest = own[0] as Rec; // tcs_by_turn inherits the position order of s.tcs
       const ms = new Set(own.map((t) => (t.tc as TcF).model));
-      for (const m of s.extra_models_by_turn.get(tur.turn_id as string) ?? []) ms.add(m);
       const single = ms.size === 1 ? ([...ms][0] as string | null) : null;
       let settingsExcluded = !hasMarker;
-      if (hasMarker && s.ord_verified && s.integrity.size === 0 && earliest.ord !== null && rec.ord !== null) {
+      if (hasMarker && s.ord_verified && earliest.ord !== null && rec.ord !== null) {
         // "between" is symmetric: a usage record can be logged before the context of its own turn.
         let eo = earliest.ord;
         for (const t of own) if ((t.ord ?? Number.POSITIVE_INFINITY) < eo) eo = t.ord as number;
@@ -861,50 +903,61 @@ export async function parseCodex(files: readonly DiscoveredFile[], opts: ParseOp
       return { source: "inherited_prefix", candidate: cand, verified: false, ctx: tc };
     }
     const verified =
-      s.ord_verified && s.integrity.size === 0 && (s.fork === null || (s.fork.resolved && tc.ord !== null && s.fork.hist !== null && tc.ord >= s.fork.hist)) &&
+      s.ord_verified && (s.fork === null || (s.fork.resolved && tc.ord !== null && s.fork.hist !== null && tc.ord >= s.fork.hist)) &&
       s.single_model !== null && !hasMarker;
     return { source: verified ? "carried_verified" : "carried_unverified", candidate: cand, verified, ctx: tc };
   };
 
   // ---- classify every token_usage_record Rec ------------------------------------------------------------------
   const excluded: ExcludedRecord[] = [];
+  const ledger: LedgerEntry[] = []; // event-time ledger of the logical counters (LEDGER_COUNT_FIELDS)
   const unverifiedKeys = new Set<string>();
-  const verifiedKeyed = new Map<string, Rec[]>(); // response_id -> distinct Recs (mappable, supported version)
+  const verifiedKeyed = new Map<string, Rec[]>(); // response_id -> distinct Recs (supported thread)
+  const turRecs = [...intern.values()].filter((r) => r.kind === "tur" && r.tur).sort(cmpKey);
 
   const filesOf = (rec: Rec): number[] => [...rec.files].sort((a, b) => a - b);
   for (const rec of turRecs) {
     const tur = rec.tur as TurF;
-    const verifiedFile = verifiedFileOf(rec);
-    const stream = tur.thread_id !== null ? streamById.get(tur.thread_id) : undefined;
-    const versionOk = verifiedFile && (tur.thread_id === null || stream !== undefined);
-    if (!versionOk) {
-      // R15.7: coverage only. Counted, never accounted.
+    if (tur.thread_id === null) {
+      // R2.13: a record without a string thread_id belongs to no stream: unkeyed for accounting, and it taints every
+      // Codex chain (R0.9 unattributed_record), whatever its version.
+      triggers.provider("unattributed_record");
+      cov.records_usage_bearing++;
+      cov.records_unkeyed++;
+      ledger.push({ t_ms: rec.ts, chain: null, n: { records_usage_bearing: 1, records_unkeyed: 1 } });
+      continue;
+    }
+    const stream = streamById.get(tur.thread_id);
+    if (stream === undefined) {
+      // R15.7: a record of an unverified version. Counted, never accounted; no request-level rule runs on it.
       if (tur.response_id !== null) unverifiedKeys.add(tur.response_id);
-      if (stream !== undefined) {
-        excluded.push({ provider: "codex", chain: stream.chain, reason: "unverified_version", event_ms: rec.ts ?? 0, ordinal: rec.ord, files: filesOf(rec) });
-      }
+      cov.lines_unverified_version += rec.lines;
       continue;
     }
     cov.records_usage_bearing++;
-    if (tur.tt_state === "range") cov.fields_range_failed++;
+    const streamChainId = chainIdOf(stream.chain);
+    if (tur.tt_state === "range") {
+      cov.fields_range_failed++;
+      ledger.push({ t_ms: rec.ts, chain: streamChainId, n: { fields_range_failed: 1 } });
+    }
     if (tur.response_id === null) {
       cov.records_unkeyed++; // R2.13
-      if (stream !== undefined) {
-        excluded.push({ provider: "codex", chain: stream.chain, reason: "unkeyed", event_ms: rec.ts ?? 0, ordinal: rec.ord, files: filesOf(rec) });
-      }
+      ledger.push({ t_ms: rec.ts, chain: streamChainId, n: { records_usage_bearing: 1, records_unkeyed: 1 } });
+      triggers.threads("request_anomaly", [tur.thread_id]); // unkeyed with a known chain
+      excluded.push({ provider: "codex", chain: stream.chain, reason: "unkeyed", event_ms: rec.ts ?? 0, ordinal: rec.ord, files: filesOf(rec) });
       continue;
     }
-    if (tur.thread_id === null) {
-      cov.records_usage_unmappable++; // cannot be mapped to a chain, accounted nowhere
-      continue;
-    }
-    if (tur.us.some((x) => x === "missing") || rec.ts === null) cov.records_usage_unmappable++; // R2.12, R17.3 drift_unmappable
+    const unmappable = tur.us.some((x) => x === "missing") || rec.ts === null; // R2.12, R17.3 drift_unmappable
+    if (unmappable) cov.records_usage_unmappable++;
+    ledger.push({ t_ms: rec.ts, chain: streamChainId, n: unmappable ? { records_usage_bearing: 1, records_usage_unmappable: 1 } : { records_usage_bearing: 1 } });
     const arr = verifiedKeyed.get(tur.response_id);
     if (arr) arr.push(rec);
     else verifiedKeyed.set(tur.response_id, [rec]);
   }
   cov.requests_unverified_version = unverifiedKeys.size;
-  if (cov.requests_unverified_version > 0 || cov.lines_unverified_version > 0) assumptions.add("unverified_version");
+  if (cov.requests_unverified_version > 0 || cov.lines_unverified_version > 0 || [...chainThreads].some((t) => !supported(t))) {
+    assumptions.add("unverified_version");
+  }
 
   // ---- responses ----------------------------------------------------------------------------------------------
   const responses: CodexResponse[] = [];
@@ -960,12 +1013,17 @@ export async function parseCodex(files: readonly DiscoveredFile[], opts: ParseOp
     const recs = (verifiedKeyed.get(key) as Rec[]).slice().sort(cmpKey);
     cov.requests_total++;
     cov.responses_total++;
+    const keyTs = recs.map((r) => r.ts).filter((t): t is number => t !== null);
+    const keyT = keyTs.length > 0 ? Math.min(...keyTs) : null;
+    const keyChain = chainIdOf((streamById.get((recs[0]!.tur as TurF).thread_id as string) as StreamB).chain);
     if (recs.length > 1) {
-      // R4.4: not every occurrence is the same record.
+      // R4.4: not every occurrence is the same record. Every thread that holds an occurrence is tainted (R0.9).
       const sameUsage = recs.every((r) => usageKey(r) === usageKey(recs[0] as Rec));
       const kind = sameUsage ? "conflict_attribution" : "conflict_usage";
       cov.requests_conflict++;
       cov.requests_conflict_by_kind[kind]++;
+      ledger.push({ t_ms: keyT, chain: keyChain, n: { responses_total: 1, requests_conflict: 1 }, conflict_kinds: [kind] });
+      triggers.threads("request_anomaly", recs.map((r) => (r.tur as TurF).thread_id as string));
       const allFiles = [...new Set(recs.flatMap((r) => filesOf(r)))].sort((x, y) => x - y);
       conflicts.push({ provider: "codex", kind, key, files: allFiles, effect: "excluded" });
       // one excluded entry per (key, chain), at the earliest position of that chain
@@ -980,20 +1038,28 @@ export async function parseCodex(files: readonly DiscoveredFile[], opts: ParseOp
     }
     const rec = recs[0] as Rec;
     const tur = rec.tur as TurF;
+    const thread = tur.thread_id as string;
     const st = tur.us;
     const missing = st.some((x) => x === "missing") || rec.ts === null;
     const range = st.some((x) => x === "range");
-    if (missing) {
-      // R2.12: never treated as 0. Present counters that pass R2.15 are reported (input and output are the base fields).
-      if (st[U_IN] === "ok") cov.tokens_in_incomplete_responses += BigInt(tur.u[U_IN] as number);
-      if (st[U_OUT] === "ok") cov.tokens_in_incomplete_responses += BigInt(tur.u[U_OUT] as number);
-      responses.push(build(rec, "usage_incomplete", null, []));
+    if (range) {
+      // R2.15: the range check precedes everything else (as for Claude): a failing value makes the response
+      // usage_range_failed even when another counter is missing. Removed from accounting entirely, raw values not stored.
+      cov.responses_usage_range_failed++;
+      ledger.push({ t_ms: keyT, chain: keyChain, n: { responses_total: 1, responses_usage_range_failed: 1 } });
+      triggers.threads("request_anomaly", [thread]);
+      responses.push(build(rec, "usage_range_failed", null, []));
       continue;
     }
-    if (range) {
-      // R2.15: removed from accounting entirely, raw values not stored.
-      cov.responses_usage_range_failed++;
-      responses.push(build(rec, "usage_range_failed", null, []));
+    if (missing) {
+      // R2.12: never treated as 0. Present counters that pass R2.15 are reported (input and output are the base fields).
+      let inc = 0n;
+      if (st[U_IN] === "ok") inc += BigInt(tur.u[U_IN] as number);
+      if (st[U_OUT] === "ok") inc += BigInt(tur.u[U_OUT] as number);
+      cov.tokens_in_incomplete_responses += inc;
+      ledger.push({ t_ms: keyT, chain: keyChain, n: { responses_total: 1 }, tokens_incomplete: inc });
+      triggers.threads("request_anomaly", [thread]);
+      responses.push(build(rec, "usage_incomplete", null, []));
       continue;
     }
     const inn = BigInt(tur.u[U_IN] as number);
@@ -1006,6 +1072,8 @@ export async function parseCodex(files: readonly DiscoveredFile[], opts: ParseOp
     if (c + cw > inn || rs > out || total !== inn + out) {
       cov.responses_usage_invariant_failed++;
       cov.tokens_in_invalid_responses += inn + out;
+      ledger.push({ t_ms: keyT, chain: keyChain, n: { responses_total: 1, responses_usage_invariant_failed: 1 }, tokens_invalid: inn + out });
+      triggers.threads("request_anomaly", [thread]);
       responses.push(build(rec, "usage_invariant_failed", null, []));
       continue;
     }
@@ -1021,6 +1089,7 @@ export async function parseCodex(files: readonly DiscoveredFile[], opts: ParseOp
       reasoning: rs,
       reasoning_included_in_output: true,
     };
+    ledger.push({ t_ms: keyT, chain: keyChain, n: { responses_total: 1 } });
     responses.push(build(rec, null, usage, []));
   }
 
@@ -1071,8 +1140,6 @@ export async function parseCodex(files: readonly DiscoveredFile[], opts: ParseOp
   });
 
   // ---- streams, links, compactions, thread totals ---------------------------------------------------------------
-  for (const s of streams) if (s.integrity.size > 0) cov.streams_integrity_unverified++;
-
   const streamOut: Stream[] = streams.map((s) => {
     const fork: ForkInfo | null = s.fork ? { forked_from_id: s.fork.from, history_start_ordinal: s.fork.hist, prefix_resolved: s.fork.resolved } : null;
     return {
@@ -1081,8 +1148,6 @@ export async function parseCodex(files: readonly DiscoveredFile[], opts: ParseOp
       files: [...s.files].sort((a, b) => a - b),
       start_ms: s.start_ms,
       ordinal_verified: s.ord_verified,
-      integrity_unverified: s.integrity.size > 0,
-      integrity_reasons: [...s.integrity].sort(),
       fork,
       has_settings_marker: s.markers.length > 0,
     };
@@ -1091,7 +1156,7 @@ export async function parseCodex(files: readonly DiscoveredFile[], opts: ParseOp
   const links: Link[] = [];
   for (const s of streams) {
     const kind = kindOf(s);
-    const pm = s.primary.meta as MetaF;
+    const pm = s.pm;
     if (kind !== "subagent" && !pm.has_subagent) continue; // R5.6: a source.subagent.other thread is checked for linkage too
     let reason: UnlinkedReason | null = null;
     let parent: ChainKey | null = null;
@@ -1200,25 +1265,20 @@ export async function parseCodex(files: readonly DiscoveredFile[], opts: ParseOp
       return {
         index: sf.index, provider: "codex", source_kind: sf.df.kind, versions: [], support: "coverage_only", readable: false,
         archived: sf.df.kind === "codex-archived-zst", stream_assignment: "unassigned", copy_exposed: false, without_response_id: false, lines: 0,
+        mtime_ms: sf.df.mtimeMs,
       };
     }
-    let hasTur = false;
-    let hasTok = false;
-    for (const r of sf.recs) {
-      if (r.kind === "tur") hasTur = true;
-      else if (r.kind === "tokcount") hasTok = true;
-    }
-    let support: SupportLevel = "coverage_only";
-    if (!fa.coverage_only) {
-      const metaSupported = [...sf.recs].some((r) => r.kind === "meta" && r.meta && FULL_VERSIONS.has(r.meta.label));
-      support = metaSupported || (fa.stream !== null && streamById.has(fa.stream)) ? "full" : "coverage_only";
-    }
+    // R15.7: a file is of full support iff it names chains and every chain it names is of a supported version.
+    const support: SupportLevel = fa.named.size > 0 && [...fa.named].every((t) => supported(t)) ? "full" : "coverage_only";
     return {
       index: sf.index, provider: "codex", source_kind: sf.df.kind, versions: fa.versions, support, readable: true,
       archived: sf.df.kind === "codex-archived-zst", stream_assignment: fa.assignment, copy_exposed: fa.copy_exposed,
-      without_response_id: hasTok && !hasTur, lines: sf.lines,
+      without_response_id: sf.tokcount_lines > 0 && !fa.has_tur, lines: sf.lines, mtime_ms: sf.df.mtimeMs,
     };
   });
+
+  // ---- R0.9 integrity facts --------------------------------------------------------------------------------------
+  const integrity = integrityFacts(scanned, fileAByIndex, intern, chainThreads, triggers);
 
   return {
     provider: "codex",
@@ -1230,9 +1290,78 @@ export async function parseCodex(files: readonly DiscoveredFile[], opts: ParseOp
     streams: streamOut,
     files: fileInfos,
     assumptions: [...assumptions].sort(),
+    integrity,
+    ledger,
     compactions,
     thread_totals,
     forked_from_ids: FS,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// R0.9 facts
+// ---------------------------------------------------------------------------
+
+function integrityFacts(
+  scanned: readonly ScannedFile[],
+  fileAByIndex: ReadonlyMap<number, FileA>,
+  intern: ReadonlyMap<string, Rec>,
+  chainThreads: ReadonlySet<string>,
+  triggers: TriggerSet,
+): IntegrityFacts {
+  // Family groups (R0.9): (i) a shared session_id, (ii) fork and spawn edges, (iii) a shared response_id.
+  const groups = new Map<string, Set<string>>();
+  const group = (key: string, ...threads: (string | null)[]): void => {
+    let g = groups.get(key);
+    if (g === undefined) groups.set(key, (g = new Set()));
+    for (const t of threads) if (t !== null && chainThreads.has(t)) g.add(t);
+  };
+  for (const rec of intern.values()) {
+    if (rec.kind === "meta" && rec.meta && rec.meta.id !== null) {
+      const m = rec.meta;
+      if (m.session_id !== null) group(`s\u0000${m.session_id}`, m.id);
+      if (m.forked_from_id !== null) group(`e\u0000${m.id}\u0000${m.forked_from_id}`, m.id, m.forked_from_id);
+      if (m.spawn_parent !== null) group(`e\u0000${m.id}\u0000${m.spawn_parent}`, m.id, m.spawn_parent);
+    } else if (rec.kind === "tur" && rec.tur && rec.tur.thread_id !== null) {
+      const t = rec.tur;
+      if (t.session_id !== null) group(`s\u0000${t.session_id}`, t.thread_id);
+      if (t.response_id !== null) group(`r\u0000${t.response_id}`, t.thread_id);
+    }
+  }
+  const seen = new Set<string>();
+  const familyGroups: ChainId[][] = [];
+  for (const g of groups.values()) {
+    if (g.size < 2) continue;
+    const ids = [...g].map(cid).sort();
+    const k = ids.join("\u0001");
+    if (seen.has(k)) continue;
+    seen.add(k);
+    familyGroups.push(ids);
+  }
+  familyGroups.sort((a, b) => {
+    const ka = a.join("\u0001");
+    const kb = b.join("\u0001");
+    return ka < kb ? -1 : ka > kb ? 1 : 0;
+  });
+
+  const fileFacts: FileFacts[] = scanned.map((sf) => {
+    const fa = fileAByIndex.get(sf.index);
+    return {
+      index: sf.index,
+      provider: "codex",
+      mtime_ms: sf.df.mtimeMs,
+      named_chains: fa === undefined ? [] : [...fa.named].map(cid).sort(),
+      unparsed_lines: sf.readable ? sf.parse_errors + sf.truncated_tail : 0,
+      readable: sf.readable,
+    };
+  });
+
+  return {
+    provider: "codex",
+    chains: [...chainThreads].map(cid).sort(),
+    family_groups: familyGroups,
+    triggers: triggers.list(),
+    files: fileFacts,
   };
 }
 
@@ -1255,7 +1384,7 @@ function chainStr(s: StreamB): string {
 
 /** R5.2 request kind of a Codex chain, from the stream's own session_meta. */
 function kindOf(s: StreamB): RequestKind {
-  const m = s.primary.meta as MetaF;
+  const m = s.pm;
   // R5.2: thread_spawn present, or thread_source subagent / agent_created_thread. `source.subagent.other` alone does not
   // make a subagent (it only gives the link reason other_source, R5.6), so a guardian_review thread stays a classifier.
   if (m.has_spawn || m.thread_source === "subagent" || m.thread_source === "agent_created_thread") return "subagent";

@@ -3,7 +3,7 @@ import { parseArgs } from "node:util";
 import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { analyze, WindowError, type Analysis } from "./analyze.js";
-import { discover, type DiscoveredFile, type DiscoverOptions } from "./discover.js";
+import { discover, inProject, type DiscoveredFile, type DiscoverOptions } from "./discover.js";
 import { zstdSupported } from "./io/lines.js";
 import { colorEnabled, formatInt, formatTable, makePainter, type Painter } from "./report/format.js";
 import { buildReportInput } from "./report/input.js";
@@ -34,7 +34,6 @@ export interface CliOptions {
   id?: string;
   since?: string;
   until?: string;
-  fast: boolean;
   agent: AgentFilter;
   project?: string;
   json: boolean;
@@ -66,9 +65,9 @@ Options:
   --since <when>        Only count activity since a date (YYYY-MM-DD) or duration (7d, 24h, 2w).
                         Earlier requests are still read as baseline and add nothing to the totals
   --until <when>        Only count activity before this date or duration (default: now)
-  --fast                Skip files not modified within 7 days before --since (adds an assumption)
-  --agent <name>        claude, codex or all (default: all)
-  --project <name>      Only include Claude sessions of this project directory (Codex logs have none)
+  --agent <name>        Print claude, codex or all (default: all). Every log file is still read
+  --project <name>      Print only Claude sessions of this project directory (Codex logs have none).
+                        Every log file is still read, and coverage and taint shares cover the whole scan
   --json                Machine readable output
   --demo                Use built-in synthetic data instead of local logs
   --claude-dir <path>   Claude Code projects dir (default: ~/.claude/projects)
@@ -103,7 +102,6 @@ export function parseCli(argv: string[]): ParsedCli {
       options: {
         since: { type: "string" },
         until: { type: "string" },
-        fast: { type: "boolean" },
         agent: { type: "string" },
         project: { type: "string" },
         json: { type: "boolean" },
@@ -154,7 +152,6 @@ export function parseCli(argv: string[]): ParsedCli {
     id,
     since: v.since,
     until: v.until,
-    fast: v.fast ?? false,
     agent,
     project: v.project,
     json: v.json ?? false,
@@ -183,35 +180,44 @@ export function discoverOptionsFor(opts: CliOptions, env: CliIO["env"]): Discove
   return o;
 }
 
-/** --agent and --project selection. A project is a Claude project directory; Codex logs have none (R1.1). */
+/**
+ * --agent and --project selection of what the `doctor` lists. A project is a Claude project directory; Codex logs
+ * have none (R1.1). It never limits what is read (R5.9): analysis always gets every discovered file.
+ */
 export function selectFiles(files: readonly DiscoveredFile[], opts: CliOptions): DiscoveredFile[] {
   return files.filter((f) => {
     if (opts.agent !== "all" && f.agent !== opts.agent) return false;
-    if (opts.project !== undefined) return f.agent === "claude" && f.relPath.split("/")[0] === opts.project;
+    if (opts.project !== undefined) return inProject(f, opts.project);
     return true;
   });
 }
 
-async function analyzeFor(opts: CliOptions, io: CliIO, list: readonly DiscoveredFile[]): Promise<{ analysis: Analysis; input: ReportInput }> {
+/**
+ * Reads the clock once: that instant is the run start of R0.9 (live families) and the report time. `files` is every
+ * discovered file; `--agent` and `--project` only choose what is printed (R5.9).
+ */
+async function analyzeFor(opts: CliOptions, io: CliIO, files: readonly DiscoveredFile[]): Promise<{ analysis: Analysis; input: ReportInput }> {
   const now_ms = io.now ? io.now() : Date.now();
-  const analysis = await analyze(list, { since: opts.since, until: opts.until, fast: opts.fast, agent: opts.agent, now_ms });
-  const input = buildReportInput({
-    graph: analysis.graph,
-    parsed: analysis.parsed,
-    priced: analysis.priced,
-    detection: analysis.detection,
-    book: analysis.book,
-    options: { command: opts.command === "doctor" ? "doctor" : "default", json: opts.json, show_ids: false, demo: opts.demo, color: false },
-    generated_at_ms: now_ms,
-    tool_version: readVersion(),
-  });
+  const analysis = await analyze(files, { since: opts.since, until: opts.until, agent: opts.agent, project: opts.project, now_ms });
+  const input = buildReportInput(
+    {
+      graph: analysis.graph,
+      parsed: analysis.parsed,
+      priced: analysis.priced,
+      detection: analysis.detection,
+      book: analysis.book,
+      options: { command: opts.command === "doctor" ? "doctor" : "default", json: opts.json, show_ids: false, demo: opts.demo, color: false },
+      generated_at_ms: now_ms,
+      tool_version: readVersion(),
+    },
+    analysis.filter,
+  );
   return { analysis, input };
 }
 
 async function runSummary(opts: CliOptions, io: CliIO, color: boolean): Promise<number> {
   const found = await discover(discoverOptionsFor(opts, io.env));
-  const list = selectFiles(found.files, opts);
-  const { analysis, input } = await analyzeFor(opts, io, list);
+  const { analysis, input } = await analyzeFor(opts, io, found.files);
   if (opts.json) {
     io.out(reportToJsonText(input, new Set(analysis.book.models.keys())));
     return EXIT.OK;
@@ -229,7 +235,7 @@ async function runDoctor(opts: CliOptions, io: CliIO, paint: Painter): Promise<n
   // Archived Codex logs need zstd, which older Node 22 builds lack. Surface the coverage loss.
   const zstdOk = zstdSupported();
   const unreadable = zstdOk ? 0 : (counts.get("codex-archived-zst") ?? 0);
-  const parsed = list.length > 0 ? await analyzeFor(opts, io, list) : null;
+  const parsed = list.length > 0 ? await analyzeFor(opts, io, found.files) : null;
   if (opts.json) {
     const cov = parsed ? doctorCoverageToJson(parsed.input.coverage, parsed.input.drift) : null;
     io.out(
@@ -268,7 +274,7 @@ async function runDoctor(opts: CliOptions, io: CliIO, paint: Painter): Promise<n
   }
   if (parsed) {
     io.out("");
-    io.out(renderCoverage(parsed.input.coverage_by_provider, parsed.input.drift, paint));
+    io.out(renderCoverage(parsed.input.coverage_by_provider, parsed.input.drift, paint, parsed.input.headline.taint_by_provider));
     for (const d of parsed.input.drift.filter((x) => x.tripped)) {
       io.out(`Drift ${d.code} (${d.provider}): ${d.numerator} of ${d.denominator}`);
     }
