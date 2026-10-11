@@ -1,6 +1,6 @@
 {
   "name": "cachewhy",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Offline prompt cache forensics for Claude Code and Codex logs.",
   "license": "MIT",
   "author": "Muhammet Can Erganis",
