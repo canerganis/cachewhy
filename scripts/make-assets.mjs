@@ -30,9 +30,29 @@ const OUT = [
   ["2026-10-07 12:54  claude/subagent  claude-fable-5-1     677k   $8.29  confirmed          earlier messages edited: Claude reported it", C.green],
 ];
 
-function demo() {
+const CODEX_OUT = [
+  ["cachewhy rebuilds (2026-10-04 to 2026-10-11)", C.bold, true],
+  ["Checked 6,345 requests. 46 suspected prefix rebuilds, 2.6M tokens processed again, ~$4.18 API list-price equivalent.", C.fg],
+  ["Evidence: 0 confirmed, 28 hypotheses, 18 unknown.", C.fg],
+  ["", C.fg],
+  ["By cause", C.bold, true],
+  ["Cause                     Events  Tokens rebuilt  List-price equiv.", C.dim],
+  ["------------------------  ------  --------------  -----------------", C.dim],
+  ["unknown                       18            1.4M              $2.60", C.fg],
+  ["compaction or /clear          20            633k              $0.84", C.yellow],
+  ["idle past cache TTL            4            355k              $0.46", C.fg],
+  ["request settings changed       3           90.6k              $0.27", C.fg],
+  ["model switch                   1            129k              $0.01", C.fg],
+  ["", C.fg],
+  ["Most expensive 3 of 46", C.bold, true],
+  ["Time (UTC)        Agent           Model        Rebuilt   Cost  Evidence           Why", C.dim],
+  ["2026-10-05 07:51  codex/main      gpt-6.1-sol     229k  $0.44  unknown            unknown: no signal in the logs explains it", C.fg],
+  ["2026-10-04 21:23  codex/main      gpt-6.1-sol     209k  $0.40  hypothesis (high)  idle past cache TTL: idle 22.3h, cache TTL 30m", C.cyan],
+  ["2026-10-05 10:45  codex/subagent  gpt-6.1-sol     156k  $0.30  unknown            unknown: no signal in the logs explains it", C.fg],
+];
+
+function demo(cmd, OUT, title) {
   const lh = 20, pad = 20, top = 44, cw = 7.8;
-  const cmd = "npx cachewhy rebuilds --since 7d";
   const width = Math.ceil(Math.max(...OUT.map((l) => l[0].length)) * cw + pad * 2);
   const height = top + (OUT.length + 2) * lh + pad;
   const typeEnd = 0.3 + cmd.length * 0.05;
@@ -47,7 +67,7 @@ function demo() {
   out.push(`<rect width="100%" height="100%" rx="10" fill="${C.bg}"/>`);
   out.push(`<rect width="100%" height="30" rx="10" fill="${C.bar}"/><rect y="20" width="100%" height="10" fill="${C.bar}"/>`);
   out.push(`<circle cx="18" cy="15" r="6" fill="#ff5f56"/><circle cx="38" cy="15" r="6" fill="#ffbd2e"/><circle cx="58" cy="15" r="6" fill="#27c93f"/>`);
-  out.push(`<text x="${width / 2}" y="19" fill="${C.dim}" text-anchor="middle" font-size="12">cachewhy</text>`);
+  out.push(`<text x="${width / 2}" y="19" fill="${C.dim}" text-anchor="middle" font-size="12">${esc(title)}</text>`);
   out.push(`<text x="${pad}" y="${top + 12}" fill="${C.green}">$ <tspan class="c" fill="${C.fg}">${esc(cmd)}</tspan></text>`);
   OUT.forEach(([t, color, bold], i) => {
     if (!t) return;
@@ -83,6 +103,27 @@ function diagram() {
     `<text x="${W / 2}" y="${H - 30}" fill="${C.dim}" font-size="13" text-anchor="middle">Cost = rebuilt tokens x (write or input price - cache read price), API list prices</text>`,
     `</svg>`,
   ].join("\n");
+}
+
+// Headline numbers from the same real week, as cards.
+function stats() {
+  const W = 960, H = 170;
+  const cards = [
+    ["$645", "API list-price cost of", "cache rebuilds in a week"],
+    ["497", "rebuilds found across", "45,362 requests"],
+    ["88%", "of that cost: cache", "expired while idle"],
+    ["83%", "came from subagents,", "outside /usage's view"],
+  ];
+  const cw = 222, gap = 24, x0 = (W - (cw * 4 + gap * 3)) / 2;
+  const body = cards.map(([big, a, b], i) => {
+    const x = x0 + i * (cw + gap);
+    const color = "#f5a524";
+    return `<rect x="${x}" y="10" width="${cw}" height="150" rx="14" fill="${C.bar}" stroke="#30363d"/>` +
+      `<text x="${x + cw / 2}" y="78" fill="${color}" font-size="48" font-weight="800" text-anchor="middle">${esc(big)}</text>` +
+      `<text x="${x + cw / 2}" y="112" fill="${C.fg}" font-size="15" text-anchor="middle">${esc(a)}</text>` +
+      `<text x="${x + cw / 2}" y="134" fill="${C.dim}" font-size="15" text-anchor="middle">${esc(b)}</text>`;
+  }).join("");
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">${body}</svg>`;
 }
 
 // The mark: a cache ring with one segment broken out, and the break highlighted.
@@ -142,7 +183,9 @@ p{font-size:34px;color:#c9d1d9;margin:28px 0 0;max-width:1000px;line-height:1.3}
 }
 
 mkdirSync("assets", { recursive: true });
-writeFileSync("assets/demo.svg", demo());
+writeFileSync("assets/demo.svg", demo("npx cachewhy rebuilds --since 7d", OUT, "cachewhy · Claude Code"));
+writeFileSync("assets/demo-codex.svg", demo("npx cachewhy rebuilds --since 7d --agent codex", CODEX_OUT, "cachewhy · Codex"));
+writeFileSync("assets/stats.svg", stats());
 writeFileSync("assets/how-it-works.svg", diagram());
 writeFileSync("assets/logo.svg", logo());
 writeFileSync("assets/banner-dark.svg", banner("dark"));

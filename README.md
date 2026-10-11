@@ -6,6 +6,12 @@
 </picture>
 
 <p>
+  <img alt="Claude Code" src="https://img.shields.io/badge/Claude%20Code-supported-D97757?logo=claude&logoColor=white">
+  <img alt="Codex" src="https://img.shields.io/badge/Codex%20CLI-supported-10a37f">
+  <img alt="Subagents" src="https://img.shields.io/badge/subagents%20%26%20workflows-traced-d2a8ff">
+</p>
+
+<p>
   <a href="https://github.com/GITHUB_OWNER/cachewhy/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/GITHUB_OWNER/cachewhy/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://www.npmjs.com/package/cachewhy"><img alt="npm" src="https://img.shields.io/npm/v/cachewhy?color=f5a524"></a>
   <img alt="node" src="https://img.shields.io/badge/node-%E2%89%A522-3fb950">
@@ -27,10 +33,24 @@
 cachewhy reads the Claude Code and Codex session logs already on your machine and finds every request where the prompt cache broke: the conversation prefix had to be processed again instead of read from cache. Each event gets a cause, an evidence level and an API list-price cost. Subagents and workflow agents included, fully offline.
 
 <p align="center">
-  <img alt="cachewhy rebuilds run on a real week of logs" src="assets/demo.svg" width="100%">
+  <img alt="One real week: $645 of cache rebuilds, 497 events, 88% from cache expiring while idle, 83% from subagents" src="assets/stats.svg" width="100%">
 </p>
 
-<sub>A real week of the author's logs (session ids replaced). Most of the waste came from subagents idling past the 5 minute cache TTL, which Claude Code's own <code>/usage</code> does not show because it only covers the main conversation.</sub>
+<p align="center"><sub>One real week of the author's own Claude Code logs. Claude Code's <code>/usage</code> explains the last miss of the main conversation; subagents and past sessions are out of its view.</sub></p>
+
+### Claude Code
+
+<p align="center">
+  <img alt="cachewhy rebuilds on Claude Code logs" src="assets/demo.svg" width="100%">
+</p>
+
+### Codex
+
+<p align="center">
+  <img alt="cachewhy rebuilds on Codex logs" src="assets/demo-codex.svg" width="100%">
+</p>
+
+<sub>Real output, session ids removed. Codex logs carry no cache miss reason, so Codex causes are hypotheses or unknown.</sub>
 
 ## Quick start
 
@@ -154,4 +174,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Test fixtures are synthetic; never commi
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). cachewhy is an independent project, not affiliated with or endorsed by Anthropic or OpenAI. Claude Code and Codex are trademarks of their owners.

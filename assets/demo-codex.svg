@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1039" height="464" viewBox="0 0 1039 464" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13">
+<style>
+.l{opacity:0;animation:show 12s infinite}
+@keyframes show{0%{opacity:0}1%{opacity:1}92%{opacity:1}96%{opacity:0}100%{opacity:0}}
+.c{clip-path:inset(0 100% 0 0);animation:type 12s steps(46) infinite}
+@keyframes type{0%{clip-path:inset(0 100% 0 0);opacity:1}21.7%{clip-path:inset(0 0 0 0);opacity:1}92%{clip-path:inset(0 0 0 0);opacity:1}96%{opacity:0}100%{clip-path:inset(0 100% 0 0);opacity:0}}
+</style>
+<rect width="100%" height="100%" rx="10" fill="#0d1117"/>
+<rect width="100%" height="30" rx="10" fill="#161b22"/><rect y="20" width="100%" height="10" fill="#161b22"/>
+<circle cx="18" cy="15" r="6" fill="#ff5f56"/><circle cx="38" cy="15" r="6" fill="#ffbd2e"/><circle cx="58" cy="15" r="6" fill="#27c93f"/>
+<text x="519.5" y="19" fill="#8b949e" text-anchor="middle" font-size="12">cachewhy · Codex</text>
+<text x="20" y="56" fill="#3fb950">$ <tspan class="c" fill="#c9d1d9">npx cachewhy rebuilds --since 7d --agent codex</tspan></text>
+<text class="l" style="animation-delay:3.20s" x="20" y="96" fill="#f0f6fc" font-weight="bold" xml:space="preserve">cachewhy rebuilds (2026-10-04 to 2026-10-11)</text>
+<text class="l" style="animation-delay:3.32s" x="20" y="116" fill="#c9d1d9" xml:space="preserve">Checked 6,345 requests. 46 suspected prefix rebuilds, 2.6M tokens processed again, ~$4.18 API list-price equivalent.</text>
+<text class="l" style="animation-delay:3.44s" x="20" y="136" fill="#c9d1d9" xml:space="preserve">Evidence: 0 confirmed, 28 hypotheses, 18 unknown.</text>
+<text class="l" style="animation-delay:3.68s" x="20" y="176" fill="#f0f6fc" font-weight="bold" xml:space="preserve">By cause</text>
+<text class="l" style="animation-delay:3.80s" x="20" y="196" fill="#8b949e" xml:space="preserve">Cause                     Events  Tokens rebuilt  List-price equiv.</text>
+<text class="l" style="animation-delay:3.92s" x="20" y="216" fill="#8b949e" xml:space="preserve">------------------------  ------  --------------  -----------------</text>
+<text class="l" style="animation-delay:4.04s" x="20" y="236" fill="#c9d1d9" xml:space="preserve">unknown                       18            1.4M              $2.60</text>
+<text class="l" style="animation-delay:4.16s" x="20" y="256" fill="#d29922" xml:space="preserve">compaction or /clear          20            633k              $0.84</text>
+<text class="l" style="animation-delay:4.28s" x="20" y="276" fill="#c9d1d9" xml:space="preserve">idle past cache TTL            4            355k              $0.46</text>
+<text class="l" style="animation-delay:4.40s" x="20" y="296" fill="#c9d1d9" xml:space="preserve">request settings changed       3           90.6k              $0.27</text>
+<text class="l" style="animation-delay:4.52s" x="20" y="316" fill="#c9d1d9" xml:space="preserve">model switch                   1            129k              $0.01</text>
+<text class="l" style="animation-delay:4.76s" x="20" y="356" fill="#f0f6fc" font-weight="bold" xml:space="preserve">Most expensive 3 of 46</text>
+<text class="l" style="animation-delay:4.88s" x="20" y="376" fill="#8b949e" xml:space="preserve">Time (UTC)        Agent           Model        Rebuilt   Cost  Evidence           Why</text>
+<text class="l" style="animation-delay:5.00s" x="20" y="396" fill="#c9d1d9" xml:space="preserve">2026-10-05 07:51  codex/main      gpt-6.1-sol     229k  $0.44  unknown            unknown: no signal in the logs explains it</text>
+<text class="l" style="animation-delay:5.12s" x="20" y="416" fill="#79c0ff" xml:space="preserve">2026-10-04 21:23  codex/main      gpt-6.1-sol     209k  $0.40  hypothesis (high)  idle past cache TTL: idle 22.3h, cache TTL 30m</text>
+<text class="l" style="animation-delay:5.24s" x="20" y="436" fill="#c9d1d9" xml:space="preserve">2026-10-05 10:45  codex/subagent  gpt-6.1-sol     156k  $0.30  unknown            unknown: no signal in the logs explains it</text>
+</svg>
