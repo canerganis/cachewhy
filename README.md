@@ -8,29 +8,7 @@ cachewhy reads the Claude Code and Codex session logs already on your machine, w
 npx cachewhy rebuilds --since 7d
 ```
 
-```
-cachewhy rebuilds (2026-10-04 to 2026-10-11)
-Checked 45,362 requests. 497 suspected prefix rebuilds, 129M tokens processed again, ~$645.45 API list-price equivalent.
-Evidence: 70 confirmed, 390 hypotheses, 37 unknown.
-
-By cause
-Cause                           Events  Tokens rebuilt  List-price equiv.
-------------------------------  ------  --------------  -----------------
-idle past cache TTL                412            118M            $570.93
-earlier messages edited             11            3.9M             $44.71
-unknown                             37            5.1M             $22.13
-tools or system prompt changed       8            895k              $5.25
-compaction or /clear                22            713k              $1.30
-model switch                         4            252k              $0.86
-request settings changed             3           90.6k              $0.27
-
-Most expensive 3 of 497
-Time (UTC)        Agent            Session   Model             Rebuilt    Cost  Evidence           Why
-----------------  ---------------  --------  ----------------  -------  ------  -----------------  --------------------------------------------
-2026-10-05 04:23  claude/subagent  3f1c9a2e  claude-fable-5-1     894k  $10.95  confirmed          idle past cache TTL: Claude reported: ...
-2026-10-04 23:05  claude/subagent  3f1c9a2e  claude-fable-5-1     848k  $10.39  hypothesis (high)  idle past cache TTL: idle 25m, cache TTL 5m
-2026-10-04 22:00  claude/subagent  3f1c9a2e  claude-fable-5-1     733k   $8.98  hypothesis (high)  idle past cache TTL: idle 11m, cache TTL 5m
-```
+![cachewhy rebuilds run on a real week of logs](assets/demo.svg)
 
 That is a real week of the author's own logs. Most of the waste was subagents sitting idle longer than the 5 minute cache TTL, which Claude Code's own `/usage` does not show because it only covers the main conversation.
 
@@ -41,6 +19,9 @@ With a coding agent, almost every request resends the whole conversation. When t
 Existing usage tools count tokens and dollars. cachewhy explains the misses.
 
 ## What it does
+
+![How cachewhy finds a rebuild](assets/how-it-works.svg)
+
 
 * Reads `~/.claude/projects` and `~/.codex` (sessions and archived sessions). Override with `--claude-dir` and `--codex-dir`.
 * Deduplicates responses by request id, so replayed and copied log lines count once.

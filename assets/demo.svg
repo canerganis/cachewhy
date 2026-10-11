@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1132" height="504" viewBox="0 0 1132 504" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13">
+<style>
+.l{opacity:0;animation:show 12s infinite}
+@keyframes show{0%{opacity:0}1%{opacity:1}92%{opacity:1}96%{opacity:0}100%{opacity:0}}
+.c{clip-path:inset(0 100% 0 0);animation:type 12s steps(32) infinite}
+@keyframes type{0%{clip-path:inset(0 100% 0 0);opacity:1}15.8%{clip-path:inset(0 0 0 0);opacity:1}92%{clip-path:inset(0 0 0 0);opacity:1}96%{opacity:0}100%{clip-path:inset(0 100% 0 0);opacity:0}}
+</style>
+<rect width="100%" height="100%" rx="10" fill="#0d1117"/>
+<rect width="100%" height="30" rx="10" fill="#161b22"/><rect y="20" width="100%" height="10" fill="#161b22"/>
+<circle cx="18" cy="15" r="6" fill="#ff5f56"/><circle cx="38" cy="15" r="6" fill="#ffbd2e"/><circle cx="58" cy="15" r="6" fill="#27c93f"/>
+<text x="566" y="19" fill="#8b949e" text-anchor="middle" font-size="12">cachewhy</text>
+<text x="20" y="56" fill="#3fb950">$ <tspan class="c" fill="#c9d1d9">npx cachewhy rebuilds --since 7d</tspan></text>
+<text class="l" style="animation-delay:2.50s" x="20" y="96" fill="#f0f6fc" font-weight="bold" xml:space="preserve">cachewhy rebuilds (2026-10-04 to 2026-10-11)</text>
+<text class="l" style="animation-delay:2.62s" x="20" y="116" fill="#c9d1d9" xml:space="preserve">Checked 45,362 requests. 497 suspected prefix rebuilds, 129M tokens processed again, ~$645.45 API list-price equivalent.</text>
+<text class="l" style="animation-delay:2.74s" x="20" y="136" fill="#c9d1d9" xml:space="preserve">Evidence: 70 confirmed, 390 hypotheses, 37 unknown.</text>
+<text class="l" style="animation-delay:2.98s" x="20" y="176" fill="#f0f6fc" font-weight="bold" xml:space="preserve">By cause</text>
+<text class="l" style="animation-delay:3.10s" x="20" y="196" fill="#8b949e" xml:space="preserve">Cause                           Events  Tokens rebuilt  List-price equiv.</text>
+<text class="l" style="animation-delay:3.22s" x="20" y="216" fill="#8b949e" xml:space="preserve">------------------------------  ------  --------------  -----------------</text>
+<text class="l" style="animation-delay:3.34s" x="20" y="236" fill="#d29922" xml:space="preserve">idle past cache TTL                412            118M            $570.93</text>
+<text class="l" style="animation-delay:3.46s" x="20" y="256" fill="#c9d1d9" xml:space="preserve">earlier messages edited             11            3.9M             $44.71</text>
+<text class="l" style="animation-delay:3.58s" x="20" y="276" fill="#c9d1d9" xml:space="preserve">unknown                             37            5.1M             $22.13</text>
+<text class="l" style="animation-delay:3.70s" x="20" y="296" fill="#c9d1d9" xml:space="preserve">tools or system prompt changed       8            895k              $5.25</text>
+<text class="l" style="animation-delay:3.82s" x="20" y="316" fill="#c9d1d9" xml:space="preserve">compaction or /clear                22            713k              $1.30</text>
+<text class="l" style="animation-delay:3.94s" x="20" y="336" fill="#c9d1d9" xml:space="preserve">model switch                         4            252k              $0.86</text>
+<text class="l" style="animation-delay:4.18s" x="20" y="376" fill="#f0f6fc" font-weight="bold" xml:space="preserve">Most expensive 4 of 497</text>
+<text class="l" style="animation-delay:4.30s" x="20" y="396" fill="#8b949e" xml:space="preserve">Time (UTC)        Agent            Model             Rebuilt    Cost  Evidence           Why</text>
+<text class="l" style="animation-delay:4.42s" x="20" y="416" fill="#3fb950" xml:space="preserve">2026-10-05 04:23  claude/subagent  claude-fable-5-1     894k  $10.95  confirmed          idle past cache TTL: previous cache entry not found</text>
+<text class="l" style="animation-delay:4.54s" x="20" y="436" fill="#79c0ff" xml:space="preserve">2026-10-04 23:05  claude/subagent  claude-fable-5-1     848k  $10.39  hypothesis (high)  idle past cache TTL: idle 25m, cache TTL 5m</text>
+<text class="l" style="animation-delay:4.66s" x="20" y="456" fill="#79c0ff" xml:space="preserve">2026-10-04 22:00  claude/subagent  claude-fable-5-1     733k   $8.98  hypothesis (high)  idle past cache TTL: idle 11m, cache TTL 5m</text>
+<text class="l" style="animation-delay:4.78s" x="20" y="476" fill="#3fb950" xml:space="preserve">2026-10-07 12:54  claude/subagent  claude-fable-5-1     677k   $8.29  confirmed          earlier messages edited: Claude reported it</text>
+</svg>
