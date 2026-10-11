@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as zlib from "node:zlib";
-import { readLines, newLineStats, mapWithLimit, processFiles, zstdSupported } from "../../src/io/lines.js";
+import { readLines, newLineStats, mapWithLimit, processFiles, zstdSupported, zstdDetectsTruncation } from "../../src/io/lines.js";
 import type { LineRecord, ReadLinesOptions } from "../../src/io/lines.js";
 
 const dir = mkdtempSync(join(tmpdir(), "cachewhy-lines-"));
@@ -80,7 +80,7 @@ test("a directory where a file is expected is reported per file and never thrown
   assert.equal(stats.error, "read_failed");
 });
 
-test("a truncated zstd frame never throws and is reported, so the caller can mark the file unreadable (R0.9 file_unreadable)", { skip: !zstdSupported() }, async () => {
+test("a truncated zstd frame never throws and is reported, so the caller can mark the file unreadable (R0.9 file_unreadable)", { skip: !zstdDetectsTruncation() && "this Node does not report truncated zstd frames" }, async () => {
   const p = join(dir, "partial.jsonl.zst");
   const good = (zlib as unknown as { zstdCompressSync(b: Buffer): Buffer }).zstdCompressSync(Buffer.from("l1\nl2\n".repeat(50)));
   writeFileSync(p, good.subarray(0, Math.max(1, good.length - 4)));

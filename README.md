@@ -7,13 +7,13 @@
 
 <p>
   <img alt="Claude Code" src="https://img.shields.io/badge/Claude%20Code-supported-D97757?logo=claude&logoColor=white">
-  <img alt="Codex" src="https://img.shields.io/badge/Codex%20CLI-supported-10a37f">
+  <img alt="Codex" src="https://img.shields.io/badge/Codex_CLI-supported-10a37f?style=flat">
   <img alt="Subagents" src="https://img.shields.io/badge/subagents%20%26%20workflows-traced-d2a8ff">
 </p>
 
 <p>
-  <a href="https://github.com/canerganis/cachewhy/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/canerganis/cachewhy/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="https://www.npmjs.com/package/cachewhy"><img alt="npm" src="https://img.shields.io/npm/v/cachewhy?color=f5a524"></a>
+  <a href="https://github.com/canerganis/cachewhy/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/canerganis/cachewhy/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="https://www.npmjs.com/package/cachewhy"><img alt="npm" src="https://img.shields.io/npm/v/cachewhy?label=npm&color=f5a524&style=flat"></a>
   <img alt="node" src="https://img.shields.io/badge/node-%E2%89%A522-3fb950">
   <img alt="dependencies" src="https://img.shields.io/badge/runtime%20deps-0-79c0ff">
   <img alt="offline" src="https://img.shields.io/badge/network-none-8b949e">
@@ -140,6 +140,7 @@ The accounting is strict on purpose. A chain the summary cannot verify end to en
 * Causes other than **confirmed** are inferred from timing and counters. Treat them as strong leads, not proof.
 * Codex logs carry no cache miss reason, so Codex events are never **confirmed**.
 * Costs use public API list prices. Subscription plans bill differently.
+* On Node 22 a truncated archived Codex log (`.jsonl.zst`) reads as a shorter file instead of being flagged unreadable, because Node 22 does not report cut zstd frames. Node 24 does.
 
 ## FAQ
 

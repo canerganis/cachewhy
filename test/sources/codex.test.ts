@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
 import { discover } from "../../src/discover.js";
-import { zstdSupported } from "../../src/io/lines.js";
+import { zstdDetectsTruncation, zstdSupported } from "../../src/io/lines.js";
 import { parseCodex } from "../../src/sources/codex.js";
 import { PHYSICAL_COVERAGE_COUNTERS, TAINT_REASONS, type CodexParseResult, type CodexResponse, type CoverageCounters, type TaintReason } from "../../src/model/types.js";
 import { scenarios } from "../../scripts/gen-fixtures.ts";
@@ -1831,8 +1831,8 @@ describe("R0.9 fixtures (4), (5), (6)", () => {
     for (let i = 0; i < 40; i++) t.tokenUsage({ responseId: `zt${i}`, turnId: "T", usage: { input: 1000 + i, output: 5 } });
     const text = filesOf(t)[0]!.content as string;
     const z = zstdCompress(text);
-    if (z === null) {
-      ctx.diagnostic("no zstd compressor on this Node: only the garbage-archive path is exercised");
+    if (z === null || !zstdDetectsTruncation()) {
+      ctx.diagnostic("this Node cannot compress zstd or does not report truncated frames: skipped");
       return;
     }
     const clean = thread1();

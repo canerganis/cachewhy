@@ -57,6 +57,26 @@ export function zstdSupported(): boolean {
   return typeof (zlib as unknown as Record<string, unknown>).createZstdDecompress === "function";
 }
 
+let truncationCheck: boolean | null = null;
+
+/**
+ * True when this Node build reports a truncated zstd frame as an error. Node 22 ends the stream silently on a cut
+ * frame, so a truncated archive there reads as a shorter file instead of an unreadable one. Node 24 throws.
+ */
+export function zstdDetectsTruncation(): boolean {
+  if (truncationCheck !== null) return truncationCheck;
+  const z = zlib as unknown as { zstdCompressSync?(b: Buffer): Buffer; zstdDecompressSync?(b: Buffer): Buffer };
+  if (!zstdSupported() || !z.zstdCompressSync || !z.zstdDecompressSync) return (truncationCheck = false);
+  const frame = z.zstdCompressSync(Buffer.from("l1\nl2\n".repeat(50)));
+  try {
+    z.zstdDecompressSync(frame.subarray(0, frame.length - 4));
+    truncationCheck = false;
+  } catch {
+    truncationCheck = true;
+  }
+  return truncationCheck;
+}
+
 const NL = 0x0a;
 const CR = 0x0d;
 
