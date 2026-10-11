@@ -26,6 +26,14 @@ const row = (input: string, output: string, read: string, w5: string, w1: string
   cache_write_1h: w1,
 });
 const geoOk = { applies: true, multiplier: "1.1", verified: true };
+/** The documented multipliers of a listed model (R3.2, S8.5b (5)); fixtures store them so the table loads. */
+const docMultipliers = (rawId: string): object | null => {
+  const id = rawId.replace(/-[0-9]{8}$/, "");
+  if (id.startsWith("claude-")) return { cache_read: ["claude-fable-5-1", "claude-mythos-5-1"].includes(id) ? "0.025" : ["claude-opus-5-5", "claude-sonnet-5-5"].includes(id) ? "0.05" : "0.1", cache_write_5m: "1.25", cache_write_1h: "2" };
+  const m = /^gpt-([0-9]+)(?:\.([0-9]+))?(?:-|$)/.exec(id);
+  if (m && (Number(m[1]) > 5 || (Number(m[1]) === 5 && Number(m[2] ?? 0) >= 6))) return { cached_input: id === "gpt-6.1-sol" ? "0.05" : "0.1", cache_write: "1.25" };
+  return null;
+};
 const claudeEntry = (id: string, prices: object, extra: object = {}) => ({
   id,
   provider: "anthropic",
@@ -37,6 +45,7 @@ const claudeEntry = (id: string, prices: object, extra: object = {}) => ({
   geo_us: geoOk,
   verified: true,
   verified_at: "2026-10-09",
+  multipliers: docMultipliers(id),
   ...extra,
 });
 const gptEntry = (id: string, prices: object, lc: object | null) => ({
@@ -49,6 +58,7 @@ const gptEntry = (id: string, prices: object, lc: object | null) => ({
   fast: null,
   geo_us: null,
   verified: true,
+  multipliers: docMultipliers(id),
   verified_at: "2026-10-09",
 });
 const TABLE = {

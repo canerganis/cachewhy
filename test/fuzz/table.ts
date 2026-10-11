@@ -52,6 +52,165 @@ function pickRow(t: Obj, r: Rng, provider?: string): { e: Obj; owner: Obj; key: 
 
 const MUTATIONS: Array<[string, Mutation]> = [
   [
+    "dated_ids",
+    (t, r) => {
+      const e = r.pick(entries(t));
+      const id = String(e.id);
+      const dated = `${id}-${r.pick(["20251001", "20260101", "2025100", "202510011"])}`;
+      const where = r.int(0, 2);
+      if (where === 0) e.id = dated;
+      else if (where === 1) e.model_ids = [dated];
+      else {
+        e.id = dated;
+        e.model_ids = [...(Array.isArray(e.model_ids) ? e.model_ids : []), dated];
+      }
+      const wrong = r.chance(0.5);
+      if (wrong) {
+        const p = priceRows(e)[0];
+        if (p) {
+          const row = p[0][p[1]] as Obj;
+          const k = Object.keys(row).find((x) => x.startsWith("cache") || x === "cached_input");
+          if (k) row[k] = String(Number(row[k]) + 0.01);
+        }
+      }
+      return `${id} dated ids (slot ${where}), cache price ${wrong ? "wrong" : "correct"}`;
+    },
+  ],
+  [
+    "anthropic_long_context_with_prices",
+    (t, r) => {
+      const e = r.pick(entries(t, "anthropic"));
+      const base = isObj(e.prices_usd_per_mtok) ? (structuredClone(e.prices_usd_per_mtok) as Obj) : null;
+      if (base === null) return null;
+      const broken = r.chance(0.5);
+      const k = r.pick([1, 2]);
+      for (const f of Object.keys(base)) base[f] = String(Number((Number(base[f]) * k).toFixed(6)));
+      if (broken) base.cache_read = String(Number(base.cache_read) + 0.01);
+      e.long_context = { surcharge: "none", verified: true, prices_usd_per_mtok: base, ...(r.chance(0.5) ? { multipliers: structuredClone(e.multipliers ?? {}) } : {}) };
+      return `${e.id} verified long_context with prices x${k}${broken ? ", ratio broken" : ""}`;
+    },
+  ],
+  [
+    "entry_multipliers_absent",
+    (t, r) => {
+      const e = r.pick(entries(t));
+      if (r.chance(0.5)) delete e.multipliers;
+      else e.multipliers = undefined;
+      return `${e.id} multipliers absent`;
+    },
+  ],
+  [
+    "new_openai_ids",
+    (t, r) => {
+      const src = r.pick(entries(t, "openai"));
+      const e = structuredClone(src) as Obj;
+      const id = r.pick(["gpt-5.7", "gpt-5.10", "gpt-7", "gpt-5.7-sol", "gpt-5.10-luna", "gpt-7-sol", "gpt-5.9"]);
+      e.id = id;
+      e.model_ids = [id];
+      if (r.chance(0.5) && isObj(e.prices_usd_per_mtok)) {
+        // documented multipliers for GPT-5.6 and later: cached input 0.1x, cache write 1.25x
+        const p = e.prices_usd_per_mtok as Obj;
+        const input = Number(p.input);
+        if (Number.isFinite(input)) {
+          p.cached_input = String(Number((input * 0.1).toFixed(6)));
+          p.cache_write = String(Number((input * 1.25).toFixed(6)));
+        }
+      }
+      (t.models as Obj[]).push(e);
+      return `new openai entry ${id} cloned from ${src.id}`;
+    },
+  ],
+  [
+    "row_container_not_object",
+    (t, r) => {
+      const e = r.pick(entries(t));
+      const field = r.pick(["tiers", "fast", "long_context", "service_tier", "geo_us"]);
+      const v = r.pick<unknown>([5, "x", [], true, 0, ""]);
+      e[field] = v;
+      return `${e.id}.${field} = ${JSON.stringify(v)}`;
+    },
+  ],
+  [
+    "model_ids_shape",
+    (t, r) => {
+      const e = r.pick(entries(t));
+      const v = r.pick<unknown>(["x", 5, {}, null, [5], [null], [e.id, 5], [{}], [], ["", e.id]]);
+      e.model_ids = v;
+      return `${e.id}.model_ids = ${JSON.stringify(v)}`;
+    },
+  ],
+  [
+    "entry_id_own_member",
+    (t, r) => {
+      const e = r.pick(entries(t));
+      const members: unknown[] = Array.isArray(e.model_ids) ? e.model_ids : [];
+      const m = String(members[0] ?? e.id);
+      const raw = r.chance(0.5);
+      e.id = raw ? m : `${m}-20251001`;
+      if (!raw) e.model_ids = [m, ...members.slice(1)];
+      return `${m}: entry id ${raw ? "raw-equal" : "normalized-equal"} to its own member`;
+    },
+  ],
+  [
+    "verified_placeholder_incomplete",
+    (t, r) => {
+      const e = r.pick(entries(t));
+      e.verified = true;
+      e.verified_at = r.pick<unknown>(["TBD", "", "pending", "2026", "2026-1-1", null, "unverified"]);
+      const p = priceRows(e)[0];
+      if (p) {
+        const row = p[0][p[1]] as Obj;
+        const keys = Object.keys(row);
+        if (keys.length > 0) delete row[r.pick(keys)];
+      }
+      return `${e.id} verified with placeholder date and an incomplete row`;
+    },
+  ],
+  [
+    "min_cacheable_tokens_range",
+    (t, r) => {
+      const e = r.pick(entries(t));
+      const v = r.pick<unknown>([9007199254740992, 9007199254740991, -1, 1.5, "512", null, 0]);
+      e.min_cacheable_tokens = v;
+      return `${e.id}.min_cacheable_tokens = ${JSON.stringify(v)}`;
+    },
+  ],
+  [
+    "modifiers_container_not_object",
+    (t, r) => {
+      const v = r.pick<unknown>([5, [], null, "x", true]);
+      t.modifiers = v;
+      return `modifiers = ${JSON.stringify(v)}`;
+    },
+  ],
+  [
+    "unknown_members_in_rows",
+    (t, r) => {
+      const where = r.int(0, 2);
+      const e = r.pick(entries(t));
+      if (where === 0) {
+        const p = pickRow(t, r);
+        if (!p) return null;
+        (p.owner[p.key] as Obj)[r.pick(["extra", "cache_write_30m", "input_batch"])] = r.pick<unknown>(["1", 1, null]);
+        return `${p.e.id}.${p.key} gets an unknown member`;
+      }
+      const rows = isObj(e.prices_usd_per_mtok) ? structuredClone(e.prices_usd_per_mtok) : {};
+      e.service_tier = { priority: { prices_usd_per_mtok: rows, verified: true, verified_at: "2026-10-09" } };
+      if (where === 2) (e.service_tier.priority.prices_usd_per_mtok as Obj).unknown_member = "2";
+      return `${e.id}.service_tier row (${where === 2 ? "with unknown member" : "plain"})`;
+    },
+  ],
+  [
+    "long_context_multipliers_not_object",
+    (t, r) => {
+      const e = r.pick(entries(t));
+      if (!isObj(e.long_context)) return null;
+      const v = r.pick<unknown>([5, "x", [], null, true]);
+      e.long_context.multipliers = v;
+      return `${e.id}.long_context.multipliers = ${JSON.stringify(v)}`;
+    },
+  ],
+  [
     "multipliers_empty_or_partial",
     (t, r) => {
       const e = r.pick(entries(t));

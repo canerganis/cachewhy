@@ -500,10 +500,10 @@ const PRICE_KEYS = ["input", "output", "cache_read", "cache_write_5m", "cache_wr
 const PRICE_RE = /^(0|[1-9][0-9]*)(\.[0-9]{1,6})?$/;
 
 /** S8.5a: every price of a row is a JSON string of the price grammar; null is `n/a` (R3.6). Anything else is malformed. */
-function checkPriceRow(row) {
+function checkPriceRow(row, everyMember = false) {
   if (row === undefined || row === null) return;
   if (!isObj(row)) throw new Error("table_malformed");
-  for (const k of PRICE_KEYS) {
+  for (const k of everyMember ? Object.keys(row) : PRICE_KEYS) {
     if (!(k in row)) continue;
     const v = row[k];
     if (v === null) continue;
@@ -544,8 +544,14 @@ function documentedMultiplier(e, field) {
     }
     return undefined;
   }
-  // OpenAI: GPT-5.6 and later (gpt-5.6-*, gpt-6-*, gpt-6.1-*)
-  const later = [...ids].some((n) => /^gpt-5\.6(-|$)/.test(n) || /^gpt-6(\.[0-9]+)?(-|$)/.test(n));
+  // OpenAI: GPT-5.6 and later: gpt-<major>.<minor>... or gpt-<major>-... with (major, minor) >= (5, 6), minor 0 when absent
+  const later = [...ids].some((n) => {
+    const m = /^gpt-([0-9]+)(?:\.([0-9]+))?(?:-|$)/.exec(n);
+    if (m === null) return false;
+    const major = Number(m[1]);
+    const minor = m[2] === undefined ? 0 : Number(m[2]);
+    return major > 5 || (major === 5 && minor >= 6);
+  });
   if (!later) return undefined;
   if (field === "cache_write") return [5n, 4n];
   if (field === "cached_input") return any("gpt-6.1-sol") ? [5n, 100n] : [1n, 10n];
@@ -614,15 +620,22 @@ function validateTable(table) {
   for (const e of table.models) {
     if (!isObj(e) || typeof e.id !== "string") bad();
     if (e.provider !== "anthropic" && e.provider !== "openai") bad();
-    if (e.min_cacheable_tokens !== undefined && e.min_cacheable_tokens !== null && !(Number.isInteger(e.min_cacheable_tokens) && e.min_cacheable_tokens >= 0)) bad();
+    if (e.min_cacheable_tokens !== undefined && e.min_cacheable_tokens !== null && !(Number.isSafeInteger(e.min_cacheable_tokens) && e.min_cacheable_tokens >= 0)) bad();
+    // S8.5b (d): shapes. model_ids is an array of strings; a present container or multipliers value is an object
+    if (e.model_ids !== undefined && e.model_ids !== null && !(Array.isArray(e.model_ids) && e.model_ids.every((x) => typeof x === "string"))) bad();
+    for (const c of [e.tiers, e.fast, e.long_context, e.service_tier, e.multipliers]) if (c !== undefined && c !== null && !isObj(c)) bad();
+    for (const c of [isObj(e.fast) ? e.fast.multipliers : null, isObj(e.tiers) ? e.tiers.high_multipliers : null, isObj(e.long_context) ? e.long_context.multipliers : null]) {
+      if (c !== undefined && c !== null && !isObj(c)) bad();
+    }
+    const ev = verifiedObj(e, e, table); // S8.5b (a): effective verification (the flag and an effective date)
     // S8.5a: every price row that is present is an object whose prices follow the grammar
     checkPriceRow(e.prices_usd_per_mtok);
     if (isObj(e.fast)) checkPriceRow(e.fast.prices_usd_per_mtok);
     if (isObj(e.tiers)) checkPriceRow(e.tiers.high);
     if (isObj(e.long_context)) checkPriceRow(e.long_context.prices_usd_per_mtok);
-    if (isObj(e.service_tier)) for (const v of Object.values(e.service_tier)) if (isObj(v)) checkPriceRow(v.prices_usd_per_mtok);
+    if (isObj(e.service_tier)) for (const v of Object.values(e.service_tier)) if (isObj(v)) checkPriceRow(v.prices_usd_per_mtok, true); // every member of a service-tier row
     // (3) a verified entry carries a complete standard row for its provider
-    if (e.verified === true) {
+    if (ev) {
       const complete = (row) => {
         const need = REQUIRED_ROW[e.provider];
         for (const k of need.strings) if (typeof row[k] !== "string") bad();
@@ -638,34 +651,38 @@ function validateTable(table) {
     }
     // (5) R3.2: ratio test on every row with an effective multiplier object, documented multipliers, inherited objects
     const own = isObj(e.multipliers) ? e.multipliers : null;
-    checkRatio(e.prices_usd_per_mtok, own, e.verified === true);
+    // S8.5b (b): a model the documented list names must store a multipliers object at all
+    if (MULT_KEYS.some((k) => documentedMultiplier(e, k) !== undefined) && own === null) bad();
+    checkRatio(e.prices_usd_per_mtok, own, ev);
     checkDocumented(e, e.multipliers);
     if (isObj(e.fast)) {
       const inherited = e.fast.multipliers;
       if (inherited !== undefined && inherited !== null && canon(inherited) !== canon(e.multipliers ?? null)) bad();
       if (isObj(inherited)) checkDocumented(e, inherited); // the inherited copy lists every documented multiplier too
-      checkRatio(e.fast.prices_usd_per_mtok, isObj(inherited) ? inherited : own, e.verified === true);
+      checkRatio(e.fast.prices_usd_per_mtok, isObj(inherited) ? inherited : own, ev);
     }
     if (isObj(e.tiers)) {
       const inherited = e.tiers.high_multipliers;
       if (inherited !== undefined && inherited !== null && canon(inherited) !== canon(e.multipliers ?? null)) bad();
       if (isObj(inherited)) checkDocumented(e, inherited);
-      checkRatio(e.tiers.high, isObj(inherited) ? inherited : own, e.verified === true);
+      checkRatio(e.tiers.high, isObj(inherited) ? inherited : own, ev);
       if (e.tiers.split_tokens !== undefined && e.tiers.split_tokens !== null && e.tiers.split_tokens !== Number(C26)) bad(); // C26
     }
     if (isObj(e.long_context)) {
       const lc = e.long_context;
-      if (lc.verified === true) {
-        checkRatio(lc.prices_usd_per_mtok, isObj(lc.multipliers) ? lc.multipliers : own, e.verified === true);
+      if (verifiedObj(lc, e, table)) {
+        checkRatio(lc.prices_usd_per_mtok, isObj(lc.multipliers) ? lc.multipliers : own, ev);
       }
       if (lc.threshold_input_tokens !== undefined && lc.threshold_input_tokens !== null && lc.threshold_input_tokens !== Number(C25)) bad(); // C25
     }
     if (isObj(e.geo_us) && e.geo_us.multiplier !== undefined && e.geo_us.multiplier !== null && !sameRational(decimalRational(e.geo_us.multiplier), C32)) bad(); // C32
     // (7) two model ids anywhere with the same normalized form, inside one entry or in two
     // the model ids of an entry are its `id` and every member of `model_ids` (the id counts once when it is also a member)
-    const members = (Array.isArray(e.model_ids) ? e.model_ids : []).map(tableModelId).filter((x) => x !== null);
+    // (e) the id counts once only when it is raw-equal to a member of model_ids
+    const rawMembers = Array.isArray(e.model_ids) ? e.model_ids : [];
+    const members = rawMembers.map(tableModelId).filter((x) => x !== null);
     const own_id = tableModelId(e.id);
-    const all = own_id !== null && members.includes(own_id) ? members : own_id !== null ? [own_id, ...members] : members;
+    const all = own_id === null || rawMembers.includes(e.id) ? members : [own_id, ...members];
     for (const id of all) {
       if (seen.has(id)) bad();
       seen.add(id);
@@ -1044,7 +1061,7 @@ function priceClaude(res, book, stats) {
   if (geo === "other") return unpriced("geo_other", tot);
 
   let row = claudeRow(entry.prices_usd_per_mtok);
-  const hasTiers = isObj(entry.tiers);
+  const hasTiers = entry.tiers !== undefined && entry.tiers !== null; // any present tiers value fires the gate (a non-object table is refused at load)
   const aboveSplit = hasTiers && ctx > C26; // Haiku 5.5: tier by total_input = i + r + w (R2.2, R3.4), BigInt (S8.3)
   const nonStd = tier === "priority" || tier === "batch" || tier === "other";
   if (nonStd) {

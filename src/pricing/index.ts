@@ -47,6 +47,7 @@ import {
 // S8.5a: no leading zeros, `0` alone or `0.` followed by digits; `05`, `00.5`, `.5`, `5.` and signs are malformed.
 const DECIMAL = /^(0|[1-9][0-9]*)(?:\.([0-9]+))?$/;
 const PRICE_GRAMMAR = /^(0|[1-9][0-9]*)(\.[0-9]{1,6})?$/;
+const PRICE_MEMBERS = ["input", "output", "cache_read", "cache_write_5m", "cache_write_1h", "cached_input", "cache_write"] as const;
 const PRICE_SCALE = 1_000_000n; // price units are 1e-6 USD per MTok
 
 /** Exact rational of a non-negative decimal string, or null when it is not one. */
@@ -192,6 +193,11 @@ function parseRow(provider: TableProvider, p: TablePriceRow | null | undefined, 
     grammar?.("row");
     return { row: null, error: "a price row must be an object of decimal strings" };
   }
+  // S8.5b (d): every named price member, whatever the provider of the row, is null or a valid price
+  for (const n of PRICE_MEMBERS) {
+    const v = (p as unknown as Record<string, unknown>)[n];
+    if (v !== null && v !== undefined && !(typeof v === "string" && PRICE_GRAMMAR.test(v))) grammar?.(n);
+  }
   const get = (v: unknown, name: string, required: boolean): bigint | null | "bad" => {
     if (v === null || v === undefined) return required ? "bad" : null;
     // S8.5a: a price that is not a string of the price grammar (1 to 6 decimals) makes the table malformed, whatever the
@@ -237,6 +243,7 @@ function ratioTest(
   row: PriceRow,
   path: string,
   ctx: Ctx,
+  verified: boolean,
 ): void {
   if (multipliers === null || multipliers === undefined) return;
   if (row.input === null) return;
@@ -250,7 +257,8 @@ function ratioTest(
     }
     const price = row[field];
     if (price === null) {
-      ctx.c.add("ratio", `${path}.${field}`, "multiplier is stored but the row has no such price");
+      // S8.5b (c): a missing cache price where a multiplier is stored fails on a verified entry, is skipped on an unverified one
+      if (verified) ctx.c.add("ratio", `${path}.${field}`, "multiplier is stored but the row has no such price");
       continue;
     }
     if (price * m.den !== row.input * m.num) {
@@ -307,14 +315,24 @@ export function documentedMultipliers(provider: TableProvider, id: string): Read
 }
 
 function documentedTest(entry: TableModelEntry, path: string, ctx: Ctx): void {
-  const doc = documentedMultipliers(entry.provider, entry.id);
-  if (doc === null) return;
+  // S8.5b (b): the list applies to every normalized model id of the entry (its id and each model_ids member). A model the
+  // list names must store every listed multiplier; an entry with no multipliers object fails.
+  const ids = [entry.id, ...(Array.isArray(entry.model_ids) ? entry.model_ids : [])].filter((x): x is string => typeof x === "string");
   const stored = entry.multipliers ?? null;
-  for (const [k, want] of Object.entries(doc)) {
-    const raw = stored === null ? undefined : stored[k];
-    const have = parseDecimal(raw);
-    if (have === null || have.num * want.den !== want.num * have.den) {
-      ctx.c.add("documented_multiplier", `${path}.multipliers.${k}`, "stored multiplier differs from the documented list (R3.2)");
+  const failed = new Set<string>();
+  for (const id of ids) {
+    const norm = normalizeModelId(id);
+    // the Claude list names Claude models: an Anthropic id outside the `claude-` family has no documented multiplier
+    if (entry.provider === "anthropic" && !norm.startsWith("claude-")) continue;
+    const doc = documentedMultipliers(entry.provider, norm);
+    if (doc === null) continue;
+    for (const [k, want] of Object.entries(doc)) {
+      const raw = stored === null ? undefined : stored[k];
+      const have = parseDecimal(raw);
+      if ((have === null || have.num * want.den !== want.num * have.den) && !failed.has(k)) {
+        failed.add(k);
+        ctx.c.add("documented_multiplier", `${path}.multipliers.${k}`, "stored multiplier differs from the documented list (R3.2)");
+      }
     }
   }
 }
@@ -344,7 +362,10 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
   }
 
   // Table level modifiers.
-  const modifiers = table.modifiers ?? {};
+  const modRaw = table.modifiers as unknown;
+  const modOk = modRaw === undefined || modRaw === null || (typeof modRaw === "object" && !Array.isArray(modRaw));
+  if (!modOk) c.add("schema", "modifiers", "modifiers must be an object (S8.5b (d))");
+  const modifiers = (modOk ? (modRaw ?? {}) : {}) as NonNullable<PricingTable["modifiers"]>;
   const fastGeo = modifiers["fast_with_geo_us"];
   auditVerified(fastGeo, null, "modifiers.fast_with_geo_us", ctx);
   for (const [k, v] of Object.entries(modifiers)) {
@@ -372,16 +393,39 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
   const geoTableVerified = isVerified(geoMod, null, ctx);
 
   const idOwner = new Map<string, { idx: number; raw: string }>();
-  table.models.forEach((entry, idx) => {
+  table.models.forEach((entryRaw, idx) => {
     const path = `models[${idx}]`;
-    if (typeof entry !== "object" || entry === null || typeof entry.id !== "string") {
+    if (typeof entryRaw !== "object" || entryRaw === null || typeof entryRaw.id !== "string") {
       c.add("schema", path, "entry must be an object with a string id");
       return;
     }
-    if (entry.provider !== "anthropic" && entry.provider !== "openai") {
+    if (entryRaw.provider !== "anthropic" && entryRaw.provider !== "openai") {
       c.add("schema", `${path}.provider`, "provider must be anthropic or openai");
       return;
     }
+    // S8.5b (d): a nested object that is present and not an object, or model_ids that is not an array of strings, makes
+    // the table malformed; the rest of the entry is then read without it.
+    const notObj = (v: unknown): boolean => v !== undefined && v !== null && (typeof v !== "object" || Array.isArray(v));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const e: any = { ...entryRaw };
+    for (const k of ["tiers", "fast", "long_context", "service_tier", "multipliers"]) {
+      if (notObj(e[k])) {
+        c.add("schema", `${path}.${k}`, `${k} must be an object (S8.5b (d))`);
+        e[k] = null;
+      }
+    }
+    const subMult: Array<[string, string]> = [["fast", "multipliers"], ["tiers", "high_multipliers"], ["long_context", "multipliers"]];
+    for (const [k, mk] of subMult) {
+      if (e[k] !== null && e[k] !== undefined && notObj(e[k][mk])) {
+        c.add("schema", `${path}.${k}.${mk}`, `${mk} must be an object (S8.5b (d))`);
+        e[k] = { ...e[k], [mk]: null };
+      }
+    }
+    if (e.model_ids !== undefined && e.model_ids !== null && (!Array.isArray(e.model_ids) || e.model_ids.some((x: unknown) => typeof x !== "string"))) {
+      c.add("schema", `${path}.model_ids`, "model_ids must be an array of strings (S8.5b (d))");
+      e.model_ids = Array.isArray(e.model_ids) ? e.model_ids.filter((x: unknown) => typeof x === "string") : [];
+    }
+    const entry = e as TableModelEntry;
     const provider = entry.provider;
     auditVerified(entry, null, path, ctx);
     const entryVerified = isVerified(entry, null, ctx);
@@ -411,10 +455,9 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
     if (std.row === null && entryVerified) {
       c.add("schema", `${path}.prices_usd_per_mtok`, "a verified entry needs a standard price row");
     }
-    if (std.row !== null) {
-      ratioTest(entry.multipliers, std.row, `${path}.prices_usd_per_mtok`, ctx);
-      documentedTest(entry, path, ctx);
-    }
+    if (std.row !== null) ratioTest(entry.multipliers, std.row, `${path}.prices_usd_per_mtok`, ctx, entryVerified);
+    // S8.5b (b): the documented list applies to a listed model whatever its prices (an entry with no prices included)
+    documentedTest(entry, path, ctx);
 
     // Fast row (every fast row is ratio tested, R3.2).
     let fast: PriceRow | null = null;
@@ -426,7 +469,7 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
       if (entry.fast.multipliers !== undefined && entry.fast.multipliers !== null && !sameMultipliers(entry.fast.multipliers, entry.multipliers)) {
         c.add("schema", `${path}.fast.multipliers`, "the stored fast multipliers differ from the multipliers of the entry (R3.2)");
       }
-      if (f.row !== null) ratioTest(fastMult, f.row, `${path}.fast`, ctx);
+      if (f.row !== null) ratioTest(fastMult, f.row, `${path}.fast`, ctx, entryVerified);
       incompleteRow(entryVerified, entry.fast.prices_usd_per_mtok, f, `${path}.fast.prices_usd_per_mtok`);
       if (isVerified(entry.fast, entry, ctx)) {
         // S8.5b lists no refusal for an incomplete fast row: it is unusable, so the model has no fast row
@@ -454,7 +497,7 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
       ) {
         c.add("schema", `${path}.tiers.high_multipliers`, "the stored high tier multipliers differ from the multipliers of the entry (R3.2)");
       }
-      if (t.row !== null) ratioTest(highMult, t.row, `${path}.tiers.high`, ctx);
+      if (t.row !== null) ratioTest(highMult, t.row, `${path}.tiers.high`, ctx, entryVerified);
       incompleteRow(entryVerified, entry.tiers.high, t, `${path}.tiers.high`);
       if (isVerified(entry.tiers, entry, ctx)) {
         if (t.row !== null) tierHigh = t.row; // an incomplete high tier row is unusable (tier_unverified), not a refusal
@@ -484,7 +527,7 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
           const l = parseRow(provider, lc.prices_usd_per_mtok, badPrice(`${path}.long_context.prices_usd_per_mtok`));
           incompleteRow(entryVerified, lc.prices_usd_per_mtok, l, `${path}.long_context.prices_usd_per_mtok`);
           // R3.2: a long-context row stores its own multiplier object; an absent one falls back to the entry's.
-          if (l.row !== null && lc.verified === true) ratioTest(lc.multipliers ?? entry.multipliers, l.row, `${path}.long_context`, ctx);
+          if (l.row !== null && isVerified(lc, entry, ctx)) ratioTest(lc.multipliers ?? entry.multipliers, l.row, `${path}.long_context`, ctx, entryVerified);
           if (pricesVerified) {
             if (l.row !== null) lcRow = l.row; // an incomplete long-context row is unusable, not a refusal (S8.5b)
           }
@@ -494,6 +537,8 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
         // Anthropic has no long-context rule, but a price row is validated like every other one (S8.5a)
         const l = parseRow(provider, lc.prices_usd_per_mtok, badPrice(`${path}.long_context.prices_usd_per_mtok`));
         incompleteRow(entryVerified, lc.prices_usd_per_mtok, l, `${path}.long_context.prices_usd_per_mtok`);
+        // S8.5b (c): the ratio test runs on every verified long-context row with prices, for both providers
+        if (l.row !== null && isVerified(lc, entry, ctx)) ratioTest(lc.multipliers ?? entry.multipliers, l.row, `${path}.long_context`, ctx, entryVerified);
       }
     }
 
@@ -512,8 +557,13 @@ function buildBook(table: PricingTable): { book: PriceBook; findings: readonly T
     if (entry.service_tier !== null && entry.service_tier !== undefined) {
       for (const [k, v] of Object.entries(entry.service_tier) as [string, (TableVerifiable & { readonly prices_usd_per_mtok: TablePriceRow }) | null | undefined][]) {
         const sp = `${path}.service_tier.${k}`;
+        // S8.5b (d): every member of a service_tier row's price object is null or a valid price, whatever its key
+        const rowObj = (v as { prices_usd_per_mtok?: unknown } | null | undefined)?.prices_usd_per_mtok;
+        if (typeof rowObj === "object" && rowObj !== null && !Array.isArray(rowObj)) {
+          for (const [mk, mv] of Object.entries(rowObj)) if (mv !== null && !(typeof mv === "string" && PRICE_GRAMMAR.test(mv))) badPrice(`${sp}.prices_usd_per_mtok`)(mk);
+        }
         if (!(SERVICE_TIER_KEYS as readonly string[]).includes(k)) {
-          continue; // only priority and batch rows are read; another key is ignored (not a refusal case of S8.5b)
+          continue; // only priority and batch rows are read; another key is validated above and otherwise ignored
         }
         if (v === undefined || v === null) continue;
         auditVerified(v, entry, sp, ctx);

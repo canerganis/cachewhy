@@ -2114,7 +2114,7 @@ describe("S8.5a: every price row of every entry is validated at load with the 1 
     find(t2, "claude-opus-5-5").long_context.prices_usd_per_mtok = { input: "1", output: "1.1234567", cache_read: "1", cache_write_5m: "1", cache_write_1h: "1" };
     assert.throws(() => loadPriceBook(t2), PriceTableError);
     const t3 = tableCopy();
-    find(t3, "claude-opus-5-5").long_context.prices_usd_per_mtok = { input: "1", output: "1", cache_read: "1", cache_write_5m: "1", cache_write_1h: "1" };
+    find(t3, "claude-opus-5-5").long_context.prices_usd_per_mtok = { input: "1", output: "1", cache_read: "0.05", cache_write_5m: "1.25", cache_write_1h: "2" }; // consistent with the multipliers (S8.5b (c))
     assert.doesNotThrow(() => loadPriceBook(t3));
   });
 
@@ -2454,5 +2454,102 @@ describe("S12.7: model rows are keyed by (model key, model_verified)", () => {
     assert.deepEqual(rows.map((m) => [m.responses, m.model_verified]).sort(), [[1, false], [1, true]]);
     const total = view.totals.find((x) => x.provider === "claude")!;
     assert.equal(total.models.reduce((a, m) => a + m.responses, 0), total.requests_total);
+  });
+});
+
+describe("S8.5b further details (b) to (e)", () => {
+  const entry = (tbl: any, id: string): any => tbl.models.find((m: any) => m.id === id);
+  const refused = (fn: (t: any) => void): boolean => {
+    const tbl = tableCopy();
+    fn(tbl);
+    try {
+      loadPriceBook(tbl);
+      return false;
+    } catch (e) {
+      if (e instanceof PriceTableError) return true;
+      throw e;
+    }
+  };
+
+  it("(b) the documented list applies to every normalized id of the entry, not the raw entry id", () => {
+    const rename = (tbl: any, id: string, wrong: boolean): void => {
+      const e = entry(tbl, "claude-opus-5-5");
+      e.id = id;
+      e.model_ids = [id];
+      if (wrong) {
+        // consistent ratios with a wrong cache-read multiplier: only the documented list can refuse it
+        e.multipliers.cache_read = "0.1";
+        e.prices_usd_per_mtok.cache_read = "0.4";
+        e.fast.multipliers.cache_read = "0.1";
+        e.fast.prices_usd_per_mtok.cache_read = "0.8";
+      }
+    };
+    assert.equal(refused((tbl) => rename(tbl, "claude-opus-5-5-20251001", false)), false); // correct and dated: accepted
+    assert.equal(refused((tbl) => rename(tbl, "claude-opus-5-5-20251001", true)), true); // wrong and dated: refused
+    assert.equal(refused((tbl) => rename(tbl, "claude-opus-5-5", true)), true);
+    // the listed id only in model_ids, an unlisted entry id
+    assert.equal(refused((tbl) => { rename(tbl, "custom-x", true); entry(tbl, "custom-x").model_ids = ["custom-x", "claude-opus-5-5-20251001"]; }), true);
+    assert.equal(refused((tbl) => { rename(tbl, "custom-x", true); }), false); // an unlisted id has no documented multipliers
+    // a listed model with no multipliers object at all fails
+    assert.equal(refused((tbl) => { delete entry(tbl, "claude-sonnet-5-5").multipliers; }), true);
+    // GPT 5.6 and later means (major, minor) >= (5, 6); minor 0 when absent
+    const gpt = (id: string, drop: boolean) => (tbl: any): void => {
+      const e = entry(tbl, "gpt-6-sol");
+      e.id = id;
+      e.model_ids = [id];
+      if (drop) delete e.multipliers;
+    };
+    for (const id of ["gpt-5.6-x", "gpt-5.10-x", "gpt-6-x", "gpt-6.1-x", "gpt-10-x"]) assert.equal(refused(gpt(id, true)), true, id);
+    for (const id of ["gpt-5.5-x", "gpt-5-x", "gpt-5.1-x", "gpt-4.9-x"]) assert.equal(refused(gpt(id, true)), false, id);
+  });
+
+  it("(c) the ratio test covers verified long-context rows of both providers; an unverified entry skips a missing cache price", () => {
+    const lc = (tbl: any): void => {
+      entry(tbl, "claude-opus-5-5").long_context.prices_usd_per_mtok = { input: "1", output: "1", cache_read: "0.06", cache_write_5m: "1.25", cache_write_1h: "2" };
+    };
+    assert.equal(refused(lc), true); // 0.06 is not 0.05 times 1
+    assert.equal(refused((tbl) => { lc(tbl); entry(tbl, "claude-opus-5-5").long_context.verified = false; }), false);
+    assert.equal(refused((tbl) => { entry(tbl, "gpt-6-sol").long_context.prices_usd_per_mtok.cached_input = "0.33"; }), true);
+    assert.equal(refused((tbl) => { delete entry(tbl, "claude-opus-5-5").prices_usd_per_mtok.cache_read; }), true); // verified: fails
+    assert.equal(refused((tbl) => { const e = entry(tbl, "claude-opus-5-5"); e.verified = false; delete e.prices_usd_per_mtok.cache_read; }), false); // unverified: skipped
+  });
+
+  it("(d) the shapes that make the table malformed never throw anything but a PriceTableError", () => {
+    for (const v of [5, [], true, "x"]) assert.equal(refused((tbl) => { tbl.modifiers = v; }), true, JSON.stringify(v));
+    assert.equal(refused((tbl) => { tbl.modifiers = null; }), false);
+    for (const v of ["x", [5], {}, 5, [null]]) assert.equal(refused((tbl) => { entry(tbl, "claude-opus-5-5").model_ids = v; }), true, JSON.stringify(v));
+    for (const k of ["tiers", "fast", "long_context", "service_tier", "multipliers"]) {
+      for (const v of ["x", 5, [], true]) assert.equal(refused((tbl) => { entry(tbl, "claude-opus-5-5")[k] = v; }), true, `${k} ${JSON.stringify(v)}`);
+    }
+    assert.equal(refused((tbl) => { entry(tbl, "claude-opus-5-5").fast.multipliers = 5; }), true);
+    assert.equal(refused((tbl) => { entry(tbl, "claude-haiku-5-5").tiers.high_multipliers = "x"; }), true);
+    assert.equal(refused((tbl) => { entry(tbl, "gpt-6-sol").long_context.multipliers = []; }), true);
+    // a null nested object is absent
+    assert.equal(refused((tbl) => { entry(tbl, "claude-opus-5-5").fast = null; entry(tbl, "claude-opus-5-5").service_tier = null; }), false);
+  });
+
+  it("(d) every named price member, of either provider's row, is null or a valid price", () => {
+    for (const name of ["input", "output", "cache_read", "cache_write_5m", "cache_write_1h", "cached_input", "cache_write"]) {
+      for (const v of ["x", 5, [], "01", "1.1234567"]) {
+        assert.equal(refused((tbl) => { entry(tbl, "gpt-5.1-codex").prices_usd_per_mtok = { [name]: v }; }), true, `openai ${name} ${JSON.stringify(v)}`);
+        assert.equal(refused((tbl) => { entry(tbl, "mythos-preview").prices_usd_per_mtok = { [name]: v }; }), true, `anthropic ${name} ${JSON.stringify(v)}`);
+      }
+    }
+    assert.equal(refused((tbl) => { entry(tbl, "gpt-5.1-codex").prices_usd_per_mtok = { input: null, cache_read: null, cached_input: null }; }), false);
+  });
+
+  it("(d) every member of a service_tier row object is null or a valid price, whatever its key", () => {
+    const st = (row: unknown, key = "priority") => (tbl: any): void => { entry(tbl, "claude-opus-5-5").service_tier = { [key]: { verified: false, prices_usd_per_mtok: row } }; };
+    assert.equal(refused(st({ foo: 5 })), true);
+    assert.equal(refused(st({ input: "1", extra: [] }, "batch")), true);
+    assert.equal(refused(st({ input: "1", extra: "x" }, "zzz")), true); // a key that is not read is validated too
+    const full = { input: "1", output: "1", cache_read: "0.05", cache_write_5m: "1.25", cache_write_1h: "2" };
+    assert.equal(refused(st({ ...full, extra: null })), false);
+    assert.equal(refused(st({ ...full, extra: "2.5" }, "zzz")), false);
+  });
+
+  it("(e) the entry id counts once only when it is raw-equal to a model_ids member", () => {
+    assert.equal(refused((tbl) => { entry(tbl, "claude-opus-5-5").model_ids = ["claude-opus-5-5-20260101"]; }), true); // id and member normalize alike
+    assert.equal(refused((tbl) => { entry(tbl, "claude-opus-5-5").model_ids = ["claude-opus-5-5"]; }), false);
   });
 });

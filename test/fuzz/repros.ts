@@ -171,6 +171,17 @@ export const TABLE_REPROS: Array<{ id: string; title: string; mutate: (t: Tbl) =
   { id: "T13", title: "table-level modifiers.geo_us.multiplier = '1.2' (copy of C32)", mutate: (t) => { t.modifiers.geo_us.multiplier = "1.2"; } },
   { id: "T14", title: "table-level modifiers.openai_long_context.threshold_input_tokens = 272001 (copy of C25)", mutate: (t) => { t.modifiers.openai_long_context.threshold_input_tokens = 272001; } },
   { id: "T15", title: "entry id equals another entry's model id", mutate: (t) => { entry(t, "claude-opus-4-1").id = "claude-opus-5-5"; } },
+  { id: "T16", title: "documented model with a dated entry id and dated model_ids (cache prices correct), S2.4", mutate: (t) => { const e = entry(t, "claude-mythos-5-1"); e.id = "claude-mythos-5-1-20251001"; e.model_ids = ["claude-mythos-5-1-20251001"]; } },
+  { id: "T17", title: "new unverified OpenAI entry gpt-5.9 cloned from gpt-5-codex (no prices, no multipliers)", mutate: (t) => { const e = structuredClone(entry(t, "gpt-5-codex")); e.id = "gpt-5.9"; e.model_ids = ["gpt-5.9"]; t.models.push(e); } },
+  { id: "T18", title: "control: new verified OpenAI entry gpt-5.7 with the documented multipliers", mutate: (t) => { const e = structuredClone(entry(t, "gpt-5.6-luna")); e.id = "gpt-5.7"; e.model_ids = ["gpt-5.7"]; t.models.push(e); } },
+  { id: "T19", title: "documented model whose model_ids start with an empty string: ['', 'claude-fable-5-1']", mutate: (t) => { entry(t, "claude-fable-5-1").model_ids = ["", "claude-fable-5-1"]; } },
+  { id: "T20", title: "documented model with only a dated model_ids member (entry id undated)", mutate: (t) => { entry(t, "claude-opus-5-5").model_ids = ["claude-opus-5-5-20251001"]; } },
+  { id: "T21", title: "gpt-5.5 multipliers = {cache_read: '0.1'} (wrong key for OpenAI)", mutate: (t) => { entry(t, "gpt-5.5").multipliers = { cache_read: "0.1" }; } },
+  { id: "T22", title: "claude-opus-4-7 verified with placeholder date TBD, a price key removed and multipliers absent", mutate: (t) => { const e = entry(t, "claude-opus-4-7"); e.verified = true; e.verified_at = "TBD"; delete e.prices_usd_per_mtok.output; delete e.multipliers; } },
+  { id: "T23", title: "claude-opus-4-7 multipliers absent only", mutate: (t) => { delete entry(t, "claude-opus-4-7").multipliers; } },
+  { id: "T24", title: "claude-opus-4-7 placeholder date TBD only (row complete)", mutate: (t) => { entry(t, "claude-opus-4-7").verified_at = "TBD"; } },
+  { id: "T25", title: "documented model, model_ids = ['claude-opus-5-5-2025100'] (7-digit suffix is no date suffix), entry id undated", mutate: (t) => { entry(t, "claude-opus-5-5").model_ids = ["claude-opus-5-5-2025100"]; } },
+  { id: "T26", title: "documented model, model_ids = ['claude-opus-5-5-202510011'] (9-digit suffix), entry id undated", mutate: (t) => { entry(t, "claude-opus-5-5").model_ids = ["claude-opus-5-5-202510011"]; } },
   { id: "T8", title: "control: all prices of one entry doubled (ratios intact)", mutate: (t) => { const e = entry(t, "claude-opus-5-5"); for (const row of [e.prices_usd_per_mtok, e.fast.prices_usd_per_mtok]) for (const k of Object.keys(row)) row[k] = String(Number(row[k]) * 2); } },
 ];
 

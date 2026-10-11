@@ -1159,7 +1159,7 @@ function earlyClaudeRecords(c: Ctx, sessions: ClaudeSessionOut[]): void {
   used(c, "c_early_records");
   const sc: Ctx = { ...c, r: sub };
   let first = c.baseMs;
-  const stamps = s.main.records.map((x) => (typeof x.timestamp === "string" ? Date.parse(x.timestamp) : Number.NaN)).filter((x) => Number.isFinite(x));
+  const stamps = s.main.records.map((x) => (typeof x.timestamp === "string" ? Date.parse(x.timestamp) : Number.NaN)).filter((x) => Number.isFinite(x) && x > Date.UTC(2025, 0, 1) && x < Date.UTC(2030, 0, 1)); // ignore mutated timestamps such as year 0000
   if (stamps.length > 0) first = Math.min(...stamps);
   const th = newThread(sc, s.sessionId, null, first - lead, unsup ? "2.0.1" : s.main.version);
   for (const kd of kinds.slice(0, n)) {
@@ -1772,6 +1772,8 @@ export function generateScan(seed: number, knobs: Knobs): FuzzScan {
   const cx = r.sub();
   genClaude({ ...c, r: cl });
   genCodex({ ...c, r: cx });
+  // event instants are nominal: never let a mutated timestamp drag a window bound out of 2025 to 2030
+  for (let i = c.eventMs.length - 1; i >= 0; i--) if (!(c.eventMs[i]! > Date.UTC(2025, 0, 1) && c.eventMs[i]! < Date.UTC(2030, 0, 1))) c.eventMs.splice(i, 1);
   c.eventMs.sort((x, y) => x - y);
   const ev = c.eventMs.length > 0 ? c.eventMs : [c.baseMs];
   return { seed, files: c.files, eventMs: c.eventMs, minMs: Math.min(...ev), maxMs: Math.max(...ev), used: [...c.used].sort(), links: c.links };
