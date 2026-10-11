@@ -55,10 +55,23 @@ cachewhy reads the Claude Code and Codex session logs already on your machine an
 ## Quick start
 
 ```bash
-npx cachewhy rebuilds --since 7d
+npx cachewhy rebuilds --since 7d                 # Claude Code and Codex together
+npx cachewhy rebuilds --since 7d --agent claude  # Claude Code only
+npx cachewhy rebuilds --since 7d --agent codex   # Codex only
 ```
 
 No install, no config, no account. Requires Node 22 or newer. cachewhy finds `~/.claude/projects` and `~/.codex` on its own.
+
+### Supported agents
+
+| | Claude Code | Codex CLI |
+| --- | --- | --- |
+| Logs read | `~/.claude/projects`, main sessions, subagents, workflow agents | `~/.codex/sessions` and `archived_sessions`, including compressed `.jsonl.zst` |
+| Threads | main conversation, each subagent linked to the tool call that spawned it, workflow agents | main threads, subagents, forks that inherit a parent prefix |
+| Causes | logged cache miss reason (**confirmed**), model switch, idle past TTL, compaction, effort or version change | model switch, idle past TTL, compaction, settings change (**hypothesis**; Codex logs carry no miss reason) |
+| Prices | Anthropic API list prices, 5 minute and 1 hour cache writes | OpenAI API list prices, cached input |
+
+Checked against the published npm package on a real machine: 4,931 Claude Code files and 1,909 Codex files (532 live, 1,377 archived), none unreadable.
 
 ## Why this exists
 
