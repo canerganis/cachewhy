@@ -85,7 +85,67 @@ function diagram() {
   ].join("\n");
 }
 
+// The mark: a cache ring with one segment broken out, and the break highlighted.
+function mark(size, ring, accent) {
+  const r = size * 0.34, cx = size / 2, cy = size / 2, sw = size * 0.11;
+  const pt = (deg) => [cx + r * Math.cos((deg * Math.PI) / 180), cy + r * Math.sin((deg * Math.PI) / 180)];
+  const arc = (a, b) => {
+    const [x1, y1] = pt(a), [x2, y2] = pt(b);
+    return `M${x1.toFixed(2)},${y1.toFixed(2)} A${r},${r} 0 ${b - a > 180 ? 1 : 0} 1 ${x2.toFixed(2)},${y2.toFixed(2)}`;
+  };
+  // ring from -40 to 250 degrees, a gap, then the broken segment pushed outward
+  const [bx, by] = [size * 0.06, -size * 0.06];
+  return (
+    `<path d="${arc(-20, 262)}" fill="none" stroke="${ring}" stroke-width="${sw}" stroke-linecap="round"/>` +
+    `<g transform="translate(${bx},${by})"><path d="${arc(284, 318)}" fill="none" stroke="${accent}" stroke-width="${sw}" stroke-linecap="round"/></g>` +
+    `<circle cx="${cx}" cy="${cy}" r="${size * 0.07}" fill="${accent}"/>`
+  );
+}
+
+function logo() {
+  const s = 128;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${s}" height="${s}" viewBox="0 0 ${s} ${s}"><rect width="${s}" height="${s}" rx="28" fill="#0d1117"/>${mark(s, "#79c0ff", "#f5a524")}</svg>`;
+}
+
+function banner(theme) {
+  const dark = theme === "dark";
+  const fg = dark ? "#f0f6fc" : "#1f2328", sub = dark ? "#8b949e" : "#59636e", ring = dark ? "#79c0ff" : "#0969da";
+  const W = 800, H = 200, s = 132;
+  return [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">`,
+    `<g transform="translate(36,${(H - s) / 2})">${mark(s, ring, "#f5a524")}</g>`,
+    `<text x="190" y="102" fill="${fg}" font-size="64" font-weight="700" letter-spacing="-1.5">cachewhy</text>`,
+    `<text x="194" y="140" fill="${sub}" font-size="20">Why your coding agent's prompt cache broke, and what it cost.</text>`,
+    `</svg>`,
+  ].join("\n");
+}
+
+// GitHub social preview, 1280x640. Rendered to PNG by scripts/render-social.ps1 (headless Edge or Chrome).
+function social() {
+  const W = 1280, H = 640;
+  return `<!doctype html><html><head><meta charset="utf-8"><style>
+html,body{margin:0;width:${W}px;height:${H}px;background:#0d1117;font-family:-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;color:#f0f6fc;overflow:hidden}
+.wrap{padding:72px 88px;box-sizing:border-box;height:100%;display:flex;flex-direction:column;justify-content:space-between}
+.top{display:flex;align-items:center;gap:28px}
+h1{font-size:88px;margin:0;letter-spacing:-2px}
+p{font-size:34px;color:#c9d1d9;margin:28px 0 0;max-width:1000px;line-height:1.3}
+.stats{display:flex;gap:56px;font-size:24px;color:#8b949e}
+.stats b{display:block;font-size:44px;color:#f5a524;margin-bottom:4px}
+.foot{font-size:24px;color:#8b949e;font-family:ui-monospace,Consolas,monospace}
+.foot span{color:#3fb950}
+</style></head><body><div class="wrap">
+<div><div class="top"><svg width="120" height="120" viewBox="0 0 120 120">${mark(120, "#79c0ff", "#f5a524")}</svg><h1>cachewhy</h1></div>
+<p>Find the prompt cache rebuilds in your Claude Code and Codex sessions, with a cause and an evidence level for each.</p></div>
+<div class="stats"><div><b>Subagents</b>and workflows included</div><div><b>Offline</b>no network, no content</div><div><b>Claude + Codex</b>one report</div></div>
+<div class="foot"><span>$</span> npx cachewhy rebuilds --since 7d</div>
+</div></body></html>`;
+}
+
 mkdirSync("assets", { recursive: true });
 writeFileSync("assets/demo.svg", demo());
 writeFileSync("assets/how-it-works.svg", diagram());
-console.log("wrote assets/demo.svg and assets/how-it-works.svg");
+writeFileSync("assets/logo.svg", logo());
+writeFileSync("assets/banner-dark.svg", banner("dark"));
+writeFileSync("assets/banner-light.svg", banner("light"));
+writeFileSync("assets/social.html", social());
+console.log("wrote assets/{demo,how-it-works,logo,banner-dark,banner-light}.svg and assets/social.html");

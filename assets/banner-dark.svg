@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="200" viewBox="0 0 800 200" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<g transform="translate(36,34)"><path d="M108.17,50.65 A44.88,44.88 0 1 1 59.75,21.56" fill="none" stroke="#79c0ff" stroke-width="14.52" stroke-linecap="round"/><g transform="translate(7.92,-7.92)"><path d="M76.86,22.45 A44.88,44.88 0 0 1 99.35,35.97" fill="none" stroke="#f5a524" stroke-width="14.52" stroke-linecap="round"/></g><circle cx="66" cy="66" r="9.24" fill="#f5a524"/></g>
+<text x="190" y="102" fill="#f0f6fc" font-size="64" font-weight="700" letter-spacing="-1.5">cachewhy</text>
+<text x="194" y="140" fill="#8b949e" font-size="20">Why your coding agent's prompt cache broke, and what it cost.</text>
+</svg>
