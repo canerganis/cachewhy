@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1 (2026-10-11)
+
+* README: supported agents table, Codex quick start, clearer Codex wording, dark mode banner on npm.
+* Tests: truncated zstd archive tests run only where Node reports cut frames (Node 24), documented under Limits.
+
 ## 0.1.0 (2026-10-11)
 
 First public release.

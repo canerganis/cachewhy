@@ -1,8 +1,8 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/banner-dark.svg">
-  <img alt="cachewhy" src="assets/banner-light.svg" width="720">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/canerganis/cachewhy/main/assets/banner-dark.svg">
+  <img alt="cachewhy" src="https://raw.githubusercontent.com/canerganis/cachewhy/main/assets/banner-light.svg" width="720">
 </picture>
 
 <p>
