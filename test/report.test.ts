@@ -504,7 +504,7 @@ describe("taint in the report (R0.9, accounting only)", () => {
     const text = renderReport(input);
     assert.match(text, /Taint, whole scan: 1 of 2 chains tainted \(R0\.9\), their 1 responses tokens only; 0 live session families skipped\./);
     assert.match(text, /claude-opus-5-5 \(unverified\)/);
-    assert.match(text, /Rebuild events, boundaries, causes and deltas are not computed in this version/);
+    assert.match(text, /Cache rebuilds and their causes: cachewhy rebuilds/);
     assert.match(text, /chains tainted \(R0\.9\) +1/);
     assert.match(text, /reason: unparsed_line +1/);
     assert.match(text, /Claude taint share: 1 of 2 session families \(50\.0%\), 400 of 1,400 tokens \(28\.6%\)\./);

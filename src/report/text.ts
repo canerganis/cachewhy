@@ -254,7 +254,7 @@ export function renderReport(input: ReportInput & { readonly shown_providers?: r
   }
   // R16.1: the warning is the first line of the output when any provider of the scan is over C36.
   lines.push(...warningLines(h));
-  lines.push(paint("bold", "cachewhy summary") + " (token and list-price-equivalent accounting; rebuild events, boundaries and causes are not computed yet)");
+  lines.push(paint("bold", "cachewhy summary") + " (token and list-price-equivalent accounting; run `cachewhy rebuilds` for cache rebuilds and their causes)");
   lines.push(
     `Scan window ${iso(input.window.since_ms)} to ${iso(input.window.until_ms)} (UTC). ${formatInt(h.n_total)} responses: ${formatInt(h.n_main)} main, ${formatInt(h.n_sub)} subagent, ${formatInt(h.n_wf)} workflow, ${formatInt(h.n_cx)} Codex.`,
   );
@@ -271,7 +271,7 @@ export function renderReport(input: ReportInput & { readonly shown_providers?: r
   const cov = renderCoverage(input.coverage_by_provider, input.drift, paint, h.taint_by_provider);
   if (cov) lines.push(cov);
   else lines.push("No Claude or Codex responses found.");
-  lines.push("", "Rebuild events, boundaries, causes and deltas are not computed in this version, so none is printed.");
+  lines.push("", "Cache rebuilds and their causes: cachewhy rebuilds");
   if (input.assumptions.length > 0) lines.push("", `Assumptions: ${input.assumptions.join(", ")}`);
   return lines.join("\n");
 }

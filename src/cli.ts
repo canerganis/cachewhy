@@ -9,9 +9,11 @@ import { colorEnabled, formatInt, formatTable, makePainter, type Painter } from 
 import { buildReportInput } from "./report/input.js";
 import { doctorCoverageToJson, reportToJsonText } from "./report/json.js";
 import { renderCoverage, renderReport } from "./report/text.js";
+import { renderRebuilds, rebuildsToJson } from "./report/rebuilds.js";
+import { detectRebuilds } from "./rebuilds.js";
 import { formatError } from "./util/sanitize.js";
 import { SINCE_RE } from "./window.js";
-import type { ReportInput } from "./model/types.js";
+import { chainIdOf, type ReportInput } from "./model/types.js";
 
 /** Exit codes. */
 export const EXIT = {
@@ -24,7 +26,7 @@ export const EXIT = {
   NOT_IMPLEMENTED: 3,
 } as const;
 
-export const COMMANDS = ["summary", "session", "evidence", "doctor", "pricing"] as const;
+export const COMMANDS = ["summary", "rebuilds", "session", "evidence", "doctor", "pricing"] as const;
 export type Command = (typeof COMMANDS)[number];
 export type AgentFilter = "claude" | "codex" | "all";
 
@@ -41,6 +43,8 @@ export interface CliOptions {
   claudeDir?: string;
   codexDir?: string;
   noColor: boolean;
+  /** `rebuilds`: how many events to list. */
+  top: number;
 }
 
 export interface CliIO {
@@ -56,6 +60,7 @@ export const HELP = `cachewhy: offline prompt cache forensics for Claude Code an
 
 Usage:
   cachewhy [summary] [options]     Summary across sessions (default)
+  cachewhy rebuilds [options]      Suspected cache rebuilds, their causes and cost
   cachewhy session <id> [options]  One session timeline
   cachewhy evidence <id> [options] Evidence behind each finding for a session
   cachewhy doctor [options]        List discovered log sources
@@ -68,6 +73,7 @@ Options:
   --agent <name>        Print claude, codex or all (default: all). Every log file is still read
   --project <name>      Print only Claude sessions of this project directory (Codex logs have none).
                         Every log file is still read, and coverage and taint shares cover the whole scan
+  --top <n>             rebuilds: number of events to list (default 20)
   --json                Machine readable output
   --demo                Use built-in synthetic data instead of local logs
   --claude-dir <path>   Claude Code projects dir (default: ~/.claude/projects)
@@ -105,6 +111,7 @@ export function parseCli(argv: string[]): ParsedCli {
         agent: { type: "string" },
         project: { type: "string" },
         json: { type: "boolean" },
+        top: { type: "string" },
         demo: { type: "boolean" },
         "claude-dir": { type: "string" },
         "codex-dir": { type: "string" },
@@ -147,6 +154,9 @@ export function parseCli(argv: string[]): ParsedCli {
     throw new UsageError(`--until must be a date like 2026-01-31 or a duration like 7d, 24h, 2w (got ${v.until})`);
   }
 
+  const top = v.top === undefined ? 20 : Number(v.top);
+  if (!Number.isInteger(top) || top < 1) throw new UsageError(`--top must be a positive integer (got ${v.top})`);
+
   return {
     command,
     id,
@@ -159,6 +169,7 @@ export function parseCli(argv: string[]): ParsedCli {
     claudeDir: v["claude-dir"],
     codexDir: v["codex-dir"],
     noColor: v["no-color"] ?? false,
+    top,
   };
 }
 
@@ -223,6 +234,22 @@ async function runSummary(opts: CliOptions, io: CliIO, color: boolean): Promise<
     return EXIT.OK;
   }
   io.out(renderReport({ ...input, options: { ...input.options, color } }));
+  return EXIT.OK;
+}
+
+async function runRebuilds(opts: CliOptions, io: CliIO, paint: Painter): Promise<number> {
+  const found = await discover(discoverOptionsFor(opts, io.env));
+  const now_ms = io.now ? io.now() : Date.now();
+  const analysis = await analyze(found.files, { since: opts.since, until: opts.until, agent: opts.agent, project: opts.project, now_ms });
+  const shown = new Set(analysis.filter.providers);
+  const report = detectRebuilds(analysis, (r) => shown.has(r.provider) && (analysis.filter.chains === null || analysis.filter.chains.has(chainIdOf(r.chain))));
+  if (opts.json) {
+    io.out(rebuildsToJson(report, opts.top));
+    return EXIT.OK;
+  }
+  const w = analysis.window;
+  const label = `${new Date(w.since_ms).toISOString().slice(0, 10)} to ${new Date(w.until_ms).toISOString().slice(0, 10)}`;
+  io.out(renderRebuilds(report, opts.top, paint, label));
   return EXIT.OK;
 }
 
@@ -310,6 +337,7 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
   try {
     if (opts.command === "doctor") return await runDoctor(opts, io, paint);
     if (opts.command === "summary" && !opts.demo) return await runSummary(opts, io, paint.enabled);
+    if (opts.command === "rebuilds" && !opts.demo) return await runRebuilds(opts, io, paint);
     io.err(`cachewhy: ${opts.command} is not implemented yet`);
     return EXIT.NOT_IMPLEMENTED;
   } catch (e) {
