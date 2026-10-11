@@ -50,7 +50,7 @@ cachewhy reads the Claude Code and Codex session logs already on your machine an
   <img alt="cachewhy rebuilds on Codex logs" src="assets/demo-codex.svg" width="100%">
 </p>
 
-<sub>Real output, session ids removed. Codex logs carry no cache miss reason, so Codex causes are hypotheses or unknown.</sub>
+<sub>Real output from the author's Codex logs, session ids removed. Codex does not log why a cache missed, so cachewhy works the cause out from timing, model changes and context size, and marks each one with its confidence.</sub>
 
 ## Quick start
 
