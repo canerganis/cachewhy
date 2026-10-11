@@ -12,7 +12,7 @@
 </p>
 
 <p>
-  <a href="https://github.com/GITHUB_OWNER/cachewhy/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/GITHUB_OWNER/cachewhy/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/canerganis/cachewhy/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/canerganis/cachewhy/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://www.npmjs.com/package/cachewhy"><img alt="npm" src="https://img.shields.io/npm/v/cachewhy?color=f5a524"></a>
   <img alt="node" src="https://img.shields.io/badge/node-%E2%89%A522-3fb950">
   <img alt="dependencies" src="https://img.shields.io/badge/runtime%20deps-0-79c0ff">

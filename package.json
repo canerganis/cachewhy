@@ -2,8 +2,29 @@
   "name": "cachewhy",
   "version": "0.1.0",
   "description": "Offline prompt cache forensics for Claude Code and Codex logs.",
+  "keywords": [
+    "claude-code",
+    "codex",
+    "prompt-caching",
+    "prompt-cache",
+    "llm",
+    "ai-agents",
+    "cost",
+    "tokens",
+    "cli",
+    "anthropic",
+    "openai"
+  ],
   "license": "MIT",
   "author": "Muhammet Can Erganis",
+  "homepage": "https://github.com/canerganis/cachewhy#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/canerganis/cachewhy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/canerganis/cachewhy/issues"
+  },
   "type": "module",
   "bin": {
     "cachewhy": "dist/cli.js"
